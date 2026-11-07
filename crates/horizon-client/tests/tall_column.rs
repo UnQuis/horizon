@@ -137,6 +137,7 @@ fn a_tall_column_streams_lights_and_meshes_to_its_top() {
             cutout_leaves: true,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
             assets: &context.assets,
             render: &context.render,
             tables: &context.tables,

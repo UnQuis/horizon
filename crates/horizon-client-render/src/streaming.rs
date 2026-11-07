@@ -270,6 +270,7 @@ struct MeshSettings {
     cutout_leaves: bool,
     translucent_layers: Arc<[bool]>,
     leaf_culling: LeafCullingMode,
+    opaque_ice: bool,
 }
 enum Job {
     Generate(i32, i32),
@@ -532,6 +533,8 @@ pub struct Streaming {
     pub translucent_layers: Arc<[bool]>,
     /// What the mesher does with leaf faces inside a canopy (`LeafCullingMode`).
     pub leaf_culling: LeafCullingMode,
+    /// Draw ice in the solid pass, opaque (`Mesher::opaque_ice`).
+    pub opaque_ice: bool,
     /// Incremental relighting of block edits on lit chunks (see `light::relight`).
     light_tables: Arc<LightTables>,
     /// Applied edits by sequence, replayed onto light jobs snapshotted before them.
@@ -993,6 +996,7 @@ impl<G: ChunkGenerator> Jobs<G> {
                     cutout_leaves: settings.cutout_leaves,
                     translucent_layers: &settings.translucent_layers,
                     leaf_culling: settings.leaf_culling,
+                    opaque_ice: settings.opaque_ice,
                     assets: &context.assets,
                     render: &context.render,
                     tables: &context.tables,
@@ -1107,6 +1111,7 @@ impl Streaming {
             cutout_leaves: true,
             translucent_layers: Arc::from([]),
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
             light_tables,
             light_log: Vec::new(),
             light_edit_sequence: 0,
@@ -2078,6 +2083,7 @@ impl Streaming {
                             cutout_leaves: self.cutout_leaves,
                             translucent_layers: self.translucent_layers.clone(),
                             leaf_culling: self.leaf_culling,
+                            opaque_ice: self.opaque_ice,
                         },
                     ),
                 );

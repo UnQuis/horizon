@@ -145,6 +145,7 @@ fn a_shader_pack_lights_the_faces_itself() {
             cutout_leaves: true,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
         };
         let mut colours: Vec<u32> = mesher
             .mesh(&region, 0)
@@ -201,6 +202,7 @@ fn a_shader_pack_lights_every_nether_face_like_an_up_face() {
             cutout_leaves: true,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
         };
         let mesh = mesher.mesh(&region, 0);
         // Both blocks' six faces: 2 × 6 quads of 4 vertices.
@@ -253,6 +255,7 @@ fn separate_ao_passes_ao_in_alpha_without_darkening_rgb() {
         cutout_leaves: true,
         translucent_layers: &[],
         leaf_culling: LeafCullingMode::Off,
+        opaque_ice: false,
     };
     let mesh = mesher.mesh(&region, 0);
     assert!(!mesh.solid.is_empty());
@@ -328,6 +331,7 @@ fn reused_mesh_matches_fresh_geometry_across_sections_and_resource_reload() {
             cutout_leaves: reload == 0,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
         };
         for (case, (center, east)) in [
             (&empty, None),
@@ -477,6 +481,7 @@ fn a_shader_pack_s_still_water_top_starts_at_its_south_west_corner() {
             cutout_leaves: true,
             translucent_layers: &[],
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
         };
         let mesh = mesher.mesh(&region, 0);
         // The top and its backward face, both from the same first corner.

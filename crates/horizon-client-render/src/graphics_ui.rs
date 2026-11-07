@@ -76,6 +76,7 @@ pub enum H {
     EntityCullingPrecheck,
     ParticleCulling,
     LeafCulling,
+    OpaqueIce,
     CacheShulkerBoxes,
     CacheSigns,
     CacheDecoratedPots,
@@ -446,6 +447,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::LeafCulling,
                             Saves,
                             "Draws or drops leaf faces inside canopies. Off keeps vanilla's fancy leaves.",
+                        ),
+                        h(
+                            H::OpaqueIce,
+                            Saves,
+                            "Makes ice opaque: faster over ice, but you can't see through it.",
                         ),
                     ],
                 ),
@@ -835,6 +841,7 @@ impl H {
             ),
             H::ParticleCulling => labelled("Particle Culling", g.particle_culling.label()),
             H::LeafCulling => labelled("Leaf Culling", g.leaf_culling.label()),
+            H::OpaqueIce => labelled("Opaque Ice", on_off(g.opaque_ice)),
             H::CacheShulkerBoxes => labelled("Shulker Boxes", on_off(g.cache_shulker_boxes)),
             H::CacheSigns => labelled("Signs", on_off(g.cache_signs)),
             H::CacheDecoratedPots => labelled("Decorated Pots", on_off(g.cache_decorated_pots)),
@@ -1001,6 +1008,7 @@ impl H {
             H::LeafCulling => {
                 g.leaf_culling = step(&LeafCullingMode::ALL, g.leaf_culling, back);
             }
+            H::OpaqueIce => g.opaque_ice = !g.opaque_ice,
             H::CacheShulkerBoxes => g.cache_shulker_boxes = !g.cache_shulker_boxes,
             H::CacheSigns => g.cache_signs = !g.cache_signs,
             H::CacheDecoratedPots => g.cache_decorated_pots = !g.cache_decorated_pots,
@@ -1162,6 +1170,7 @@ impl Item {
             Item::Horizon(H::Weather) => g.weather,
             Item::Horizon(H::AnimatedTextures) => g.animated_textures,
             Item::Horizon(H::DitherCutoutMips) => g.dither_cutout_mips,
+            Item::Horizon(H::OpaqueIce) => g.opaque_ice,
             Item::Horizon(H::Hdr) => g.hdr,
             Item::Horizon(H::HdrLighting) => g.hdr_lighting,
             Item::Horizon(H::BatteryMode) => g.battery,
@@ -3107,6 +3116,31 @@ mod tests {
                 assert_eq!(s.horizon.gpu_culling, on, "{preset:?}");
             }
         }
+    }
+
+    #[test]
+    fn opaque_ice_is_a_performance_switch_off_by_default() {
+        let mut s = Settings::default();
+        let item = Item::Horizon(H::OpaqueIce);
+        assert_eq!(item.switch(&s), Some(false));
+        assert_eq!(item.label(&s).plain(), "Opaque Ice: Off");
+        item.cycle(&mut s, false, FB);
+        assert_eq!(item.switch(&s), Some(true));
+        assert_eq!(item.label(&s).plain(), "Opaque Ice: On");
+        assert_eq!(s.horizon.preset, Preset::Custom);
+        assert!(crate::graphics::Graphics::parse(&s.horizon.serialize()).opaque_ice);
+        item.cycle(&mut s, false, FB);
+        assert_eq!(item.switch(&s), Some(false));
+
+        let (page, _) = rows()
+            .into_iter()
+            .find(|(_, groups)| {
+                groups
+                    .iter()
+                    .any(|(_, rows)| rows.iter().any(|r| r.item == item))
+            })
+            .unwrap();
+        assert_eq!(page, Page::Performance);
     }
 
     #[test]

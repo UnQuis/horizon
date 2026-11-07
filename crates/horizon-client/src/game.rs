@@ -15219,16 +15219,19 @@ impl Game<'_> {
             s.smooth_lighting,
             s.cutout_leaves,
             leaf_culling,
+            s.horizon.opaque_ice,
         ) != (
             st.biome_blend,
             st.smooth_lighting,
             st.cutout_leaves,
             st.leaf_culling,
+            st.opaque_ice,
         );
         self.streaming.biome_blend = self.settings.biome_blend;
         self.streaming.smooth_lighting = self.settings.smooth_lighting;
         self.streaming.cutout_leaves = self.settings.cutout_leaves;
         self.streaming.leaf_culling = leaf_culling;
+        self.streaming.opaque_ice = self.settings.horizon.opaque_ice;
         if remesh {
             self.all_sections_changed();
         }

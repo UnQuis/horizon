@@ -1155,6 +1155,8 @@ fn row_masks_match_cell_definition() {
 #[cfg(test)]
 mod leaf_culling_tests;
 #[cfg(test)]
+mod opaque_ice_tests;
+#[cfg(test)]
 mod reuse_tests;
 #[cfg(test)]
 mod tint_tests;
@@ -1488,6 +1490,8 @@ pub struct Mesher<'a> {
     pub translucent_layers: &'a [bool],
     /// What the worker does with leaf faces inside a canopy.
     pub leaf_culling: LeafCullingMode,
+    /// Draw ice in the solid pass, opaque: every ice face is forced there.
+    pub opaque_ice: bool,
 }
 impl Mesher<'_> {
     /// `region[dz][dx]` are the chunks around the meshed column (centre 1,1).
@@ -1595,6 +1599,9 @@ impl Mesher<'_> {
                     let interior_leaf = state.leaves
                         && self.leaf_culling.is_interior()
                         && scratch.leaf.interior(self.leaf_culling, x, y, z);
+                    // Opaque Ice: ice draws in the solid pass whatever its sprite's alpha,
+                    // as opaque leaves do.
+                    let force_solid = interior_leaf || self.opaque_ice && state.ice;
                     for (d, [dx, dy, dz], opposite) in DIRECTIONS {
                         let neighbor = pad.blocks[pi(x + dx, y + dy, z + dz)];
                         // `should_render_face`'s first test, without its lookups: a
@@ -1605,6 +1612,9 @@ impl Mesher<'_> {
                         let other = &info[neighbor as usize];
                         // LeavesBlock.skipRendering with opaque leaves.
                         let opaque_leaves = !self.cutout_leaves && state.leaves && other.leaves;
+                        // Opaque Ice makes an ice neighbour a full opaque cube: faces
+                        // between two ice blocks, and faces looking into ice, never show.
+                        let opaque_ice = self.opaque_ice && other.ice;
                         let culled_leaf = match self.leaf_culling {
                             LeafCullingMode::Hollow | LeafCullingMode::Hidden => {
                                 state.leaves
@@ -1623,6 +1633,7 @@ impl Mesher<'_> {
                         };
                         visible[d as usize] = !opaque_leaves
                             && !culled_leaf
+                            && !opaque_ice
                             && self
                                 .visibility
                                 .should_render_face(
@@ -1671,7 +1682,7 @@ impl Mesher<'_> {
                                 ao,
                                 (id, state),
                                 world,
-                                interior_leaf,
+                                force_solid,
                             );
                         }
                     }
@@ -1711,7 +1722,7 @@ impl Mesher<'_> {
         ao: bool,
         (id, state): (u32, &Info),
         world: BlockPos,
-        interior_leaf: bool,
+        force_solid: bool,
     ) {
         let q = &face.quad;
         // A quad's own light (a model's glowing part) may raise the tier; whether it
@@ -1848,9 +1859,9 @@ impl Mesher<'_> {
                 q.uv
             },
         );
-        // Opaque leaves (forceOpaque) and leaves a leaf-culling mode proved internal draw in the
-        // solid layer whatever their sprite.
-        let solid_leaves = !self.cutout_leaves && state.leaves || interior_leaf;
+        // Opaque leaves (forceOpaque), leaves a leaf-culling mode proved internal, and
+        // Opaque Ice draw in the solid layer whatever their sprite.
+        let solid = !self.cutout_leaves && state.leaves || force_solid;
         let own = TileLayer::Layer {
             layer: face.layer as u16,
             translucent: face.translucent,
@@ -1870,8 +1881,8 @@ impl Mesher<'_> {
             TileLayer::Skip | TileLayer::Default => own,
         };
         match pick {
-            Pick::Keep => self.quad(out, solid_leaves, own, corners.map(|c| c.0), tint),
-            Pick::Tile(t) => self.quad(out, solid_leaves, tile(t), corners.map(|c| c.0), tint),
+            Pick::Keep => self.quad(out, solid, own, corners.map(|c| c.0), tint),
+            Pick::Tile(t) => self.quad(out, solid, tile(t), corners.map(|c| c.0), tint),
             Pick::Quarters(tiles) => {
                 let cuts = cuts(&corners);
                 for s in cuts.windows(2) {
@@ -1880,7 +1891,7 @@ impl Mesher<'_> {
                             .map(|(s, t)| bilinear(&corners, s, t));
                         let quarter = quarter_of(&piece);
                         let piece = piece.map(|c| c.0);
-                        self.quad(out, solid_leaves, tile(tiles[quarter]), piece, tint);
+                        self.quad(out, solid, tile(tiles[quarter]), piece, tint);
                     }
                 }
             }
@@ -1929,17 +1940,17 @@ impl Mesher<'_> {
             }
         }
     }
-    /// One terrain quad with sprite `tile`, in the pass its alpha needs (`solid_leaves`: no
+    /// One terrain quad with sprite `tile`, in the pass its alpha needs (`force_solid`: no
     /// alpha cutout whatever the sprite).
     fn quad(
         &self,
         out: &mut SectionMesh,
-        solid_leaves: bool,
+        force_solid: bool,
         tile: TileLayer,
         v: [TerrainVertex; 4],
         tint: Option<u32>,
     ) {
-        self.quad_as(out, solid_leaves, tile, v, true, tint);
+        self.quad_as(out, force_solid, tile, v, true, tint);
     }
     /// Whether [`Mesher::quad`] draws `tile` in the translucent pass.
     fn translucent(&self, tile: TileLayer) -> bool {
@@ -1963,7 +1974,7 @@ impl Mesher<'_> {
     fn quad_as(
         &self,
         out: &mut SectionMesh,
-        solid_leaves: bool,
+        force_solid: bool,
         tile: TileLayer,
         mut v: [TerrainVertex; 4],
         by_sprite: bool,
@@ -1980,14 +1991,17 @@ impl Mesher<'_> {
         if self.tables.is_animated(layer) {
             out.note_sprite_layer(layer);
         }
-        let translucent = if by_sprite {
+        // `force_solid` also takes the quad out of the translucent list: an opaque
+        // layer bit in the translucent pass would still be sorted and blended.
+        let sprite_translucent = if by_sprite {
             self.translucent(tile)
         } else {
             translucent
         };
+        let (translucent, opaque_layer) = quad_pass(force_solid, sprite_translucent, opaque);
         // Quads over opaque texels draw in the solid layer: no alpha cutout (a dirt path's side
         // skips its clear top row). All four vertices share the layer.
-        let layer = if opaque && !translucent || solid_leaves {
+        let layer = if opaque_layer {
             layer | OPAQUE_LAYER
         } else {
             layer
@@ -2008,6 +2022,13 @@ impl Mesher<'_> {
             out.solid_tints.push(tint.unwrap_or(packed::WHITE));
         }
     }
+}
+/// Where a terrain quad goes and whether it carries the opaque layer bit.
+/// `force_solid` wins over the sprite's own translucency: drawing it with the opaque
+/// bit still in the translucent list would sort and blend it.
+fn quad_pass(force_solid: bool, translucent: bool, opaque: bool) -> (bool, bool) {
+    let translucent = !force_solid && translucent;
+    (translucent, opaque && !translucent || force_solid)
 }
 /// The cuts of a `ctm_compact` face, in quad parameters, without allocating: the first `.1`
 /// of `.0`.
@@ -2180,5 +2201,22 @@ mod quarter_tests {
         assert_eq!(standard_uv(D::North, [1.0, 1.0, 0.0]), [0.0, 0.0]);
         assert_eq!(standard_uv(D::East, [1.0, 0.0, 1.0]), [0.0, 1.0]);
         assert_eq!(standard_uv(D::Down, [0.0, 0.0, 1.0]), [0.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod quad_pass_tests {
+    use super::quad_pass;
+
+    #[test]
+    fn force_solid_wins_over_a_translucent_sprite() {
+        // An ice sprite is translucent, but Opaque Ice must put it in the solid list.
+        assert_eq!(quad_pass(true, true, false), (false, true));
+        assert_eq!(quad_pass(true, true, true), (false, true));
+        // Without the override, a translucent sprite keeps its pass and has no opaque bit.
+        assert_eq!(quad_pass(false, true, false), (true, false));
+        assert_eq!(quad_pass(false, true, true), (true, false));
+        // A solid sprite is opaque even without the override.
+        assert_eq!(quad_pass(false, false, true), (false, true));
     }
 }

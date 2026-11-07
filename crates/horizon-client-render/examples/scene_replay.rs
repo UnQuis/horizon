@@ -660,6 +660,7 @@ fn remesh(
                         cutout_leaves,
                         translucent_layers: &[],
                         leaf_culling,
+                        opaque_ice: false,
                     };
                     let mut scratch = MeshScratch::default();
                     let mut out = Vec::new();

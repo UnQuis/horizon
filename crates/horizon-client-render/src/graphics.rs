@@ -684,6 +684,9 @@ pub struct Graphics {
     /// vanilla's fancy leaves. Ignored with a resource pack that may replace
     /// the vanilla leaf models ([`Graphics::leaf_culling_effective`]).
     pub leaf_culling: LeafCullingMode,
+    /// Draw ice in the solid pass, opaque: it no longer needs back-to-front sorting and
+    /// hides what is behind it. Off by default, so the picture is vanilla's.
+    pub opaque_ice: bool,
     /// Cache settled shulker-box models.
     pub cache_shulker_boxes: bool,
     /// Cache sign-text geometry.
@@ -789,6 +792,7 @@ impl Default for Graphics {
             entity_culling_precheck: 64,
             particle_culling: ParticleCullingMode::Off,
             leaf_culling: LeafCullingMode::Off,
+            opaque_ice: false,
             cache_shulker_boxes: false,
             // Sign text has used its renderer cache independently of the new model caches.
             cache_signs: true,
@@ -889,6 +893,7 @@ impl Graphics {
                 }
                 "particleCulling" => g.particle_culling = ParticleCullingMode::parse(value),
                 "leafCulling" => g.leaf_culling = LeafCullingMode::parse(value),
+                "opaqueIce" => g.opaque_ice = flag(g.opaque_ice),
                 "blockEntityCache" => {
                     let enabled = flag(false);
                     g.cache_shulker_boxes = enabled;
@@ -980,7 +985,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nentityCullingPrecheck:{}\nparticleCulling:{}\nleafCulling:{}\nopaqueIce:{}\nblockEntityCacheShulkerBoxes:{}\nblockEntityCacheSigns:{}\nblockEntityCacheDecoratedPots:{}\nblockEntityCacheBells:{}\nblockEntityCacheChests:{}\nblockEntityCacheBanners:{}\nblockEntityCacheCopperGolemStatues:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\ntextureBudgetMiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\nditherCutoutMips:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nscreenshotQuality:{}\nframeGeneration:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrLighting:{}\nhdrKey:{}\nbatteryMode:{}\nshadowCache:{}\ngraphicsApi:{}\npickedShaderPack:{}\nbatchTranslucent:{}\nhdrSmoothGradients:{}\ngpuCulling:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -989,6 +994,7 @@ impl Graphics {
             self.entity_culling_precheck,
             self.particle_culling.name(),
             self.leaf_culling.name(),
+            bool_text(self.opaque_ice),
             bool_text(self.cache_shulker_boxes),
             bool_text(self.cache_signs),
             bool_text(self.cache_decorated_pots),
@@ -1178,6 +1184,7 @@ mod tests {
             entity_culling_precheck: 128,
             particle_culling: ParticleCullingMode::Asynchronous,
             leaf_culling: LeafCullingMode::SolidAggressive,
+            opaque_ice: true,
             cache_shulker_boxes: true,
             cache_signs: true,
             cache_decorated_pots: true,
@@ -1264,6 +1271,10 @@ mod tests {
         // GPU Culling is opt-in: only the file or its switch turns it on.
         assert!(!Graphics::default().gpu_culling);
         assert!(Graphics::parse("gpuCulling:true\n").gpu_culling);
+        // Opaque Ice is opt-in too: only the file or its switch turns it on.
+        assert!(!Graphics::default().opaque_ice);
+        assert!(Graphics::parse("opaqueIce:true\n").opaque_ice);
+        assert!(!Graphics::parse("opaqueIce:false\n").opaque_ice);
         // 0 is Auto; anything else is a peak the slider reaches.
         assert_eq!(Graphics::parse("hdrPeak:0\n").hdr_peak, 0);
         assert_eq!(Graphics::parse("hdrPeak:50\n").hdr_peak, 200);

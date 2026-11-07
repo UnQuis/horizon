@@ -483,6 +483,8 @@
   "Reuses statue geometry until its block state changes.": "Reuses statue geometry until its block state changes.",
   "Leaf Culling": "Leaf Culling",
   "Every leaf face. Vanilla's fancy leaves.": "Every leaf face. Vanilla's fancy leaves.",
+  "Opaque Ice": "Opaque Ice",
+  "Makes ice opaque: faster over ice, but you can't see through it.": "Makes ice opaque: faster over ice, but you can't see through it.",
   "Distant Plant Dither": "Distant Plant Dither",
   "Keeps fine plants in high-res packs from fading far away.": "Keeps fine plants in high-res packs from fading far away.",
   "Screenshot Quality": "Screenshot Quality",

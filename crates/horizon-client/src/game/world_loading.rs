@@ -872,6 +872,7 @@ pub(super) fn make_streaming(
     streaming.leaf_culling = settings
         .horizon
         .leaf_culling_effective(&settings.resource_packs);
+    streaming.opaque_ice = settings.horizon.opaque_ice;
     streaming.biome_zoom = BiomeZoom::new(obfuscate_seed(seed));
     streaming.sky_light = dim != Dim::Nether;
     streaming.nether_shading = dim == Dim::Nether;
