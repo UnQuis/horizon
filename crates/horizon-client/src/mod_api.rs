@@ -481,7 +481,7 @@ pub struct NativeServerPlayer {
     pub address: String,
     /// The connection's round-trip time in milliseconds, as the keep-alive measured it and the
     /// player list shows it (`ServerCommonPacketListenerImpl.latency`). The fields below are API
-    /// @API:server_player_state@; 0, false or None where the server does not hold them.
+    /// 504; 0, false or None where the server does not hold them.
     pub latency: i32,
     /// The protocol version the client connected with (the server's own: others are refused).
     pub protocol: i32,
@@ -512,7 +512,7 @@ pub struct NativeServerPlayer {
 }
 
 /// What a player's client told the server about itself, and what the server sent it
-/// (`native_player_client`). API @API:player_client@.
+/// (`native_player_client`). API 473.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct NativeClientInfo {
@@ -549,7 +549,7 @@ pub struct NativeCommand {
     /// The operator level a player needs to see and run it (0: everyone).
     pub level: u8,
     /// The permission node that decides instead, when set
-    /// ([`NativeCommand::permission`]). API @API:command_permission@.
+    /// ([`NativeCommand::permission`]). API 460.
     pub permission: Option<String>,
 }
 
@@ -576,7 +576,7 @@ impl NativeCommand {
     /// the command, so a permissions mod grants or refuses it whatever the
     /// player's level, and without one the level decides as before. A
     /// command's node is the first one its usages give.
-    /// API @API:command_permission@.
+    /// API 460.
     pub fn permission(mut self, node: &str) -> Self {
         self.permission = Some(node.to_owned());
         self

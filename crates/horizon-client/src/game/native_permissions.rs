@@ -15,7 +15,7 @@ impl Game<'_> {
     /// level; 0 is everyone). The level is the one the server holds for a
     /// player who is on or joining; inside a player's hook, with the hub out
     /// of reach, the acting player's. Anyone else, and every player on a
-    /// client, counts as level 0. API @API:permission_check@.
+    /// client, counts as level 0. API 471.
     pub(super) fn native_has_permission(
         &self,
         player: u128,
@@ -31,7 +31,7 @@ impl Game<'_> {
     /// tick, so it works from any server hook, the player's own included
     /// (from the commands-sent hooks themselves it would send it every tick).
     /// True when the player is on (or is the acting player); false for
-    /// anyone else and on a client. API @API:resend_commands@.
+    /// anyone else and on a client. API 497.
     pub(super) fn native_resend_commands(&mut self, player: u128) -> bool {
         let on = self.lan_acting_uuid == Some(player)
             || self

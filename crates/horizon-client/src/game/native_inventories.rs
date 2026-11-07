@@ -308,7 +308,7 @@ impl Game<'_> {
     /// inventory loaded from elsewhere. Live or their file, as
     /// `native_inventory`; a player on the server is sent their whole
     /// inventory at once. Err as `native_inventory`, or for a wrong number
-    /// of slots or a `selected` past the hotbar. @API:set_inventory@.
+    /// of slots or a `selected` past the hotbar. 506.
     pub(super) fn native_set_inventory(
         &mut self,
         uuid: u128,
@@ -351,7 +351,7 @@ impl Game<'_> {
     /// there (Bukkit's `setItem`, checked like `native_move_stack`). Live or
     /// their file; a player's screen follows with the tick's sync. Err as
     /// `native_inventory`, for no such slot, or when the slot changed.
-    /// @API:set_inventory_slot@.
+    /// 507.
     pub(super) fn native_set_inventory_slot(
         &mut self,
         uuid: u128,
@@ -375,7 +375,7 @@ impl Game<'_> {
     /// or none, and returns them in order. Live or their file; a player's
     /// screen follows with the tick's sync. Err as `native_inventory`, for a
     /// slot named twice, or when one changed (nothing is taken then).
-    /// @API:set_inventory_slot@.
+    /// 507.
     pub(super) fn native_take_stacks(
         &mut self,
         uuid: u128,

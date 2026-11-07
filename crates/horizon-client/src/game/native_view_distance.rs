@@ -17,7 +17,7 @@ impl Game<'_> {
     /// leaves; a later server change (`view-distance`) keeps it. False off a
     /// server, for a player not online, and inside a guest's packet hook,
     /// where the hub is taken out (call it from a tick hook). API
-    /// @API:player_view_distance@.
+    /// 493.
     pub(super) fn native_set_player_view_distance(
         &mut self,
         uuid: u128,
@@ -34,7 +34,7 @@ impl Game<'_> {
     /// The view distance the player `uuid` has now: the radius of chunks it
     /// is sent (`native_set_player_view_distance`). None off a server, for a
     /// player not online, and inside a guest's packet hook. API
-    /// @API:player_view_distance@.
+    /// 493.
     pub(super) fn native_player_view_distance(&self, uuid: u128) -> Option<i32> {
         if !self.native_authoritative() {
             return None;

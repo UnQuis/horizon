@@ -6,6 +6,211 @@
 //! Horizon's own HUD extras do, and keep a mod's settings where the
 //! WebAssembly mod of the same id kept them.
 //!
+//! API 513 adds a level's world border bounds (`native_world_border`).
+//!
+//! API 512 adds a ridden vehicle's move with its id, which a mod may cancel or send elsewhere, mounts included (`native_vehicle_moved_v2`), leaving `native_vehicle_moved` as it was.
+//!
+//! API 511 adds an entity about to trample farmland, cancellable (`native_trample`).
+//!
+//! API 510 adds a boat, minecart or ridden mob teleported with its riders (`native_teleport_vehicle`), as Bukkit's `Vehicle.teleport`.
+//!
+//! API 509 adds a server player teleported from any server hook, the acting player's own included (`native_teleport_player`), as Bukkit's `Player.teleport`.
+//!
+//! API 508 adds `NativeCommand` argument kinds whose completions the client asks the server for (`word?`, `text?`, `player_name`), and a guest's completion request with the command split into label and arguments (`native_tab_complete_v2`).
+//!
+//! API 507 adds one checked slot of a player's inventory set, and exact stacks taken all or none (`native_set_inventory_slot`, `native_take_stacks`).
+//!
+//! API 506 adds a player's whole inventory or ender chest replaced, live or in their file (`native_set_inventory`).
+//!
+//! API 505 adds a server player let fly in any game mode and set flying (`native_set_flight`), as Bukkit's `Player.setAllowFlight` and `setFlying`.
+//!
+//! API 504 adds more of a player on `NativeServerPlayer`: latency, protocol, experience, ground, abilities, sneaking, eye height, selected slot, nickname and hidden level.
+//!
+//! API 503 adds the server's player limit, folder and log file (`native_max_players`, `native_server_dir`, `native_log_file`).
+//!
+//! API 502 adds a plugin channel message to one player's client on any channel outside `horizon:` (`native_send_custom_payload_to_player`).
+//!
+//! API 501 adds a console command that reaches the mods' registered commands, then vanilla's (`native_run_mod_command`).
+//!
+//! API 500 adds a console command run with its result and answer kept (`native_run_command_captured`).
+//!
+//! API 499 adds a command run as a player typing it would, at their level, with its result and answer (`native_run_command_as`).
+//!
+//! API 498 adds a dead server player respawned without their client's Respawn click (`native_respawn_player`), as Spigot's `player.spigot().respawn()`.
+//!
+//! API 497 adds a player's command tree sent again, the mods asked anew (`native_resend_commands`), as Bukkit's `Player.updateCommands`.
+//!
+//! API 496 adds a thrown projectile about to cross the world border, which a mod may move, slow or let through (`native_projectile_world_border`).
+//!
+//! API 495 adds an online player's profile property set (`native_set_profile_property`) and the player shown again with it (`native_refresh_player`).
+//!
+//! API 494 adds a player the server knows, by name (`native_profile_by_name`) or id (`native_profile_by_uuid`), from who is on and the profile cache.
+//!
+//! API 493 adds one player's view distance (`native_set_player_view_distance`, `native_player_view_distance`).
+//!
+//! API 492 adds an online player's `textures` property (`native_player_textures`) and a head stack of any player (`native_player_head`).
+//!
+//! API 491 adds a server player about to be teleported, with the cause, both levels and the position packet's relative flags, which a mod may change or cancel (`native_player_teleport`).
+//!
+//! API 490 adds a player's food read (`native_player_food`) and their health, food and experience set (`native_set_player_status`), as Bukkit's `setHealth`, `setFoodLevel`, `setSaturation` and `setExp`; health 0 kills.
+//!
+//! API 489 adds where a joining player is about to be placed, which a mod may change (`native_player_spawn_location`).
+//!
+//! API 488 adds where a dead player is about to respawn, which a mod may change (`native_player_respawn_position`).
+//!
+//! API 487 adds a player's statistics and advancements in vanilla's JSON, read and replaced (`native_player_stats`, `native_player_stat`, `native_set_player_stats`, `native_player_advancements`, `native_set_player_advancements`).
+//!
+//! API 486 adds a joining player's profile properties on the connection's thread, before `LoginFinished` (`native_player_profile`).
+//!
+//! API 485 adds a player logging in, on the connection's thread before the server's checks, held for the mods' answers or refused (`native_player_pre_login`).
+//!
+//! API 484 adds the compound mods keep on a player (`native_player_persistent_data`, `native_set_player_persistent_data`), saved as `NeoForgeData`, as NeoForge's `Entity.getPersistentData` and Bukkit's `PersistentDataContainer`.
+//!
+//! API 483 adds a player's permission level, also inside `native_player_login` (`native_player_permission`).
+//!
+//! API 482 adds a server player's move before it is applied, which a mod may cancel or send elsewhere (`native_player_move`).
+//!
+//! API 481 adds a player leaving while still in their level, before they are saved and removed (`native_player_logging_out`).
+//!
+//! API 480 adds a guest about to throw a snowball, egg, ender pearl or mod thrown item, with the whole stack, cancellable (`native_player_launch_projectile_v2`), leaving `native_player_launch_projectile` as it was.
+//!
+//! API 479 adds one player hurting another by melee, sweep or a projectile, with both players named, cancellable (`native_player_hurt_by_player`).
+//!
+//! API 478 adds any player's main-hand stack and equipment slots from any server hook (`native_held_stack`, `native_player_equipment`).
+//!
+//! API 477 adds a player's effects read, one given or taken off, or all replaced (`native_effects`, `native_add_effect`, `native_remove_effect`, `native_set_effects`), as vanilla's `LivingEntity.addEffect` and Bukkit's `addPotionEffect`.
+//!
+//! API 476 adds a player's compound as the server would save it now (`native_player_compound`), as vanilla's `ServerPlayer.saveWithoutId`.
+//!
+//! API 475 adds the root commands a player's level hides from their command tree, which a mod may put back (`native_player_commands_sent_v2`), leaving `native_player_commands_sent` as it was.
+//!
+//! API 474 adds the operator level one typed command of a player runs at, which a mod may raise or lower (`native_player_command_level`).
+//!
+//! API 473 adds what a player's client told the server and what it was sent (`native_player_client`): brand, language, view distance, chunks and wire bytes.
+//!
+//! API 472 adds a player's attribute read, its base set, or a saved `attributes` list loaded (`native_attribute`, `native_set_attribute_base`, `native_set_attributes`), as Bukkit's `AttributeInstance` and vanilla's `AttributeMap.load`.
+//!
+//! API 471 adds permission nodes: a permissions mod's answer (`native_permission_check`) and the question every mod asks (`native_has_permission`), falling back to the operator level.
+//!
+//! API 470 adds a server player or mob seated on a vehicle or taken off it, and a vehicle emptied (`native_mount`, `native_dismount`, `native_eject_passengers`), as `/ride` and Bukkit's `addPassenger`/`leaveVehicle`/`eject`.
+//!
+//! API 469 adds each message written to the log, on the log's writer thread (`native_log_line`).
+//!
+//! API 468 adds a pickup with the whole stack, the item's thrower and position (`native_item_picked_up_v2`), leaving `native_item_picked_up` as it was.
+//!
+//! API 467 adds a player's throw with the whole stack, cancellable (`native_item_dropped_v2`), leaving `native_item_dropped` as it was.
+//!
+//! API 466 adds a guest's drag in their own inventory or a vanilla menu ending, with the slots it went over, cancellable (`native_inventory_drag`).
+//!
+//! API 465 adds a guest's click in their own inventory or a vanilla menu, before it is applied, cancellable (`native_inventory_click`).
+//!
+//! API 464 adds a client's handshake on the connection's thread, its host rewritable, refusable (`native_handshake`).
+//!
+//! API 463 adds a player's plugin channel message on a channel that isn't Horizon's own (`native_custom_payload_from_client`).
+//!
+//! API 462 adds a creative slot set with the whole stack (`native_creative_slot_v2`), leaving `native_creative_slot` as it was.
+//!
+//! API 461 adds every line the dedicated server's console or RCON is about to run, cancellable, with replies (`native_console_line`).
+//!
+//! API 460 adds a permission node on a mod's command (`NativeCommand::permission`), which the command tree and the server's dispatch ask `native_has_permission` for.
+//!
+//! API 459 adds a server command looked up by name, an alias resolved (`native_command_info`).
+//!
+//! API 458 adds chunk tickets in a level nobody is in (`native_force_chunk_in`).
+//!
+//! API 457 adds read-only chunk snapshots (`native_chunk_snapshot`) with block map colours and biome tints (`native_block_map_color`, `native_biome_name`, `native_biome_tint`).
+//!
+//! API 456 adds a guest about to place a block item, with the position and state, before anything is set, cancellable (`native_block_place`).
+//!
+//! API 455 adds a client mod opens the chat screen with text typed in (`native_open_chat`).
+//!
+//! API 454 adds every block state's facts and looks by its id, and the resources' files, for client mods working off the main thread (`native_block_states`, `native_client_resources`).
+//!
+//! API 453 adds dropped-item block contact after a clipped vertical move.
+//!
+//! API 452 adds client world snapshots (`native_client_chunks`, `native_client_chunks_changed`, `native_client_biomes`, `native_client_biomes_changed`): the client's loaded chunks of an area and its biome table, shared with the world and read on a mod's own threads.
+//!
+//! API 451 adds player bots driven by a server mod: one tick of a player's own movement from an input (`native_simulate_player_move`) and the block collision boxes in a box (`native_collision_boxes`).
+//!
+//! API 450 adds one local client particle through Host::add_particle, retaining the existing provider and engine limits.
+//!
+//! API 449 adds an opt-in provider behind the ordinary block-fluid helpers.
+//!
+//! API 448 adds client sound parameter interception before playback and live channel updates (`native_sound_play`).
+//!
+//! API 447 adds a right-click on an entity with the point clicked (`native_entity_interact_specific`).
+//!
+//! API 446 adds an item fallback after a native mob's ordinary interaction passed.
+//!
+//! API 445 adds state-dependent block clone items before Ctrl+Pick data.
+//!
+//! API 444 adds the players' command trees rebuilt while the server runs (`native_refresh_commands`), for a mod that changes the commands it registers.
+//!
+//! API 443 adds a block's default state by name (`native_default_state`).
+//!
+//! API 442 adds an anvil's result, which a mod may change or cancel (`native_anvil_update`).
+//!
+//! API 441 adds transparent background rendering behind in-game screens (`native_screen_transparent_background`), menu background blur (`native_apply_screen_blur`, `native_menu_blur_radius`) and tiled menu backgrounds (`native_draw_menu_background`, `native_tiled_sprite`).
+//!
+//! API 440 adds the start of a player's server tick (`native_player_tick_pre`).
+//!
+//! API 439 adds the window's player logging in to a server (`native_client_player_network_logging_in`).
+//!
+//! API 438 adds the window's client tick, before and after its work (`native_client_tick_pre`, `native_client_tick_post`).
+//!
+//! API 437 adds a mod's say before a player's landing changes a block (`native_entity_change_block_v2`).
+//!
+//! API 436 adds how fast a player digs a block (`native_break_speed`).
+//!
+//! API 435 adds item tooltip rendering interception (`native_tooltip_render_pre`), GUI item drawing helpers (`gui_draw_item`, `gui_draw_item_with`), and live keyboard modifier/key state checks (`has_shift_down`, `has_control_down`, `has_alt_down`, `is_key_down`).
+//!
+//! API 434 adds the damage a living entity's health takes, before and after (`native_living_damage_pre`, `native_living_damage_post`).
+//!
+//! API 433 adds entity model layers built in code (`native_layer_definitions`, NeoForge's `EntityRenderersEvent.RegisterLayerDefinitions`), baked with `native_bake_layer` and drawn with `native_draw_model_part`.
+//!
+//! API 432 adds a mod tank's say on which fluids it takes (`native_block_entity_accepts_fluid`).
+//!
+//! API 431 adds a new toast about to be queued, cancellable (`native_toast_add`).
+//!
+//! API 430 adds a structure template's blocks as `/place template` would place them, without placing them (`native_structure_template`), for builders.
+//!
+//! API 429 adds a new mob's goals (`native_register_goals`, `Mob.registerGoals`).
+//!
+//! API 428 adds a world-space text/quad canvas (`native_world_submit`, `native_world_quad`, `native_world_text`).
+//!
+//! API 427 adds Horizon's health HUD state for a `native_health_hud` mod (`native_health_hud_state`) and this
+//! client's player's attribute values (`native_local_attribute`).
+//!
+//! API 426 adds the drawn-map sender on Host (`send_map`, the existing `native_send_map`).
+//!
+//! API 425 adds entity handles on a client (`native_entity` and the `entity_*` and `living_*` reads over the entities the server shows the window, armor stands' custom names and equipment included) and the stacks of a server-opened menu by slot (`native_menu_stacks`).
+//!
+//! API 424 adds world primitives (`native_world_primitives`): lines, boxes, beams and text a client mod draws in the world each frame.
+//!
+//! API 423 adds the glowing outline a client draws on an entity (`native_entity_outline`).
+//!
+//! API 422 adds a mod's own fluids in tanks (`native_fluid_insert` takes any namespaced fluid outside `minecraft`), and the tanks' contents read through `Host` (`native_fluid_tanks`).
+//!
+//! API 421 adds the current of a fluid at a position (`native_fluid_flow`, `FluidState.getFlow`).
+//!
+//! API 420 adds turning parts of a block entity's kept geometry (`BlockEntityDraw::spin`, `still`): the game turns them each frame from the game time.
+//!
+//! API 419 adds a scene of blocks and their mod block entities drawn in a screen from an angle (`native_draw_scene`), as Create's Ponder shows its machines.
+//!
+//! API 418 adds text in the world from `native_block_entity_submit` (`native_draw_text`), as a sign draws its lines.
+//!
+//! API 417 adds the texture a block state shows on a side, by the name the block entity drawing helpers take (`native_block_face_sprite`), for copycat blocks.
+//!
+//! API 416 adds chunks a mod keeps loaded and ticking (`native_force_chunk`, `native_forced_chunks`).
+//!
+//! API 415 adds a mod container's say on which items it takes (`native_container_accepts`).
+//!
+//! API 414 adds a mod's machine breaks blocks with a tool and keeps their drops (`native_machine_destroy_block`) and shows its crack (`native_set_break_progress`).
+//!
+//! API 413 adds a mod's fake player uses an item on a block, in the air or on an entity (`native_use_as_player`), as a deployer does.
+//!
+//! API 412 adds trait mods reach helpers `dyn Host` couldn't carry: `draw_model`, `mod_block_entity` and `change_mod_block_entity` (a neighbour's mod block entity), `item_entities`, `level_random`, `play_sound` and `send_particles` outside level hooks, `block_name_in_tag`, `server_item_in_tag`, item components, `trigger_criterion`, and the player's `equipment` and `sneaking`.
+//!
 //! API 411 adds client Host services, GUI painting, model-head snapshots and client lifecycle notifications.
 //!
 //! API 410 adds a final foreground GUI overlay (`native_gui_render_post`) and the current frame's camera during GUI rendering.
@@ -1165,7 +1370,7 @@ pub(super) use horizon_world::level::flags;
 /// The hook points' API version. The launcher reads this line from the
 /// source it builds; keep its form.
 #[allow(dead_code)]
-pub(crate) const NATIVE_HOOKS_API: u32 = 411;
+pub(crate) const NATIVE_HOOKS_API: u32 = 513;
 
 impl GameLevel<'_> {
     /// A hopper at `pos` is about to pick up `count` of `item`. Set `cancel` to leave the dropped stack in the world. Server-side. 232.
@@ -2195,7 +2400,7 @@ impl Game<'_> {
     /// stack and supplies the block from `Entity.getOnPosLegacy`.
     /// `client` identifies prediction. `discard` consumes the current entity
     /// without loot or pickup. A stack reduced to zero also consumes it.
-    /// @API:item_after_vertical_collision@
+    /// 453
     pub(super) fn native_item_after_vertical_collision(
         &mut self,
         dimension: &str,
@@ -2241,7 +2446,7 @@ impl Game<'_> {
     /// the player with the server's first position, so `native_player` is
     /// None here. A mod may send the server its own packets
     /// (`native_send_packet`). Client only.
-    /// API @API:client_player_network_logging_in@.
+    /// API 439.
     pub(super) fn native_client_player_network_logging_in(&mut self) {
         mod_api::dispatch_client_player_network_logging_in(self, mod_api::mods());
     }
@@ -2257,7 +2462,7 @@ impl Game<'_> {
     /// behind an in-game screen (inventory, container, creative, book, sign, editor).
     /// Set `canceled` (or return `Flow::Cancel`) to suppress the vanilla dark gradient,
     /// allowing a mod to draw its own background or apply menu background blur
-    /// via `Host::apply_screen_blur`. API @API:screen_transparent_background@.
+    /// via `Host::apply_screen_blur`. API 441.
     pub(super) fn native_screen_transparent_background(
         &self,
         screen: &str,
@@ -2573,13 +2778,13 @@ impl Game<'_> {
     /// ticks 20 times a second on the title screen, while paused and in a
     /// world alike, and runs the ticks a slow frame owes back to back. Never
     /// on a server, single player's own included: it ticks on its own thread.
-    /// Client only. API @API:client_tick@.
+    /// Client only. API 438.
     pub(super) fn native_client_tick_pre(&mut self) {
         mod_api::dispatch_client_tick_pre(self, mod_api::mods());
     }
     /// The same client tick ends (`ClientTickEvent.Post`): the world's tick,
     /// the chat queue, music and sounds are done. A tick that errors ends
-    /// before it. Client only. API @API:client_tick@.
+    /// before it. Client only. API 438.
     pub(super) fn native_client_tick_post(&mut self) {
         mod_api::dispatch_client_tick_post(self, mod_api::mods());
     }
@@ -2647,7 +2852,7 @@ impl Game<'_> {
     /// `interactLivingEntity`. Set `claimed` to take the click: the hand
     /// swings and none of those runs. Asked once per hand, as vanilla tries
     /// the main hand then the off hand. Server-side, for every player of the
-    /// world (the helpers read the acting one). API @API:entity_interact_specific@.
+    /// world (the helpers read the acting one). API 447.
     pub(super) fn native_entity_interact_specific(
         &mut self,
         entity: i32,
@@ -2690,7 +2895,7 @@ impl Game<'_> {
     /// Server-side for every acting player. This covers native Mob entries,
     /// not armor stands, other real players or dragon-part interaction tables.
     /// `ItemStack.interactLivingEntity` in `Player.interactOn`.
-    /// API @API:item_interact_mob@.
+    /// API 446.
     pub(super) fn native_item_interact_mob(
         &mut self,
         entity: i32,
@@ -2731,7 +2936,7 @@ impl Game<'_> {
     /// host's for each guest (the helpers read that player), and a remote
     /// client's own prediction, so a mod changes the speed alike on both sides
     /// to keep the crack in step with the server. It is asked every tick of a
-    /// dig, on each side, so it should only compute. API @API:break_speed@.
+    /// dig, on each side, so it should only compute. API 436.
     pub(super) fn native_break_speed(
         &self,
         pos: [i32; 3],
@@ -2746,7 +2951,7 @@ impl Game<'_> {
     /// world, before their digging, item use and cooldowns, and before the
     /// `native_player_tick` that ends the same tick. The helpers read that
     /// player. Players still tick under `/tick freeze`; a dead player
-    /// doesn't. API @API:player_tick_pre@.
+    /// doesn't. API 440.
     pub(super) fn native_player_tick_pre(&mut self) {
         mod_api::dispatch_player_tick_pre(self, mod_api::mods());
     }
@@ -2945,7 +3150,7 @@ impl Game<'_> {
     /// facing the camera, in world coordinates, to `primitives`, each depth tested or seen
     /// through walls (`horizon_client::world_primitives`). Horizon draws them with its own
     /// pipelines after the entities and before the first-person hand, at the world's
-    /// resolution, depth and TAA. Not on the title screen. API @API:world_primitives@.
+    /// resolution, depth and TAA. Not on the title screen. API 424.
     pub(super) fn native_world_primitives(
         &self,
         partial: f32,
@@ -2982,7 +3187,7 @@ impl Game<'_> {
     /// only what this client draws: the entity's `Glowing` flag, what the
     /// server and other players see, stays. Asked each frame for every mob,
     /// player (yourself in third person), dropped item and projectile drawn.
-    /// API @API:entity_outline@.
+    /// API 423.
     pub(super) fn native_entity_outline(
         &self,
         entity_id: u32,
@@ -3205,7 +3410,7 @@ impl Game<'_> {
     /// `createBodyLayer()` builds it. `native_bake_layer` bakes one into the
     /// `ModelPart` tree `native_draw_model_part` draws. Asked once at start,
     /// on every side. An id in vanilla's namespace, not of that form, or
-    /// registered already is logged and left out. API @API:model_layers@.
+    /// registered already is logged and left out. API 433.
     pub(super) fn native_layer_definitions(layers: &mut Vec<(String, LayerDefinition)>) {
         mod_api::dispatch_layer_definitions(mod_api::mods(), layers);
     }
@@ -3319,7 +3524,7 @@ impl Game<'_> {
     /// the fluid there; the fill tries the next tank. Every tank accepts
     /// every fluid unless a mod says otherwise; a cauldron, which holds only
     /// water and lava, and a drain never ask it. Bundles need "hooks":
-    /// @API:block_entity_accepts_fluid@.
+    /// 432.
     pub(super) fn native_block_entity_accepts_fluid(
         &self,
         block: &str,
@@ -3340,7 +3545,7 @@ impl Game<'_> {
     /// when the block fluid helpers resolve their target. True takes precedence over API 54's
     /// `fluids` storage, even when a runtime callback supplies no response.
     /// Set custom to true for your block; never clear an earlier declaration.
-    /// @API:custom_block_fluids@
+    /// 449
     pub(super) fn native_custom_block_fluids(&self, block: &str, custom: &mut bool) {
         mod_api::dispatch_custom_block_fluids(self, mod_api::mods(), block, custom);
     }
@@ -3499,7 +3704,7 @@ impl Game<'_> {
     /// the block's `ModContainer` lets that slot be filled through that face
     /// (its `inputs` and `faces`). Set `cancel` to refuse the item there; the
     /// mover tries the next slot. Not asked for a player's clicks in a menu
-    /// (`native_menu_slot_rules`). Bundles need "hooks": @API:container_accepts@.
+    /// (`native_menu_slot_rules`). Bundles need "hooks": 415.
     pub(super) fn native_container_accepts(
         &self,
         pos: [i32; 3],
@@ -3579,7 +3784,7 @@ impl Game<'_> {
     /// before the hand/HUD. The pose starts camera-relative; use
     /// `draw.translate_world` for a world position. Called independently of
     /// block entities and chunks, so transient overlays may outlive their
-    /// source block. API @API:world_canvas@.
+    /// source block. API 428.
     pub(super) fn native_world_submit(&self, draw: &mut NativeWorldDraw) {
         mod_api::dispatch_world_submit(self, mod_api::mods(), draw);
     }
@@ -4805,7 +5010,7 @@ impl Game<'_> {
     /// The first supplied stack replaces the block's normal clone item;
     /// no response keeps vanilla behavior. Empty or unregistered replacements
     /// produce no picked item, including for a block without a primary item.
-    /// @API:block_clone_item@
+    /// 445
     pub(super) fn native_block_clone_item(
         &self,
         block: &str,
@@ -6003,7 +6208,7 @@ impl Game<'_> {
     /// keep the window in step with the server. The window works its result
     /// out again after each click in the menu, so it may ask about the same
     /// inputs again: a mod should answer from what it is told. On the host,
-    /// `native_prepare_anvil` comes after it. API @API:anvil_update@.
+    /// `native_prepare_anvil` comes after it. API 442.
     pub(super) fn native_anvil_update(
         &mut self,
         player: u128,
@@ -6429,7 +6634,7 @@ impl Game<'_> {
     /// `chunk_load_failure`, `chunk_save_failure`), or empty for
     /// `now_playing`. An update to a toast already queued or shown is not an
     /// add. Set `cancel` and it isn't queued, shown or sounded. Title-screen
-    /// toasts are not told. Client-side. API @API:toast_add@.
+    /// toasts are not told. Client-side. API 431.
     pub(super) fn native_toast_add(&mut self, kind: &str, id: &str, cancel: &mut bool) {
         mod_api::dispatch_toast_add(self, mod_api::mods(), kind, id, cancel);
     }
@@ -6582,7 +6787,7 @@ impl Game<'_> {
     /// was, `entity` and `kind` the mob for a mob's landing (`None` and the
     /// player's type here). `from` and `to` are the block names. Set `cancel`
     /// and the block stays as it was and nothing the change would have caused
-    /// happens, as Bukkit's `EntityChangeBlockEvent` (@API:entity_change_block_v2@).
+    /// happens, as Bukkit's `EntityChangeBlockEvent` (437).
     pub(super) fn native_entity_change_block_v2(
         &mut self,
         player: Option<u128>,
@@ -6857,7 +7062,7 @@ impl Game<'_> {
     /// given, a leading slash included. Set `cancel` and it does not run. Each
     /// line in `replies` answers the source as the console's feedback does: in
     /// the log, and in the RCON or `horizon-server` reply. There is no player:
-    /// the source is the console at level 4. Server-side. API @API:console_line@.
+    /// the source is the console at level 4. Server-side. API 461.
     pub(super) fn native_console_line(
         &mut self,
         source: &str,
@@ -6877,7 +7082,7 @@ impl Game<'_> {
     /// works; `native_send_custom_payload_to_player` answers on a channel of
     /// any name. Heard from a dead player too. Server-side, for every guest
     /// (a single player world's own player sends none). The client side is
-    /// #6774. API @API:custom_payload_from_client@.
+    /// #6774. API 463.
     pub(super) fn native_custom_payload_from_client(
         &mut self,
         player: u128,
@@ -6895,7 +7100,7 @@ impl Game<'_> {
     /// drops and experience, `native_player_died`; they are then saved dead. Once for each placed
     /// player who leaves, before `native_player_logged_out`, on a server. Not heard when the
     /// server stops, where `native_player_logged_out` tells with them still listed.
-    /// @API:player_logging_out@.
+    /// 481.
     pub(super) fn native_player_logging_out(&mut self, player: u128, name: &str) {
         mod_api::dispatch_player_logging_out(self, mod_api::mods(), player, name);
     }
@@ -6915,7 +7120,7 @@ impl Game<'_> {
     /// Channeling's lightning, fire, the effects of a potion or a tipped arrow, and thrown
     /// tridents, which hurt no players yet. Like `native_living_incoming_damage` there is no
     /// `self`: the game is in the middle of the hit. It runs on the server thread.
-    /// @API:player_hurt_by_player@.
+    /// 479.
     pub(super) fn native_player_hurt_by_player(
         attacker: u128,
         attacker_entity: i32,
@@ -6946,7 +7151,7 @@ impl Game<'_> {
     /// teleport follows. A dimension the server does not have, or a value that is not finite,
     /// leaves that part as it was. Once for each join, after `native_player_login` let them in
     /// and before `native_player_logged_in`; no player's state is swapped in (they are in no
-    /// level yet). Server-side. @API:player_spawn_location@.
+    /// level yet). Server-side. 489.
     pub(super) fn native_player_spawn_location(
         &mut self,
         player: u128,
@@ -6970,7 +7175,7 @@ impl Game<'_> {
     /// that threw or dropped it; none for a block's or a mob's drop) and its `position`. Heard
     /// just before `native_item_picked_up`, which hears nothing of a pickup canceled here. Set
     /// `canceled` to leave the stack on the ground: it isn't offered again for 10 ticks.
-    /// Server-side. @API:item_picked_up_v2@.
+    /// Server-side. 468.
     pub(super) fn native_item_picked_up_v2(
         &mut self,
         player: u128,
@@ -6995,7 +7200,7 @@ impl Game<'_> {
     /// thrown: the stack goes back into the player's inventory (`Inventory.add`: the held slot
     /// first), and only what doesn't fit there is thrown, unheard; v1 hears nothing of it. The
     /// drop statistics and the arm swing still happen, as in NeoForge. Server-side.
-    /// @API:item_dropped_v2@.
+    /// 467.
     pub(super) fn native_item_dropped_v2(
         &mut self,
         player: u128,
@@ -7008,7 +7213,7 @@ impl Game<'_> {
     /// a custom name, unbreakable, attribute modifiers, a container's contents...), none for an
     /// emptied slot. Heard just before `native_creative_slot`, which hears nothing of a packet
     /// canceled here. Set `cancel` and the packet is ignored. The player's state is swapped in,
-    /// as for v1. Server-side. @API:creative_slot_v2@.
+    /// as for v1. Server-side. 462.
     pub(super) fn native_creative_slot_v2(
         &mut self,
         player: u128,
@@ -7039,7 +7244,7 @@ impl Game<'_> {
     /// nothing. `player` may be on the server, joining, or unknown to it; it
     /// is often asked with the hub out of reach, so answer from the mod's own
     /// data. Calling `native_has_permission` from inside it asks again.
-    /// Server-side. API @API:permission_check@.
+    /// Server-side. API 471.
     pub(super) fn native_permission_check(
         &self,
         player: u128,
@@ -7067,7 +7272,7 @@ impl Game<'_> {
     /// of `names` and it is hidden, as with v1. This changes only the tree
     /// the client gets: running a granted vanilla command still needs its
     /// level (`native_player_command_level`). Mods are asked in order and
-    /// share both lists. API @API:player_commands_sent_v2@.
+    /// share both lists. API 475.
     pub(super) fn native_player_commands_sent_v2(
         &mut self,
         player: u128,
@@ -7100,7 +7305,7 @@ impl Game<'_> {
     /// for a mod's quiet commands; a LAN world without Allow Commands still
     /// refuses its guests' vanilla commands. The hub is out of reach here and
     /// no player's state is swapped in: answer from the mod's own data.
-    /// Server-side. API @API:player_command_level@.
+    /// Server-side. API 474.
     pub(super) fn native_player_command_level(
         &mut self,
         player: u128,
@@ -7121,7 +7326,7 @@ impl Game<'_> {
     /// already holds the online players' names matching it. Push yours over
     /// `range`. No player's state is swapped in and the server's players are
     /// out of reach (`native_server_players` gives none). Server-side.
-    /// API @API:tab_complete_v2@.
+    /// API 508.
     pub(super) fn native_tab_complete_v2(
         &mut self,
         player: u128,
@@ -7152,7 +7357,7 @@ impl Game<'_> {
     /// moves it), a sleeper, moves before the client loaded the level or while a teleport waits
     /// for its answer, and teleports. It runs inside the server's handling of the packet, once
     /// a move, so it should be cheap; there is no `self` and no player's state is swapped in.
-    /// Server-side. @API:player_move@.
+    /// Server-side. 482.
     pub(super) fn native_player_move(
         player: u128,
         name: &str,
@@ -7191,7 +7396,7 @@ impl Game<'_> {
     /// `native_player_teleport_end_gateway`), respawns (`native_player_respawn_position`), a
     /// rider carried by its vehicle, waking from a bed, a moved player sent back by the server's
     /// checks, and a spectator's camera. There is no `self` and no player's state is swapped in:
-    /// the game is in the middle of the teleport. Server-side. @API:player_teleport@.
+    /// the game is in the middle of the teleport. Server-side. 491.
     pub(super) fn native_player_teleport(
         player: u128,
         name: &str,
@@ -7227,7 +7432,7 @@ impl Game<'_> {
     /// does not have, or a position that is not finite, leaves that part as it was. On a LAN
     /// host's world (not a dedicated server) the level is the Overworld whatever is set. No
     /// player's state is swapped in, and the hub is out of `self.lan`, so `native_tell` reaches
-    /// nobody here. Server-side. @API:player_respawn_position@.
+    /// nobody here. Server-side. 488.
     pub(super) fn native_player_respawn_position(
         &mut self,
         player: u128,
@@ -7256,7 +7461,7 @@ impl Game<'_> {
     /// the chance from the fall, a living entity big enough, `mob_griefing` for a mob). Set
     /// `cancel` and the farmland stays, the crop on it too; the fall damage is taken either
     /// way. There is no `self`: the game is in the middle of the entity's move. Server-side.
-    /// @API:trample@.
+    /// 511.
     pub(super) fn native_trample(
         dimension: &str,
         entity: i32,
@@ -7284,7 +7489,7 @@ impl Game<'_> {
     /// 26.3. Heard once a tick for each projectile inside the border whose next step would
     /// end outside it (a step that drag then keeps inside is heard too); arrows and tridents,
     /// which Horizon does not stop at the border, are not. No `self`: the projectiles are being
-    /// ticked. Server-side. @API:projectile_world_border@.
+    /// ticked. Server-side. 496.
     pub(super) fn native_projectile_world_border(
         dimension: &str,
         entity: u32,
@@ -7311,7 +7516,7 @@ impl Game<'_> {
     /// client, which took the item at once, gets its inventory back. The
     /// guest's state is swapped in. Not heard: bows, crossbows, tridents,
     /// splash potions, experience bottles, wind charges and fireworks.
-    /// Server-side, guests only. @API:player_launch_projectile_v2@.
+    /// Server-side, guests only. 480.
     pub(super) fn native_player_launch_projectile_v2(
         &mut self,
         player: u128,
@@ -7337,7 +7542,7 @@ impl Game<'_> {
     /// nothing moves: the click is handled as one that does nothing, so the
     /// client's predicted slots and cursor are answered with the server's.
     /// No state is swapped in; the helpers that take a UUID reach the player.
-    /// Server-side. @API:inventory_click@.
+    /// Server-side. 465.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn native_inventory_click(
         &mut self,
@@ -7368,7 +7573,7 @@ impl Game<'_> {
     /// client dragged over, in order. Set `cancel` and nothing moves: the
     /// drag ends empty and the client's predicted slots and cursor are
     /// answered with the server's. No state is swapped in. Server-side.
-    /// @API:inventory_drag@.
+    /// 466.
     pub(super) fn native_inventory_drag(
         &mut self,
         player: u128,
@@ -7399,7 +7604,7 @@ impl Game<'_> {
     /// is swapped in. `state` is `getStateForPlacement`'s, before the stack's
     /// `block_state` component; finding it asks `native_state_for_placement`
     /// and `native_can_survive` once more. Server-side, guests only.
-    /// @API:block_place@.
+    /// 456.
     pub(super) fn native_block_place(
         &mut self,
         player: u128,
@@ -7430,7 +7635,7 @@ impl Game<'_> {
     /// instead (not checked against the blocks; a value that is not finite is
     /// ignored). Either way its riders' clients are told, and the next move
     /// is heard from there. Mods are asked in order and share `to` and
-    /// `cancel`. Server-side. API @API:vehicle_moved_v2@.
+    /// `cancel`. Server-side. API 512.
     pub(super) fn native_vehicle_moved_v2(
         &mut self,
         player: Option<u128>,
@@ -8823,7 +9028,7 @@ impl Game<'_> {
     /// Players, mobs and the ender dragon. It runs on the thread that ticks
     /// the world (the server thread): state shared with render thread hooks
     /// needs synchronising. No `self`: the game is in the middle of the hit.
-    /// API @API:living_damage@.
+    /// API 434.
     pub(super) fn native_living_damage_pre(
         entity: i32,
         kind: &str,
@@ -8847,7 +9052,7 @@ impl Game<'_> {
     /// 0 when nothing did (absorption took it all, or a mod made it 0), after
     /// the combat tracker. The arguments are
     /// `native_living_damage_pre`'s. It only hears, on the server thread, with
-    /// no `self`. API @API:living_damage@.
+    /// no `self`. API 434.
     pub(super) fn native_living_damage_post(
         entity: i32,
         kind: &str,
@@ -9732,7 +9937,7 @@ impl Game<'_> {
     /// The default state of the block named `block`, `minecraft:air` or
     /// `mymod:cable` (`Block.defaultBlockState`), what `native_set_block` takes:
     /// a machine clearing or placing a block by name. None for an unknown
-    /// block. API @API:default_state@.
+    /// block. API 443.
     pub(super) fn native_default_state(&self, block: &str) -> Option<BlockStateId> {
         self.pack.assets.registry.default_state(block)
     }
@@ -10071,7 +10276,7 @@ impl Game<'_> {
     /// Requests vanilla's menu background blur for this frame, with a per-frame guard
     /// so blur is applied at most once per frame. Returns true if blur was newly
     /// requested this frame, or false if it was already applied/requested this frame.
-    /// API @API:screen_transparent_background@.
+    /// API 441.
     pub(super) fn native_apply_screen_blur(&self) -> bool {
         if self.screen_blur_requested.get() {
             return false;
@@ -10080,14 +10285,14 @@ impl Game<'_> {
         true
     }
     /// The user's configured menu background blur radius (`menuBackgroundBlurriness` in options.txt,
-    /// usually 0.0 to 10.0; default 5.0). 0.0 means blur is turned off. API @API:screen_transparent_background@.
+    /// usually 0.0 to 10.0; default 5.0). 0.0 means blur is turned off. API 441.
     pub(super) fn native_menu_blur_radius(&self) -> f32 {
         self.settings.menu_blur as f32
     }
     /// `Screen.renderMenuBackground`: draws the tiled menu background (32x32) across `rect`
     /// (`[x, y, w, h]` in GUI pixels). If `in_world` is true, uses the dark translucent
     /// texture (`gui/inworld_menu_background`); otherwise uses the opaque dirt-like
-    /// texture (`gui/menu_background`). API @API:screen_transparent_background@.
+    /// texture (`gui/menu_background`). API 441.
     pub(super) fn native_draw_menu_background(
         &self,
         batch: &mut HudBatch,
@@ -10099,7 +10304,7 @@ impl Game<'_> {
     }
     /// Repeats sprite `sprite` across `rect` (`[x, y, w, h]` in GUI pixels) with each tile
     /// sized `size` GUI pixels square, tinted by `argb`. False when the sprite is not in the HUD atlas.
-    /// API @API:screen_transparent_background@.
+    /// API 441.
     pub(super) fn native_tiled_sprite(
         &self,
         batch: &mut HudBatch,
@@ -10273,14 +10478,14 @@ impl Game<'_> {
     /// more or fewer rows. `layout` draws Horizon's rows and advances their
     /// frame state (the hearts' blink, the bubble pop sound), so call it at
     /// most once a frame, and only when you keep some of its rows.
-    /// API @API:health_hud_state@.
+    /// API 427.
     pub(super) fn native_health_hud_state(&mut self) -> &mut HealthHud {
         &mut self.health_hud
     }
     /// The current value, base plus modifiers, of this client's player's
     /// attribute `name` (`minecraft:armor_toughness`), as vanilla's
     /// `LivingEntity.getAttributeValue`. None with no player, or for an id
-    /// the player has no attribute for. API @API:health_hud_state@.
+    /// the player has no attribute for. API 427.
     pub(super) fn native_local_attribute(&mut self, name: &str) -> Option<f64> {
         self.player.as_mut()?.attribute(name).ok()
     }
