@@ -127,30 +127,29 @@ impl ComposeParams {
 
 /// Backward history sample location for a forward motion vector `m = target-current_source`.
 /// Composition searches near `current_uv - m * strength`.
-pub fn history_uv_from_forward_motion(
-    current_uv: [f32; 2],
-    motion: [f32; 2],
-    strength: f32,
-) -> [f32; 2] {
+pub fn history_uv_from_forward_motion(current_uv: [f32; 2], motion: [f32; 2], strength: f32) -> [f32; 2] {
     [
         current_uv[0] - motion[0] * strength,
         current_uv[1] - motion[1] * strength,
     ]
 }
 
+/// Deterministic fill selection rule (mirrors `compose.wgsl`): pick the first candidate whose
+/// motion validity and edge are acceptable; if none, return neutral fallback.
+pub fn deterministic_fill_select(valid_edge_ok: impl IntoIterator<Item = bool>) -> Option<usize> {
+    valid_edge_ok.into_iter().position(|ok| ok)
+}
+
+/// Neutral color used by deterministic fill when no valid candidate exists.
+pub const FILL_NEUTRAL_RGBA: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
 /// Returns whether `(color_format, edge_format)` are supported by the current TFR WGSL.
-pub fn formats_supported(
-    color_format: wgpu::TextureFormat,
-    edge_format: wgpu::TextureFormat,
-) -> bool {
+pub fn formats_supported(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) -> bool {
     color_format == SUPPORTED_COLOR_FORMAT && edge_format == SUPPORTED_EDGE_FORMAT
 }
 
 /// Validates pipeline formats. Panics with a clear message if unsupported.
-pub fn assert_supported_formats(
-    color_format: wgpu::TextureFormat,
-    edge_format: wgpu::TextureFormat,
-) {
+pub fn assert_supported_formats(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) {
     assert!(
         formats_supported(color_format, edge_format),
         "unsupported TFR formats: color={color_format:?} edge={edge_format:?}; \
@@ -556,6 +555,13 @@ mod tests {
         let uv = history_uv_from_forward_motion([0.5, 0.5], [0.1, -0.05], 1.0);
         assert!((uv[0] - 0.4).abs() < 1.0e-6);
         assert!((uv[1] - 0.55).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn deterministic_fill_picks_first_valid_else_neutral() {
+        assert_eq!(deterministic_fill_select([false, false, true, true]), Some(2));
+        assert_eq!(deterministic_fill_select([false, false]), None);
+        assert_eq!(FILL_NEUTRAL_RGBA, [0.0, 0.0, 0.0, 1.0]);
     }
 
     #[test]
