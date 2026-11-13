@@ -1,10 +1,10 @@
 # TFR (Temporal Frame Reprojection) — design (Horizon, clean room)
 
-**Spec source (only):** `TFR_DESCRIPTION.md` (repo root). No Luxium code/resources were consulted.
+**Spec:** Clean-room behavioural specification (design follows Horizon's rendering contracts). No external implementation code or resources were consulted.
 
-**Scope (M1):** architecture, core↔GPU interface, render integration points, TAA/scale/frame_gen/post/HDR policy, invalidation plan. WGSL shaders and GPU pass implementations are Agent #2 zone (`crates/horizon-client-render/src/tfr/*.wgsl`, `tfr/passes.rs`, `tfr/math.rs` as assigned); this doc defines their contract.
+**Scope (v1):** architecture, core↔GPU interface, render integration points, TAA/scale/frame_gen/post/HDR policy, and invalidation. GPU pass implementations live in `crates/horizon-client-render/src/tfr/*.wgsl`, `tfr/passes.rs`, and `tfr/math.rs`.
 
-**M1 review updates (Refs #15948):** incorporated review feedback from coordinator and Agent #3: TAA/world_post reuse-first investigation, camera-relative matrix/precision rules, LSR scene sizing/rounding, real-mode blit semantics, `WorldKey`, frame_gen precedence, shader-pack fallback, concrete HDR integration plan, explicit cut/motion metrics, preconditions/invalidation/commit contracts, prepared-history rules, and Horizon reversed-Z math conventions.
+**Review notes:** incorporated feedback on TAA/world_post reuse, camera-relative matrix/precision rules, scene sizing/rounding, real-mode blit semantics, `WorldKey`, frame_gen precedence, shader-pack fallback, HDR integration, cut/motion metrics, preconditions/invalidation/commit contracts, prepared-history rules, and Horizon reversed-Z math conventions.
 
 ## 1. Goals and non-goals
 
@@ -13,17 +13,17 @@
 - **Clean-room:** behavior follows the spec + Horizon’s existing renderer contracts only.
 - **Non-goals (initial):** no Luxium compatibility, no shader-pack-specific TFR path in the initial slice (see §6.5), no changes to Mojang assets/logic beyond integration hooks.
 
-## 2. Module layout and ownership
+## 2. Module layout
 
-Planned (all under `crates/horizon-client-render/src/tfr/`):
+All under `crates/horizon-client-render/src/tfr/`:
 
 - `mod.rs` — public surface, re-exports, feature wiring into renderer.
-- `core.rs` (or `state.rs`) — **CPU-only, GPU-free, unit-testable** state machine and decisions (Agent #3 tests target this). **Lead/impl zone.**
-- `history.rs` — CPU-side history metadata (camera, matrices, world id, sizes, validity flags) and invalidation bookkeeping; GPU resources owned by passes but described here. **Lead/impl zone.**
-- `config.rs` — config struct + validation/clamping + change detection. **Lead/impl zone.**
-- `passes.rs`, `math.rs`, `*.wgsl` — GPU passes, shaders, math helpers for motion/prepare/composite. **Agent #2 zone.**
+- `core.rs` — **CPU-only, GPU-free, unit-testable** state machine and decisions.
+- `history.rs` — CPU-side history metadata (camera, matrices, world id, sizes, validity flags) and invalidation bookkeeping; GPU resources owned by passes but described here.
+- `config.rs` — config struct + validation/clamping + change detection.
+- `passes.rs`, `math.rs`, `*.wgsl` — GPU passes, shaders, and math helpers for motion/prepare/composite.
 
-Integration hooks (Lead zone, minimal where touching shared files):
+Integration hooks (minimal where touching shared files):
 
 - `crates/horizon-client-render/src/graphics.rs` — settings fields, load/save, preset/key plumbing as needed.
 - `crates/horizon-client-render/src/gfx.rs` — renderer fields/resources, frame scheduling, real/synthetic branching, target management, present/composite ordering.
@@ -32,7 +32,7 @@ Integration hooks (Lead zone, minimal where touching shared files):
 
 ## 3. Core API (CPU-only, no wgpu types)
 
-Designed so Agent #3 can write conformance-style tests without a device. Types live in `tfr::core`/`tfr::config` and use plain math/value types (`glam`/arrays) only.
+Designed so core tests can write conformance-style tests without a device. Types live in `tfr::core`/`tfr::config` and use plain math/value types (`glam`/arrays) only.
 
 ```rust
 pub struct TfrConfig {
@@ -185,7 +185,7 @@ All thresholds/metrics are fixed, deterministic, and applied consistently (CPU a
 - **Transforms:** `view/proj/view_proj/inv_view_proj` are camera-relative transforms in Horizon’s renderer convention, consistent with `gfx/world_post.rs::reprojection(previous_view_proj, previous_camera, current_view_proj, current_camera)` and frame-generation camera motion. They are not mixed world-space+f32-position matrices. Storage/order follows `glam`/wgpu conventions used by existing shaders (column-major matrices; `matrix * vec4` multiplication order as in current WGSL). CPU/GPU transforms must be equivalent for identical inputs (testable).
 - **Scene/present sizes (LSR/internal scaling):** `scene_size` follows `world_post` target sizing per axis: `max(1, round(present_axis * scale).clamp(1, 8192))` (see `gfx/world_post.rs::sizes_with_upscale`); same formula/rule must be used for core decisions, allocations, and tests. `present_size` is the framebuffer/output size.
 
-## 4. History and resources (GPU, Agent #2 implements; interface fixed here)
+## 4. History and resources (GPU, GPU pass layer implements; interface fixed here)
 
 ### 4.1 Logical artifacts (spec terms)
 - **Scene target (real frames):** color + depth, isolated from presentation until blit/composite; linear-filterable color sampling.
@@ -225,7 +225,7 @@ History is invalidated (and validity flags cleared) before deciding the affected
 
 Caller contract: apply `invalidate` / `on_config_changed` / `on_source_or_size_changed` (and update `FrameContext` flags) **before** `begin_frame` so the decision cannot use stale history.
 
-## 5. GPU pass contract (Agent #2 implements)
+## 5. GPU pass contract (GPU pass layer implements)
 
 All passes deterministic for identical inputs/state/path.
 
@@ -313,7 +313,7 @@ All passes deterministic for identical inputs/state/path.
 
 **CPU/GPU equivalence:** reprojection, cut/meaningful-motion metrics (where applicable), validity classification, and size/rounding rules must be equivalent between CPU core/helpers and GPU passes for identical inputs.
 
-## 9. Testing and conformance hooks (for Agent #3)
+## 9. Testing and conformance hooks (for core tests)
 
 - CPU core tests: alternation limit, cut distance/angle (L2 metric + wrapping), meaningful-motion thresholds behavior (recompute-only, never blocks synthetic), world-active/size/deps/pack gating, config clamp/change invalidation, source/size invalidation ordering, prepared-required gating, deterministic decisions, `scene_size` rounding/max(1), `WorldKey` change invalidation, commit/reset rules (no commit on abort; reset only on successful `commit_real`).
 - Math/contract tests: camera-relative matrix conventions, reversed-Z depth/far-sky handling (far≈0), UV/NDC mapping, sky no-translation path, validity/OOB/`w` epsilon rules, CPU/GPU-equivalent expectations.
@@ -327,5 +327,3 @@ All passes deterministic for identical inputs/state/path.
 - **Shader-pack detection:** concrete unsupported-state conditions wired to safe real fallback.
 - **Constants finalized:** meaningful-motion epsilons, w/bounds/far tolerances, motion-field resolution/iteration limits as per spec/perf constraints.
 
----
-*M1 design authored for branch `tfr/impl` (base `origin/main` 441f49d57e), updated after M1 review and Agent #3 contract review. Refs #15948.*

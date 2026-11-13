@@ -1553,16 +1553,18 @@ pub struct Renderer {
     /// Temporal Frame Reprojection state/config (clean-room, off by default).
     tfr_state: crate::tfr::core::TfrState,
     tfr_cfg: crate::tfr::config::TfrConfig,
-    /// Last presented world color for synthetic fallback (dedicated vertical slice path).
-    tfr_history: Option<TfrHistory>,
+    tfr_gpu: Option<TfrGpuState>,
 }
 
-/// Minimal TFR history resources for the vertical-slice dedicated path.
-struct TfrHistory {
-    color: wgpu::Texture,
-    view: wgpu::TextureView,
-    size: [u32; 2],
-    format: wgpu::TextureFormat,
+/// GPU resources and history metadata for TFR synthetic reconstruction.
+struct TfrGpuState {
+    gpu: crate::tfr::passes::TfrGpuResources,
+    pipelines: crate::tfr::passes::TfrPipelines,
+    motion_params: wgpu::Buffer,
+    compose_params: wgpu::Buffer,
+    /// Camera-relative view-projection of the last committed real frame (unjittered).
+    prev_view_proj: glam::Mat4,
+    prev_camera: [f64; 3],
 }
 
 impl Renderer {
@@ -1576,7 +1578,7 @@ impl Renderer {
                 self.frame_gen.stop();
                 self.frame_gen.on = false;
             } else {
-                self.tfr_history = None;
+                self.tfr_gpu = None;
                 self.tfr_state.invalidate("disabled");
             }
         } else if cfg.enabled {
@@ -1596,9 +1598,11 @@ impl Renderer {
         pack_reads_world: bool,
         native_post: bool,
         fg_frames: bool,
+        scaled: bool,
     ) -> bool {
         self.tfr_cfg.enabled
             && !frame.title
+            && scaled
             && self.world_post.scale == 1.0
             && self.world_post.upscale <= 1.0
             && !pack_reads_world
@@ -1612,30 +1616,53 @@ impl Renderer {
             && self.native.as_ref().and_then(|n| n.post.as_ref()).is_none()
     }
 
-    fn ensure_tfr_history(&mut self, size: [u32; 2], format: wgpu::TextureFormat) -> &wgpu::TextureView {
-        let size = [size[0].max(1), size[1].max(1)];
-        let recreate = self
-            .tfr_history
-            .as_ref()
-            .is_none_or(|h| h.size != size || h.format != format);
-        if recreate {
-            let color = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("TFR history"),
-                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
-            let view = color.create_view(&Default::default());
-            self.tfr_history = Some(TfrHistory { color, view, size, format });
+    fn ensure_tfr_gpu(&mut self, scene_size: [u32; 2]) -> bool {
+        let size = crate::tfr::passes::TfrSize::new(scene_size[0], scene_size[1]);
+        if !size.is_valid() {
+            return false;
         }
-        &self.tfr_history.as_ref().expect("created").view
+        if let Some(g) = &self.tfr_gpu
+            && g.gpu.scene_size.width == size.width
+            && g.gpu.scene_size.height == size.height
+        {
+            return true;
+        }
+        let Some(gpu) = crate::tfr::passes::TfrGpuResources::new(&self.device, size.width, size.height)
+        else {
+            return false;
+        };
+        let pipelines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::tfr::passes::TfrPipelines::new(
+                &self.device,
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureFormat::Rgba8Unorm,
+            )
+        }));
+        let Ok(pipelines) = pipelines else {
+            return false;
+        };
+        let motion_params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TFR motion params"),
+            size: std::mem::size_of::<crate::tfr::passes::MotionParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let compose_params = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("TFR compose params"),
+            size: std::mem::size_of::<crate::tfr::passes::ComposeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.tfr_gpu = Some(TfrGpuState {
+            gpu,
+            pipelines,
+            motion_params,
+            compose_params,
+            prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: [0.0; 3],
+        });
+        self.tfr_state.on_source_or_size_changed();
+        true
     }
 }
 /// Every layer's mip levels, layer major (`first` is the first layer's
@@ -5202,7 +5229,7 @@ impl Renderer {
             capture_result: None,
             tfr_state: crate::tfr::core::TfrState::new(),
             tfr_cfg: crate::tfr::config::TfrConfig::default(),
-            tfr_history: None,
+            tfr_gpu: None,
         })
     }
     /// The first-person hand's quads, which follow `first` quads of the entity buffer.
@@ -5493,7 +5520,7 @@ impl Renderer {
         }
         if self.config.width != width || self.config.height != height {
             self.tfr_state.on_source_or_size_changed();
-            self.tfr_history = None;
+            self.tfr_gpu = None;
         }
         self.config.width = width;
         self.config.height = height;
@@ -9974,8 +10001,16 @@ impl Renderer {
         let scaled = self.world_post.prepare(
             &self.device,
             [self.config.width, self.config.height],
-            pack_reads_world || fg,
+            pack_reads_world || fg || tfr_wants_simple,
         );
+        let tfr_scene_size = self.world_post.size().unwrap_or([self.config.width, self.config.height]);
+        let tfr_simple_pre = self.tfr_simple_path_supported(frame, pack_reads_world, native_post, fg_frames.is_some(), scaled.is_some())
+            && self.output.frame.format == wgpu::TextureFormat::Rgba16Float
+            && tfr_scene_size[0] > 0
+            && tfr_scene_size[1] > 0;
+        if tfr_simple_pre {
+            let _ = self.ensure_tfr_gpu(tfr_scene_size);
+        }
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
             None => (&view_target, &self.depth),
@@ -10058,17 +10093,89 @@ impl Renderer {
         let clear = linear_blend::stored_clear(clear, self.output.frame.linear_light);
         let sky_visible = sky_open(frame);
         laps.lap("r_world_pass");
-        // Temporal Frame Reprojection (simple-path vertical slice): decide before world rendering.
-        // Unsupported/complex paths always take the real world path (safe fallback).
-        let tfr_simple = self.tfr_simple_path_supported(frame, pack_reads_world, native_post, fg_frames.is_some());
-        let tfr_world_size = [self.config.width, self.config.height];
-        let tfr_world_format = self.output.frame.format;
-        let tfr_synthetic = false;
-        let _tfr_do_commit_real = false;
+        // Temporal Frame Reprojection (v1 simple path, DirectScene): decide before world rendering.
+        // Requires scaled isolated scene, Rgba16Float, no TAA/upscale/pack overrides.
+        let tfr_simple = tfr_simple_pre && self.tfr_gpu.is_some();
+        let mut tfr_synthetic = false;
+        let mut tfr_real_capture = false;
         if tfr_simple {
-            // TODO(TFR): depth history + camera-relative matrices + motion/compose required.
-            // Do not substitute frame-hold/repetition for TFR; fall back to real path.
-            self.tfr_state.invalidate("synthetic path not implemented");
+            let cam_world = [frame.camera.x, frame.camera.y, frame.camera.z];
+            let cam = crate::tfr::core::CameraSample {
+                world_pos: cam_world,
+                yaw_deg: frame.yaw,
+                pitch_deg: frame.pitch,
+                view: [[0.0; 4]; 4],
+                proj: [[0.0; 4]; 4],
+                view_proj: view_proj.to_cols_array_2d(),
+                inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            };
+            let ctx = crate::tfr::core::FrameContext {
+                world_active: true,
+                world: crate::tfr::core::WorldKey { dimension: 0, generation: 1 },
+                scene_size: crate::tfr::core::FrameSize { width: tfr_scene_size[0], height: tfr_scene_size[1] },
+                present_size: crate::tfr::core::FrameSize { width: tfr_scene_size[0], height: tfr_scene_size[1] },
+                camera: cam,
+                history_ready: self.tfr_state.has_valid_history(),
+                prepared_history_ready: false,
+                history_source_mode: crate::tfr::core::HistorySourceMode::DirectScene,
+                deps_ready: self.tfr_gpu.is_some(),
+                unsupported_pack_state: false,
+            };
+            match self.tfr_state.begin_frame(self.tfr_cfg, ctx) {
+                crate::tfr::core::Decision::Synthetic => {
+                    if let Some(tfr) = &self.tfr_gpu {
+                        // Motion field from history depth + camera matrices.
+                        let mats = crate::tfr::math::reprojection_matrices(
+                            tfr.prev_view_proj.as_dmat4(),
+                            view_proj.as_dmat4(),
+                            glam::DVec3::from_array(tfr.prev_camera),
+                            glam::DVec3::from_array(cam_world),
+                        );
+                        let mparams = crate::tfr::passes::MotionParams::new(
+                            mats.geometry.to_cols_array_2d(),
+                            mats.sky.to_cols_array_2d(),
+                            tfr_scene_size,
+                            [tfr.gpu.motion_size.width, tfr.gpu.motion_size.height],
+                            crate::tfr::math::W_EPSILON as f32,
+                            crate::tfr::math::BOUNDS_EPSILON as f32,
+                            crate::tfr::math::FAR_DEPTH as f32,
+                        );
+                        self.queue.write_buffer(&tfr.motion_params, 0, bytemuck::bytes_of(&mparams));
+                        tfr.gpu.record_motion(&self.device, &tfr.pipelines, &mut encoder, &tfr.gpu.history_depth_view, &tfr.motion_params);
+                        let cparams = crate::tfr::passes::ComposeParams::new(
+                            self.tfr_cfg.reprojection_strength,
+                            self.tfr_cfg.history_stability,
+                            tfr_scene_size,
+                            false,
+                        );
+                        self.queue.write_buffer(&tfr.compose_params, 0, bytemuck::bytes_of(&cparams));
+                        tfr.gpu.record_compose(
+                            &self.device,
+                            &tfr.pipelines,
+                            &mut encoder,
+                            &tfr.gpu.history_color_view,
+                            &tfr.gpu.linear_sampler,
+                            &tfr.gpu.edge_view,
+                            &tfr.gpu.linear_sampler,
+                            &tfr.gpu.compose_out_view,
+                            &tfr.compose_params,
+                            tfr_scene_size[0],
+                            tfr_scene_size[1],
+                        );
+                        let bg = self.world_post.bind(&self.device, &tfr.gpu.compose_out_view);
+                        self.world_post.finish_with(&mut encoder, &view_target, &bg, self.own_timing.as_mut());
+                        tfr_synthetic = true;
+                    } else {
+                        self.tfr_state.note_fallback_real();
+                    }
+                }
+                crate::tfr::core::Decision::Real { .. } => {
+                    tfr_real_capture = true;
+                }
+            }
+        } else if self.tfr_cfg.enabled && !frame.title {
+            // Not eligible for simple synthetic path; keep rendering real.
+            self.tfr_state.invalidate("unsupported simple path");
         }
 
         // One of Horizon's own packs: this frame's inputs; in a timed frame its sky draws in a
@@ -11735,6 +11842,33 @@ impl Renderer {
                 self.own_timing.as_mut(),
             );
         }
+        // TFR real capture (simple DirectScene, scaled): history from scene color+depth.
+        if tfr_real_capture && !tfr_synthetic {
+            if let (Some((scene_color, scene_depth)), Some(tfr)) = (&scaled, &mut self.tfr_gpu) {
+                tfr.gpu.record_blit(&self.device, &tfr.pipelines, &mut encoder, scene_color, &tfr.gpu.linear_sampler, &tfr.gpu.history_color_view, tfr_scene_size[0], tfr_scene_size[1]);
+                tfr.gpu.record_depth_copy(&self.device, &tfr.pipelines, &mut encoder, scene_depth);
+                tfr.prev_view_proj = view_proj;
+                let inv_vp = view_proj.inverse();
+                tfr.prev_camera = [frame.camera.x, frame.camera.y, frame.camera.z];
+                self.tfr_state.commit_real(crate::tfr::core::RealFrameMeta {
+                    world: crate::tfr::core::WorldKey { dimension: 0, generation: 1 },
+                    scene_size: crate::tfr::core::FrameSize { width: tfr_scene_size[0], height: tfr_scene_size[1] },
+                    present_size: crate::tfr::core::FrameSize { width: tfr_scene_size[0], height: tfr_scene_size[1] },
+                    camera: crate::tfr::core::CameraSample {
+                        world_pos: tfr.prev_camera,
+                        yaw_deg: frame.yaw,
+                        pitch_deg: frame.pitch,
+                        view: [[0.0;4];4], proj: [[0.0;4];4],
+                        view_proj: view_proj.to_cols_array_2d(),
+                        inv_view_proj: inv_vp.to_cols_array_2d(),
+                    },
+                    history_source_mode: crate::tfr::core::HistorySourceMode::DirectScene,
+                    prepared_history_ready: false,
+                });
+            } else {
+                self.tfr_state.note_fallback_real();
+            }
+        }
         if !frame.title {
             let (depth, depth_size) = match &scaled {
                 Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
@@ -11768,7 +11902,9 @@ impl Renderer {
             });
         }
         }
-        let _ = (tfr_simple, tfr_synthetic, _tfr_do_commit_real, tfr_world_size, tfr_world_format);
+        if tfr_synthetic {
+            self.tfr_state.commit_synthetic();
+        }
         // A 0.2 pack in SDR: its picture finishes on 8 bits before the hand, the camera overlays
         // and the HUD draw over it (`overlay_format`).
         let finished = (self.output.frame.overlay_format != self.output.frame.format)
@@ -11797,8 +11933,8 @@ impl Renderer {
             first_hand_vertex: ((world_quads + additive_quads) * 4) as i32,
             crosshair,
             first_crosshair: debug_depth + debug_top,
-            world_depth: scaled.is_none(),
-            real: true,
+            world_depth: scaled.is_none() && !tfr_synthetic,
+            real: !tfr_synthetic,
             hand_drawn: !pack_draws_hand,
             hand_view_proj,
         };

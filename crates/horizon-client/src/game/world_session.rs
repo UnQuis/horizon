@@ -89,6 +89,9 @@ impl Game<'_> {
             return Ok(());
         }
         world_loading::world_data_used();
+        if let Some(r) = &mut self.renderer {
+            r.invalidate_tfr("world open");
+        }
         if self.defer_world_entry(PendingWorldEntry::Local {
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
@@ -155,6 +158,9 @@ impl Game<'_> {
     /// integrated-server selection. Server startup must use this entry point.
     pub(super) fn load_world(&mut self, request: world_loading::WorldRequest) -> Result<()> {
         self.join_world_rest()?;
+        if let Some(r) = &mut self.renderer {
+            r.invalidate_tfr("world load");
+        }
         self.perf.world_opening();
         let prepared = request.prepare(
             &self.res,
@@ -242,6 +248,10 @@ impl Game<'_> {
         Ok(())
     }
     pub(super) fn close_world(&mut self) -> Result<()> {
+        // TFR history is world/view-state specific; never carry it across worlds/dimensions.
+        if let Some(r) = &mut self.renderer {
+            r.invalidate_tfr("world closed");
+        }
         // Pause-menu and death-screen exits use the normal world-close action.
         // A standalone replay owns a synthetic remote session, so it must go
         // through replay cleanup instead of being treated like a server.
