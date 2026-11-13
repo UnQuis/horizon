@@ -1590,6 +1590,22 @@ impl Renderer {
         self.tfr_state.invalidate(reason);
     }
 
+    fn tfr_simple_path_supported(
+        &self,
+        frame: &Frame<'_>,
+        pack_reads_world: bool,
+        native_post: bool,
+        fg_frames: bool,
+    ) -> bool {
+        self.tfr_cfg.enabled
+            && !frame.title
+            && !pack_reads_world
+            && !native_post
+            && !fg_frames
+            && self.native.as_ref().and_then(|n| n.material.as_ref()).is_none()
+            && self.native.as_ref().and_then(|n| n.post.as_ref()).is_none()
+    }
+
     fn ensure_tfr_history(&mut self, size: [u32; 2], format: wgpu::TextureFormat) -> &wgpu::TextureView {
         let size = [size[0].max(1), size[1].max(1)];
         let recreate = self
@@ -10024,8 +10040,54 @@ impl Renderer {
         let clear = linear_blend::stored_clear(clear, self.output.frame.linear_light);
         let sky_visible = sky_open(frame);
         laps.lap("r_world_pass");
+        // Temporal Frame Reprojection (simple-path vertical slice): decide before world rendering.
+        // Unsupported/complex paths always take the real world path (safe fallback).
+        let tfr_simple = self.tfr_simple_path_supported(frame, pack_reads_world, native_post, fg_frames.is_some());
+        let tfr_world_size = [self.config.width, self.config.height];
+        let tfr_world_format = self.output.frame.format;
+        let mut tfr_synthetic = false;
+        let mut tfr_do_commit_real = false;
+        if tfr_simple {
+            let cam = crate::tfr::core::CameraSample {
+                world_pos: [frame.camera.x, frame.camera.y, frame.camera.z],
+                yaw_deg: frame.yaw,
+                pitch_deg: frame.pitch,
+                view: [[0.0; 4]; 4],
+                proj: [[0.0; 4]; 4],
+                view_proj: [[0.0; 4]; 4],
+                inv_view_proj: [[0.0; 4]; 4],
+            };
+            let ctx = crate::tfr::core::FrameContext {
+                world_active: !frame.title,
+                world: crate::tfr::core::WorldKey { dimension: 0, generation: 1 },
+                scene_size: crate::tfr::core::FrameSize { width: tfr_world_size[0], height: tfr_world_size[1] },
+                present_size: crate::tfr::core::FrameSize { width: tfr_world_size[0], height: tfr_world_size[1] },
+                camera: cam,
+                history_ready: self.tfr_history.as_ref().is_some_and(|h| h.size == tfr_world_size && h.format == tfr_world_format),
+                prepared_history_ready: false,
+                history_source_mode: crate::tfr::core::HistorySourceMode::DirectScene,
+                deps_ready: true,
+                unsupported_pack_state: false,
+            };
+            match self.tfr_state.begin_frame(self.tfr_cfg, ctx) {
+                crate::tfr::core::Decision::Synthetic => {
+                    if let Some(hist) = &self.tfr_history {
+                        // Present previous world image (before overlays) without rendering world.
+                        self.world_post.finish_with(&mut encoder, &view_target, &self.world_post.bind(&self.device, &hist.view), None);
+                        tfr_synthetic = true;
+                    } else {
+                        self.tfr_state.note_fallback_real();
+                    }
+                }
+                crate::tfr::core::Decision::Real { .. } => {
+                    tfr_do_commit_real = true;
+                }
+            }
+        }
+
         // One of Horizon's own packs: this frame's inputs; in a timed frame its sky draws in a
         // pass of its own, so that it has a time of its own.
+        if !tfr_synthetic {
         let mut native_sky_pass = false;
         if !frame.title
             && let Some(native) = &mut self.native
@@ -11718,6 +11780,37 @@ impl Renderer {
                     filtered: &self.sprite_sampler,
                 },
             });
+        }
+        } else {
+            // Synthetic: world image already in view_target; skip world rendering/post passes.
+        }
+        // TFR history capture/commit for simple real path (world image ready in view_target, before overlays).
+        if tfr_simple && !tfr_synthetic {
+            let _ = self.ensure_tfr_history(tfr_world_size, tfr_world_format);
+            if let Some(hist) = &self.tfr_history {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &target_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &hist.color, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: tfr_world_size[0], height: tfr_world_size[1], depth_or_array_layers: 1 },
+                );
+                if tfr_do_commit_real {
+                    let cam = crate::tfr::core::CameraSample {
+                        world_pos: [frame.camera.x, frame.camera.y, frame.camera.z],
+                        yaw_deg: frame.yaw, pitch_deg: frame.pitch,
+                        view: [[0.0;4];4], proj: [[0.0;4];4], view_proj: [[0.0;4];4], inv_view_proj: [[0.0;4];4],
+                    };
+                    self.tfr_state.commit_real(crate::tfr::core::RealFrameMeta {
+                        world: crate::tfr::core::WorldKey { dimension: 0, generation: 1 },
+                        scene_size: crate::tfr::core::FrameSize { width: tfr_world_size[0], height: tfr_world_size[1] },
+                        present_size: crate::tfr::core::FrameSize { width: tfr_world_size[0], height: tfr_world_size[1] },
+                        camera: cam,
+                        history_source_mode: crate::tfr::core::HistorySourceMode::DirectScene,
+                        prepared_history_ready: false,
+                    });
+                }
+            }
+        } else if tfr_synthetic {
+            self.tfr_state.commit_synthetic();
         }
         // A 0.2 pack in SDR: its picture finishes on 8 bits before the hand, the camera overlays
         // and the HUD draw over it (`overlay_format`).
