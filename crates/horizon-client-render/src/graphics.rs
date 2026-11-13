@@ -1145,17 +1145,17 @@ impl Graphics {
                 "frameGeneration" => g.frame_generation = FrameGeneration::parse(value),
                 "tfr" => g.tfr = flag(g.tfr),
                 "tfrReprojectionStrength" => {
-                    g.tfr_reprojection_strength = value.parse::<f32>().unwrap_or(g.tfr_reprojection_strength)
+                    g.tfr_reprojection_strength =
+                        value.parse::<f32>().unwrap_or(g.tfr_reprojection_strength)
                 }
                 "tfrHistoryStability" => {
-                    g.tfr_history_stability = value.parse::<f32>().unwrap_or(g.tfr_history_stability)
+                    g.tfr_history_stability =
+                        value.parse::<f32>().unwrap_or(g.tfr_history_stability)
                 }
                 "tfrCutDistance" => {
                     g.tfr_cut_distance = value.parse::<f32>().unwrap_or(g.tfr_cut_distance)
                 }
-                "tfrCutAngle" => {
-                    g.tfr_cut_angle = value.parse::<f32>().unwrap_or(g.tfr_cut_angle)
-                }
+                "tfrCutAngle" => g.tfr_cut_angle = value.parse::<f32>().unwrap_or(g.tfr_cut_angle),
                 "hdr" => g.hdr = HdrMode::parse(value, g.hdr),
                 "hdrLighting" => g.hdr_lighting = flag(g.hdr_lighting),
                 "hdrPaperWhite" => g.hdr_paper_white = nits_setting(number(g.hdr_paper_white)),
