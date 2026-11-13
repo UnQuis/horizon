@@ -1574,10 +1574,14 @@ impl Renderer {
             self.tfr_cfg = cfg;
             if cfg.enabled {
                 self.frame_gen.stop();
+                self.frame_gen.on = false;
             } else {
                 self.tfr_history = None;
                 self.tfr_state.invalidate("disabled");
             }
+        } else if cfg.enabled {
+            self.frame_gen.stop();
+            self.frame_gen.on = false;
         }
     }
 
