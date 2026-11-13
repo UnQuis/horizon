@@ -107,6 +107,7 @@ pub enum H {
     UpscalingSharpness,
     ScreenshotQuality,
     FrameGeneration,
+    Tfr,
     Hdr,
     HdrBlackLevel,
     /// Starts HDR calibration (`crate::hdr_calibration`).
@@ -402,6 +403,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             H::FrameGeneration,
                             Medium,
                             "Shows a made-up frame between each two real ones: smoother, a little more lag.",
+                        ),
+                        h(
+                            H::Tfr,
+                            Medium,
+                            "Temporal Frame Reprojection: alternates a fully rendered frame with a reprojected one for performance. Off by default; may add artifacts.",
                         ),
                     ],
                 ),
@@ -945,7 +951,8 @@ impl H {
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
-            H::FrameGeneration => labelled("Frame Generation", g.frame_generation.label()),
+            H::FrameGeneration => labelled("Frame Generation", g.frame_generation_effective().label()),
+            H::Tfr => labelled("Temporal Reprojection", on_off(g.tfr)),
             H::Hdr => labelled("HDR", g.hdr.label()),
             H::HdrCalibrate => Text::literal(lang::get(match setup(s, out) {
                 Setup::Unknown | Setup::Guessed => "Calibrate...",
@@ -1081,7 +1088,16 @@ impl H {
                 )
             }
             H::FrameGeneration => {
-                g.frame_generation = step(&FrameGeneration::ALL, g.frame_generation, back)
+                g.frame_generation = step(&FrameGeneration::ALL, g.frame_generation, back);
+                if g.tfr {
+                    g.frame_generation = FrameGeneration::Off;
+                }
+            }
+            H::Tfr => {
+                g.tfr = !g.tfr;
+                if g.tfr {
+                    g.frame_generation = FrameGeneration::Off;
+                }
             }
             // Any choice tries HDR output again on a driver a start failed on.
             H::Hdr => {
@@ -1197,6 +1213,7 @@ impl Item {
             Item::Horizon(H::CacheShulkerBoxes) => g.cache_shulker_boxes,
             Item::Horizon(H::CacheSigns) => g.cache_signs,
             Item::Horizon(H::CacheDecoratedPots) => g.cache_decorated_pots,
+            Item::Horizon(H::Tfr) => g.tfr,
             Item::Horizon(H::CacheBells) => g.cache_bells,
             Item::Horizon(H::CacheChests) => g.cache_chests,
             Item::Horizon(H::CacheBanners) => g.cache_banners,

@@ -1550,6 +1550,67 @@ pub struct Renderer {
     pub capture: Option<capture::Request>,
     /// Outcome of the last capture: its summary, or the error.
     pub capture_result: Option<std::result::Result<serde_json::Value, String>>,
+    /// Temporal Frame Reprojection state/config (clean-room, off by default).
+    tfr_state: crate::tfr::core::TfrState,
+    tfr_cfg: crate::tfr::config::TfrConfig,
+    /// Last presented world color for synthetic fallback (dedicated vertical slice path).
+    tfr_history: Option<TfrHistory>,
+}
+
+/// Minimal TFR history resources for the vertical-slice dedicated path.
+struct TfrHistory {
+    color: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: [u32; 2],
+    format: wgpu::TextureFormat,
+}
+
+impl Renderer {
+    /// Apply TFR settings (off by default). TFR has priority over frame generation.
+    pub fn set_tfr(&mut self, cfg: crate::tfr::config::TfrConfig) {
+        let cfg = cfg.sanitized();
+        if self.tfr_cfg != cfg {
+            self.tfr_state.on_config_changed(cfg);
+            self.tfr_cfg = cfg;
+            if cfg.enabled {
+                self.frame_gen.stop();
+            } else {
+                self.tfr_history = None;
+                self.tfr_state.invalidate("disabled");
+            }
+        }
+    }
+
+    /// Invalidate TFR history (resize/scale/source/world changes).
+    pub fn invalidate_tfr(&mut self, reason: &'static str) {
+        self.tfr_state.invalidate(reason);
+    }
+
+    fn ensure_tfr_history(&mut self, size: [u32; 2], format: wgpu::TextureFormat) -> &wgpu::TextureView {
+        let size = [size[0].max(1), size[1].max(1)];
+        let recreate = self
+            .tfr_history
+            .as_ref()
+            .is_none_or(|h| h.size != size || h.format != format);
+        if recreate {
+            let color = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("TFR history"),
+                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = color.create_view(&Default::default());
+            self.tfr_history = Some(TfrHistory { color, view, size, format });
+        }
+        &self.tfr_history.as_ref().expect("created").view
+    }
 }
 /// Every layer's mip levels, layer major (`first` is the first layer's
 /// index into `settings`), made by `MipmapGenerator`.
@@ -5113,6 +5174,9 @@ impl Renderer {
                 .then(capture::Copies::default),
             capture: None,
             capture_result: None,
+            tfr_state: crate::tfr::core::TfrState::new(),
+            tfr_cfg: crate::tfr::config::TfrConfig::default(),
+            tfr_history: None,
         })
     }
     /// The first-person hand's quads, which follow `first` quads of the entity buffer.
@@ -6917,6 +6981,11 @@ impl Renderer {
     }
     /// Frame generation on or off (FSR 3.1's frame interpolation).
     pub fn set_frame_generation(&mut self, on: bool) {
+        if self.tfr_cfg.enabled {
+            self.frame_gen.stop();
+            self.frame_gen.on = false;
+            return;
+        }
         if !on {
             self.frame_gen.stop();
         }
