@@ -759,6 +759,7 @@ impl TfrGpuResources {
             dimension: wgpu::TextureDimension::D2,
             format: SUPPORTED_COLOR_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
