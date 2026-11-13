@@ -1599,10 +1599,16 @@ impl Renderer {
     ) -> bool {
         self.tfr_cfg.enabled
             && !frame.title
+            && self.world_post.scale == 1.0
+            && self.world_post.upscale <= 1.0
             && !pack_reads_world
             && !native_post
             && !fg_frames
-            && self.native.as_ref().and_then(|n| n.material.as_ref()).is_none()
+            && self
+                .native
+                .as_ref()
+                .and_then(|n| n.material.as_ref())
+                .is_none()
             && self.native.as_ref().and_then(|n| n.post.as_ref()).is_none()
     }
 
@@ -8149,7 +8155,18 @@ impl Renderer {
         let view_proj = views.primary().view_proj(pose);
         laps.lap("r_acquire");
         // TAA runs where the world post pass does, not under a shader pack's own.
-        let taa = !frame.title
+        // TFR (when eligible) takes priority and disables TAA jitter/accumulation.
+        // Simple path (initial): scale 1.0, no upscale/TAA jitter conflicts.
+        let tfr_wants_simple = self.tfr_cfg.enabled
+            && !frame.title
+            && self.world_post.scale == 1.0
+            && self.world_post.upscale <= 1.0
+            && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
+            && self.native
+                .as_ref()
+                .is_none_or(|n| n.post.is_none() && n.material.is_none());
+        let taa = !tfr_wants_simple
+            && !frame.title
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
             && self.native.as_ref().is_none_or(|n| n.post.is_none());
         let hdr_lighting = self.shader_pack_kind().is_none();
@@ -9906,7 +9923,8 @@ impl Renderer {
             || (taa && self.world_post.taa)
             || oit_on
             || native_render::render_needs().world_depth
-            || fg;
+            || fg
+            || self.tfr_cfg.enabled;
         // The pack's program reads the vertices this frame's draws bind.
         let pack_draws_terrain = pack_terrain && flat_frame == self.pack_terrain_flat;
         // The shadow camera's lists, drawn by the pack's shadow programs.
