@@ -5469,6 +5469,10 @@ impl Renderer {
         if self.suspended {
             return;
         }
+        if self.config.width != width || self.config.height != height {
+            self.tfr_state.on_source_or_size_changed();
+            self.tfr_history = None;
+        }
         self.config.width = width;
         self.config.height = height;
         if self.surface.is_some() {
