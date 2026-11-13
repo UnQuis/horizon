@@ -9,10 +9,10 @@
 
 use horizon_client_render::tfr::config::TfrConfig;
 use horizon_client_render::tfr::core::{
+    CameraSample, Decision, FrameContext, FrameSize, HistorySourceMode, MOTION_ANGLE_EPS_DEG,
+    MOTION_POS_EPS, MOTION_POS_EPS2, RealFrameMeta, RealReason, TfrState, WorldKey,
     angle_metric_deg, clamp_pitch_deg, distance_sq, meaningful_motion, motion_field_size,
-    scene_size, scene_size_unclamped, wrap_degrees, CameraSample, Decision, FrameContext,
-    FrameSize, HistorySourceMode, RealFrameMeta, RealReason, TfrState, WorldKey,
-    MOTION_ANGLE_EPS_DEG, MOTION_POS_EPS, MOTION_POS_EPS2,
+    scene_size, scene_size_unclamped, wrap_degrees,
 };
 
 fn default_config() -> TfrConfig {
@@ -40,10 +40,30 @@ fn camera(pos: [f64; 3], yaw_deg: f32, pitch_deg: f32) -> CameraSample {
         yaw_deg,
         pitch_deg,
         // Decision/state tests do not require specific matrices.
-        view: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
-        proj: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
-        view_proj: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
-        inv_view_proj: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        view: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        proj: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        view_proj: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        inv_view_proj: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
     }
 }
 
@@ -51,8 +71,14 @@ fn base_ctx(cam: CameraSample) -> FrameContext {
     FrameContext {
         world_active: true,
         world: world(1),
-        scene_size: FrameSize { width: 1280, height: 720 },
-        present_size: FrameSize { width: 1280, height: 720 },
+        scene_size: FrameSize {
+            width: 1280,
+            height: 720,
+        },
+        present_size: FrameSize {
+            width: 1280,
+            height: 720,
+        },
         camera: cam,
         history_ready: false,
         prepared_history_ready: true,
@@ -71,8 +97,14 @@ fn ready_ctx(cam: CameraSample) -> FrameContext {
 fn real_meta(world_key: WorldKey, cam: CameraSample, mode: HistorySourceMode) -> RealFrameMeta {
     RealFrameMeta {
         world: world_key,
-        scene_size: FrameSize { width: 1280, height: 720 },
-        present_size: FrameSize { width: 1280, height: 720 },
+        scene_size: FrameSize {
+            width: 1280,
+            height: 720,
+        },
+        present_size: FrameSize {
+            width: 1280,
+            height: 720,
+        },
         camera: cam,
         history_source_mode: mode,
         prepared_history_ready: true,
@@ -95,7 +127,10 @@ fn assert_real_reason(decision: Decision, expected: RealReason) {
 }
 
 fn assert_synthetic(decision: Decision) {
-    assert!(matches!(decision, Decision::Synthetic), "expected Synthetic, got {decision:?}");
+    assert!(
+        matches!(decision, Decision::Synthetic),
+        "expected Synthetic, got {decision:?}"
+    );
 }
 
 // C-01: enabled default off
@@ -144,32 +179,80 @@ fn config_clamps_to_spec_ranges() {
 fn scene_size_unclamped_rounds_per_axis_and_enforces_min_one() {
     // Spec: round(present*scale) per axis, min 1.
     assert_eq!(
-        scene_size_unclamped(FrameSize { width: 1920, height: 1080 }, 0.5),
-        FrameSize { width: 960, height: 540 }
+        scene_size_unclamped(
+            FrameSize {
+                width: 1920,
+                height: 1080
+            },
+            0.5
+        ),
+        FrameSize {
+            width: 960,
+            height: 540
+        }
     );
     assert_eq!(
-        scene_size_unclamped(FrameSize { width: 3, height: 3 }, 0.5),
-        FrameSize { width: 2, height: 2 } // 1.5 rounds to 2
+        scene_size_unclamped(
+            FrameSize {
+                width: 3,
+                height: 3
+            },
+            0.5
+        ),
+        FrameSize {
+            width: 2,
+            height: 2
+        } // 1.5 rounds to 2
     );
     assert_eq!(
-        scene_size_unclamped(FrameSize { width: 3, height: 3 }, 0.34),
-        FrameSize { width: 1, height: 1 } // 1.02 rounds to 1
+        scene_size_unclamped(
+            FrameSize {
+                width: 3,
+                height: 3
+            },
+            0.34
+        ),
+        FrameSize {
+            width: 1,
+            height: 1
+        } // 1.02 rounds to 1
     );
     assert_eq!(
-        scene_size_unclamped(FrameSize { width: 100, height: 100 }, 0.001),
-        FrameSize { width: 1, height: 1 }
+        scene_size_unclamped(
+            FrameSize {
+                width: 100,
+                height: 100
+            },
+            0.001
+        ),
+        FrameSize {
+            width: 1,
+            height: 1
+        }
     );
 }
 
 #[test]
 fn motion_field_size_is_half_scene_min_one() {
     assert_eq!(
-        motion_field_size(FrameSize { width: 1920, height: 1080 }),
-        FrameSize { width: 960, height: 540 }
+        motion_field_size(FrameSize {
+            width: 1920,
+            height: 1080
+        }),
+        FrameSize {
+            width: 960,
+            height: 540
+        }
     );
     assert_eq!(
-        motion_field_size(FrameSize { width: 3, height: 1 }),
-        FrameSize { width: 1, height: 1 }
+        motion_field_size(FrameSize {
+            width: 3,
+            height: 1
+        }),
+        FrameSize {
+            width: 1,
+            height: 1
+        }
     );
 }
 
@@ -188,13 +271,19 @@ fn alternates_one_synthetic_after_each_successful_real() {
     assert_synthetic(state.begin_frame(cfg, ready_ctx(cam)));
     state.commit_synthetic();
 
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(cam)), RealReason::LimitReached);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        RealReason::LimitReached,
+    );
     commit_successful_real(&mut state, w, cam);
 
     assert_synthetic(state.begin_frame(cfg, ready_ctx(cam)));
     state.commit_synthetic();
 
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(cam)), RealReason::LimitReached);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        RealReason::LimitReached,
+    );
 }
 
 // D-01: disabled => real, no synthetic
@@ -206,7 +295,10 @@ fn disabled_never_synthetic() {
     state.on_config_changed(enabled);
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), cam);
-    assert_real_reason(state.begin_frame(disabled, ready_ctx(cam)), RealReason::Disabled);
+    assert_real_reason(
+        state.begin_frame(disabled, ready_ctx(cam)),
+        RealReason::Disabled,
+    );
 }
 
 // D-01: no active world
@@ -248,7 +340,10 @@ fn invalid_scene_size_requires_real() {
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), cam);
     let mut c = ready_ctx(cam);
-    c.scene_size = FrameSize { width: 0, height: 720 };
+    c.scene_size = FrameSize {
+        width: 0,
+        height: 720,
+    };
     assert_real_reason(state.begin_frame(cfg, c), RealReason::InvalidSize);
 }
 
@@ -260,7 +355,10 @@ fn invalid_present_size_requires_real() {
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), cam);
     let mut c = ready_ctx(cam);
-    c.present_size = FrameSize { width: 1280, height: 0 };
+    c.present_size = FrameSize {
+        width: 1280,
+        height: 0,
+    };
     assert_real_reason(state.begin_frame(cfg, c), RealReason::InvalidSize);
 }
 
@@ -273,9 +371,15 @@ fn scene_size_mismatch_requires_real() {
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), cam);
     let mut c = ready_ctx(cam);
-    c.scene_size = FrameSize { width: 1920, height: 1080 };
+    c.scene_size = FrameSize {
+        width: 1920,
+        height: 1080,
+    };
     let reason = assert_real(state.begin_frame(cfg, c));
-    assert!(matches!(reason, RealReason::SizeMismatch | RealReason::Invalidated));
+    assert!(matches!(
+        reason,
+        RealReason::SizeMismatch | RealReason::Invalidated
+    ));
 }
 
 #[test]
@@ -286,9 +390,15 @@ fn present_size_mismatch_requires_real() {
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), cam);
     let mut c = ready_ctx(cam);
-    c.present_size = FrameSize { width: 1920, height: 1080 };
+    c.present_size = FrameSize {
+        width: 1920,
+        height: 1080,
+    };
     let reason = assert_real(state.begin_frame(cfg, c));
-    assert!(matches!(reason, RealReason::SizeMismatch | RealReason::Invalidated));
+    assert!(matches!(
+        reason,
+        RealReason::SizeMismatch | RealReason::Invalidated
+    ));
 }
 
 // D-03: missing dependencies => safe real
@@ -397,7 +507,10 @@ fn distance_above_threshold_requires_real_cut() {
     let ref_cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), ref_cam);
     let above = camera([10.0001, 64.0, 0.0], 0.0, 0.0);
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(above)), RealReason::CutDistance);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(above)),
+        RealReason::CutDistance,
+    );
 }
 
 #[test]
@@ -434,7 +547,10 @@ fn angle_above_threshold_requires_real_cut() {
     let ref_cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     commit_successful_real(&mut state, world(1), ref_cam);
     let above = camera([0.0, 64.0, 0.0], 14.01, 0.0);
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(above)), RealReason::CutAngle);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(above)),
+        RealReason::CutAngle,
+    );
 }
 
 #[test]
@@ -469,7 +585,10 @@ fn pitch_limits_must_not_wrap_like_yaw() {
     commit_successful_real(&mut state, world(1), ref_cam);
     // 178 degrees apart in value, not a small orientation change.
     let flipped = camera([0.0, 64.0, 0.0], 0.0, -89.0);
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(flipped)), RealReason::CutAngle);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(flipped)),
+        RealReason::CutAngle,
+    );
 }
 
 #[test]
@@ -527,7 +646,10 @@ fn invalidate_clears_history() {
     commit_successful_real(&mut state, world(1), cam);
     state.invalidate("test");
     assert!(!state.has_valid_history());
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(cam)), RealReason::NoHistory);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        RealReason::NoHistory,
+    );
 }
 
 #[test]
@@ -551,7 +673,10 @@ fn source_or_size_change_invalidates_history() {
     commit_successful_real(&mut state, world(1), cam);
     state.on_source_or_size_changed();
     assert!(!state.has_valid_history());
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(cam)), RealReason::NoHistory);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        RealReason::NoHistory,
+    );
 }
 
 // begin_frame is deterministic for unchanged state/context; synthetic slot is consumed by commit_synthetic (not by decision).
@@ -565,7 +690,10 @@ fn repeated_decision_without_commit_returns_same_decision_until_committed() {
     assert_synthetic(state.begin_frame(cfg, ready_ctx(cam)));
     assert_synthetic(state.begin_frame(cfg, ready_ctx(cam)));
     state.commit_synthetic();
-    assert_real_reason(state.begin_frame(cfg, ready_ctx(cam)), RealReason::LimitReached);
+    assert_real_reason(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        RealReason::LimitReached,
+    );
 }
 
 #[test]
@@ -607,7 +735,10 @@ fn fallback_real_invalidates_synthetic_eligibility() {
     commit_successful_real(&mut state, world(1), cam);
     state.note_fallback_real();
     assert!(!state.has_valid_history());
-    assert!(!matches!(state.begin_frame(cfg, ready_ctx(cam)), Decision::Synthetic));
+    assert!(!matches!(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        Decision::Synthetic
+    ));
 }
 
 #[test]
@@ -619,7 +750,10 @@ fn fallback_then_fresh_real_can_reenable_synthetic() {
     let w = world(1);
     commit_successful_real(&mut state, w, cam);
     state.note_fallback_real();
-    assert!(!matches!(state.begin_frame(cfg, ready_ctx(cam)), Decision::Synthetic));
+    assert!(!matches!(
+        state.begin_frame(cfg, ready_ctx(cam)),
+        Decision::Synthetic
+    ));
     commit_successful_real(&mut state, w, cam);
     assert_synthetic(state.begin_frame(cfg, ready_ctx(cam)));
 }
@@ -633,7 +767,10 @@ fn no_synthetic_without_fresh_successful_real_after_invalidate() {
     commit_successful_real(&mut state, world(1), cam);
     state.invalidate("test");
     let reason = assert_real(state.begin_frame(cfg, base_ctx(cam)));
-    assert!(matches!(reason, RealReason::NoHistory | RealReason::Invalidated));
+    assert!(matches!(
+        reason,
+        RealReason::NoHistory | RealReason::Invalidated
+    ));
 }
 
 #[test]
@@ -653,11 +790,19 @@ fn history_ready_false_invalidates_stale_history() {
 #[test]
 fn scene_size_world_post_compatible_clamps_to_device_like_range() {
     assert_eq!(
-        scene_size(FrameSize { width: 1920, height: 1080 }, 10.0),
-        FrameSize { width: 8192, height: 8192 }
+        scene_size(
+            FrameSize {
+                width: 1920,
+                height: 1080
+            },
+            10.0
+        ),
+        FrameSize {
+            width: 8192,
+            height: 8192
+        }
     );
 }
-
 
 // Pitch is clamped to valid range; yaw is wrapped for shortest angular delta (CM-02 / math conventions).
 #[test]
@@ -668,7 +813,11 @@ fn pitch_is_clamped_not_wrapped() {
     let a = camera([0.0, 64.0, 0.0], 0.0, 95.0);
     let b = camera([0.0, 64.0, 0.0], 0.0, -95.0);
     // clamped to +90 and -90 => 180 deg apart, not wrapped to small delta
-    assert!(angle_metric_deg(&a, &b) >= 179.9, "{}", angle_metric_deg(&a, &b));
+    assert!(
+        angle_metric_deg(&a, &b) >= 179.9,
+        "{}",
+        angle_metric_deg(&a, &b)
+    );
 }
 
 // Unified meaningful-motion epsilons (documented, fixed, below cut ranges).

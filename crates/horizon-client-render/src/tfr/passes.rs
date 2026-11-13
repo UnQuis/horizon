@@ -127,7 +127,11 @@ impl ComposeParams {
 
 /// Backward history sample location for a forward motion vector `m = target-current_source`.
 /// Composition searches near `current_uv - m * strength`.
-pub fn history_uv_from_forward_motion(current_uv: [f32; 2], motion: [f32; 2], strength: f32) -> [f32; 2] {
+pub fn history_uv_from_forward_motion(
+    current_uv: [f32; 2],
+    motion: [f32; 2],
+    strength: f32,
+) -> [f32; 2] {
     [
         current_uv[0] - motion[0] * strength,
         current_uv[1] - motion[1] * strength,
@@ -135,12 +139,18 @@ pub fn history_uv_from_forward_motion(current_uv: [f32; 2], motion: [f32; 2], st
 }
 
 /// Returns whether `(color_format, edge_format)` are supported by the current TFR WGSL.
-pub fn formats_supported(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) -> bool {
+pub fn formats_supported(
+    color_format: wgpu::TextureFormat,
+    edge_format: wgpu::TextureFormat,
+) -> bool {
     color_format == SUPPORTED_COLOR_FORMAT && edge_format == SUPPORTED_EDGE_FORMAT
 }
 
 /// Validates pipeline formats. Panics with a clear message if unsupported.
-pub fn assert_supported_formats(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) {
+pub fn assert_supported_formats(
+    color_format: wgpu::TextureFormat,
+    edge_format: wgpu::TextureFormat,
+) {
     assert!(
         formats_supported(color_format, edge_format),
         "unsupported TFR formats: color={color_format:?} edge={edge_format:?}; \

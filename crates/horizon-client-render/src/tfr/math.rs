@@ -150,8 +150,8 @@ pub fn reprojection_matrices(
     current_camera: DVec3,
 ) -> ReprojectionMatrices {
     let inv = reference_vp.inverse();
-    let geometry = (current_vp * DMat4::from_translation(reference_camera - current_camera) * inv)
-        .as_mat4();
+    let geometry =
+        (current_vp * DMat4::from_translation(reference_camera - current_camera) * inv).as_mat4();
     let sky = (current_vp * inv).as_mat4();
     ReprojectionMatrices { geometry, sky }
 }
@@ -318,7 +318,8 @@ mod tests {
     /// Rotation-only camera-relative VP (projection * pose * rotation), Horizon reversed-Z.
     fn rotation_vp(yaw: f64, pitch: f64) -> DMat4 {
         let projection = DMat4::perspective_rh(70.0_f64.to_radians(), 16.0 / 9.0, 1024.0, 0.05);
-        let view = DMat4::from_rotation_x(pitch.to_radians()) * DMat4::from_rotation_y(yaw.to_radians());
+        let view =
+            DMat4::from_rotation_x(pitch.to_radians()) * DMat4::from_rotation_y(yaw.to_radians());
         projection * view
     }
 
@@ -416,8 +417,7 @@ mod tests {
             0.4,
             ReprojectionMatrices {
                 geometry: Mat4::from_cols_array(&[
-                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-                    0.0,
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                 ]),
                 sky: Mat4::IDENTITY,
             },
@@ -453,9 +453,21 @@ mod tests {
             yaw_degrees: 0.02,
             ..a
         };
-        assert!(!has_meaningful_motion(below, a, MotionThresholds::default()));
-        assert!(has_meaningful_motion(above_dist, a, MotionThresholds::default()));
-        assert!(has_meaningful_motion(above_angle, a, MotionThresholds::default()));
+        assert!(!has_meaningful_motion(
+            below,
+            a,
+            MotionThresholds::default()
+        ));
+        assert!(has_meaningful_motion(
+            above_dist,
+            a,
+            MotionThresholds::default()
+        ));
+        assert!(has_meaningful_motion(
+            above_angle,
+            a,
+            MotionThresholds::default()
+        ));
         assert!(!distance_cut(above_dist, a, 0.25));
         assert!(!angle_cut(above_angle, a, 5.0));
     }
@@ -464,7 +476,10 @@ mod tests {
     fn selects_sky_matrix_for_far_depth() {
         let g = Mat4::from_translation(Vec3::X);
         let s = Mat4::IDENTITY;
-        let m = ReprojectionMatrices { geometry: g, sky: s };
+        let m = ReprojectionMatrices {
+            geometry: g,
+            sky: s,
+        };
         assert_eq!(select_reprojection(m, 0.0), s);
         assert_eq!(select_reprojection(m, FAR_DEPTH), s);
         assert_eq!(select_reprojection(m, 0.5), g);
