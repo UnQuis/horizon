@@ -983,9 +983,7 @@ impl H {
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
-            H::FrameGeneration => {
-                labelled("Frame Generation", g.frame_generation_effective().label())
-            }
+            H::FrameGeneration => labelled("Frame Generation", g.frame_generation_effective().label()),
             H::Tfr => labelled("Temporal Reprojection", on_off(g.tfr)),
             H::TfrReprojectionStrength => labelled(
                 "TFR Reprojection Strength",
