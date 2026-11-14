@@ -1,6 +1,7 @@
 // TFR prepared history (LSR/internal scaling mode): scene color -> prepared color.
 // Edge/depth-break metadata is written to a separate rgba8unorm target (filterable,
 // storage-capable) to avoid overwriting HDR alpha.
+// Scene depth is read directly from texture_depth_2d (e.g. Depth32Float).
 
 struct Params {
     // x,y: texel size in UV; z: edge scale; w: reserved.
@@ -8,7 +9,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
-@group(0) @binding(1) var scene_depth: texture_2d<f32>;
+@group(0) @binding(1) var scene_depth: texture_depth_2d;
 @group(0) @binding(2) var scene_sampler: sampler;
 @group(0) @binding(3) var output_color: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var output_edge: texture_storage_2d<rgba8unorm, write>;
@@ -16,7 +17,7 @@ struct Params {
 
 fn depth_at(p: vec2<i32>, size: vec2<i32>) -> f32 {
     let q = clamp(p, vec2<i32>(0), size - 1);
-    return textureLoad(scene_depth, q, 0).r;
+    return textureLoad(scene_depth, q, 0);
 }
 
 @compute @workgroup_size(8, 8, 1)

@@ -16,6 +16,13 @@
 //!   and convenience record methods `record_depth_copy|record_motion|record_prepare|record_compose|record_blit`
 //!   that create bind groups internally so the integrator does not assemble them manually.
 //!
+//! Notes:
+//! - `record_*` cache bind groups in `TfrGpuResources` and recreate them only when input
+//!   view/buffer handles change or on resize/recreate (call `invalidate_bind_groups` if an
+//!   external view is replaced in-place).
+//! - `DEPTH_COPY_WGSL` reads `texture_depth_2d` (`Depth32Float`) and writes sampleable `R32Float`.
+//!   Motion expects depth as `texture_2d<f32>` (R32Float copy); prepare reads `texture_depth_2d` directly.
+//!
 //! Conventions: Horizon reversed-Z (near=1, far/sky~0), WebGPU clip depth [0,1],
 //! UV origin top-left. Rotation-only camera-relative VPs (`projection * pose * rotation`).
 //!
@@ -28,7 +35,7 @@
 //! Bindings:
 //! - `MOTION_WGSL` (`@compute main`, 8x8): 0 depth `texture_2d<f32>` (R32Float copy), 1 `rgba16float`
 //!   motion (RG forward motion, B validity, A edge), 2 `uniform MotionParams`.
-//! - `PREPARE_WGSL` (`@compute main`, 8x8): 0 scene color, 1 scene depth, 2 sampler, 3 `rgba16float`
+//! - `PREPARE_WGSL` (`@compute main`, 8x8): 0 scene color, 1 scene depth `texture_depth_2d`, 2 sampler, 3 `rgba16float`
 //!   prepared color, 4 `rgba8unorm` edge, 5 `uniform PrepareParams`.
 //! - `COMPOSE_WGSL` (`@compute main`, 8x8): 0 history,1 sampler,2 motion,3 sampler,4 edge,5 sampler,
 //!   6 `rgba16float` output, 7 `uniform ComposeParams`.
@@ -305,7 +312,7 @@ impl TfrPipelines {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -716,7 +723,26 @@ impl TfrPipelines {
     }
 }
 
+#[derive(Default)]
+struct BindGroupCache {
+    depth_copy: Option<(usize, wgpu::BindGroup)>,
+    motion: Option<([usize; 2], wgpu::BindGroup)>,
+    prepare: Option<([usize; 6], wgpu::BindGroup)>,
+    compose: Option<([usize; 6], wgpu::BindGroup)>,
+    blit: Option<([usize; 3], wgpu::BindGroup)>,
+    creates: u64,
+}
+
+impl BindGroupCache {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Owned TFR GPU textures, views and convenience record helpers.
+///
+/// `record_*` cache bind groups in this resource object and recreate them only when
+/// input view/buffer handles change or resources are resized/recreated.
 pub struct TfrGpuResources {
     pub scene_size: TfrSize,
     pub motion_size: TfrSize,
@@ -731,6 +757,7 @@ pub struct TfrGpuResources {
     pub compose_out: wgpu::Texture,
     pub compose_out_view: wgpu::TextureView,
     pub linear_sampler: wgpu::Sampler,
+    bind_groups: std::cell::RefCell<BindGroupCache>,
 }
 
 impl TfrGpuResources {
@@ -844,6 +871,7 @@ impl TfrGpuResources {
             compose_out,
             compose_out_view,
             linear_sampler,
+            bind_groups: std::cell::RefCell::new(BindGroupCache::default()),
         })
     }
 
@@ -866,6 +894,16 @@ impl TfrGpuResources {
         }
     }
 
+    /// Clears cached bind groups (e.g. if external views were replaced without resize).
+    pub fn invalidate_bind_groups(&self) {
+        self.bind_groups.borrow_mut().clear();
+    }
+
+    /// Number of bind group creations performed by cached `record_*` calls (for diagnostics/tests).
+    pub fn bind_group_creates(&self) -> u64 {
+        self.bind_groups.borrow().creates
+    }
+
     pub fn record_depth_copy(
         &self,
         device: &wgpu::Device,
@@ -873,8 +911,18 @@ impl TfrGpuResources {
         encoder: &mut wgpu::CommandEncoder,
         src_depth: &wgpu::TextureView,
     ) {
-        let bg = pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view);
-        pipelines.encode_depth_copy(encoder, &bg, self.scene_size.width, self.scene_size.height);
+        let key = src_depth as *const _ as usize;
+        let mut cache = self.bind_groups.borrow_mut();
+        let bg = if let Some((k, bg)) = &cache.depth_copy {
+            if *k == key { bg } else {
+                cache.creates += 1; cache.depth_copy = Some((key, pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view)));
+                &cache.depth_copy.as_ref().unwrap().1
+            }
+        } else {
+            cache.creates += 1; cache.depth_copy = Some((key, pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view)));
+            &cache.depth_copy.as_ref().unwrap().1
+        };
+        pipelines.encode_depth_copy(encoder, bg, self.scene_size.width, self.scene_size.height);
     }
 
     pub fn record_motion(
@@ -885,8 +933,16 @@ impl TfrGpuResources {
         depth_view: &wgpu::TextureView,
         params: &wgpu::Buffer,
     ) {
-        let bg = pipelines.motion_bind_group(device, depth_view, &self.motion_view, params);
-        pipelines.encode_motion(encoder, &bg, self.motion_size.width, self.motion_size.height);
+        let key = [depth_view as *const _ as usize, params as *const _ as usize];
+        let mut cache = self.bind_groups.borrow_mut();
+        let bg = match &cache.motion {
+            Some((k, bg)) if *k == key => bg,
+            _ => {
+                cache.creates += 1; cache.motion = Some((key, pipelines.motion_bind_group(device, depth_view, &self.motion_view, params)));
+                &cache.motion.as_ref().unwrap().1
+            }
+        };
+        pipelines.encode_motion(encoder, bg, self.motion_size.width, self.motion_size.height);
     }
 
     pub fn record_prepare(
@@ -903,16 +959,34 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let bg = pipelines.prepare_bind_group(
-            device,
-            scene_color,
-            scene_depth,
-            scene_sampler,
-            prepared_color,
-            edge,
-            params,
-        );
-        pipelines.encode_prepare(encoder, &bg, width, height);
+        let key = [
+            scene_color as *const _ as usize,
+            scene_depth as *const _ as usize,
+            scene_sampler as *const _ as usize,
+            prepared_color as *const _ as usize,
+            edge as *const _ as usize,
+            params as *const _ as usize,
+        ];
+        let mut cache = self.bind_groups.borrow_mut();
+        let bg = match &cache.prepare {
+            Some((k, bg)) if *k == key => bg,
+            _ => {
+                cache.creates += 1; cache.prepare = Some((
+                    key,
+                    pipelines.prepare_bind_group(
+                        device,
+                        scene_color,
+                        scene_depth,
+                        scene_sampler,
+                        prepared_color,
+                        edge,
+                        params,
+                    ),
+                ));
+                &cache.prepare.as_ref().unwrap().1
+            }
+        };
+        pipelines.encode_prepare(encoder, bg, width, height);
     }
 
     pub fn record_compose(
@@ -929,18 +1003,36 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let bg = pipelines.compose_bind_group(
-            device,
-            history,
-            history_sampler,
-            &self.motion_view,
-            &self.linear_sampler,
-            edge,
-            edge_sampler,
-            output,
-            params,
-        );
-        pipelines.encode_compose(encoder, &bg, width, height);
+        let key = [
+            history as *const _ as usize,
+            history_sampler as *const _ as usize,
+            edge as *const _ as usize,
+            edge_sampler as *const _ as usize,
+            output as *const _ as usize,
+            params as *const _ as usize,
+        ];
+        let mut cache = self.bind_groups.borrow_mut();
+        let bg = match &cache.compose {
+            Some((k, bg)) if *k == key => bg,
+            _ => {
+                cache.creates += 1; cache.compose = Some((
+                    key,
+                    pipelines.compose_bind_group(
+                        device,
+                        history,
+                        history_sampler,
+                        &self.motion_view,
+                        &self.linear_sampler,
+                        edge,
+                        edge_sampler,
+                        output,
+                        params,
+                    ),
+                ));
+                &cache.compose.as_ref().unwrap().1
+            }
+        };
+        pipelines.encode_compose(encoder, bg, width, height);
     }
 
     pub fn record_blit(
@@ -954,8 +1046,73 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let bg = pipelines.blit_bind_group(device, src, src_sampler, dst);
-        pipelines.encode_blit(encoder, &bg, width, height);
+        let key = [
+            src as *const _ as usize,
+            src_sampler as *const _ as usize,
+            dst as *const _ as usize,
+        ];
+        let mut cache = self.bind_groups.borrow_mut();
+        let bg = match &cache.blit {
+            Some((k, bg)) if *k == key => bg,
+            _ => {
+                cache.creates += 1; cache.blit = Some((key, pipelines.blit_bind_group(device, src, src_sampler, dst)));
+                &cache.blit.as_ref().unwrap().1
+            }
+        };
+        pipelines.encode_blit(encoder, bg, width, height);
+    }
+}
+
+/// CPU model of `compose.wgsl` UV clamping for a given texture texel size.
+pub fn compose_clamp_uv(uv: [f32; 2], texel_size: [f32; 2]) -> [f32; 2] {
+    let ex = 0.5 / texel_size[0].max(1.0);
+    let ey = 0.5 / texel_size[1].max(1.0);
+    [uv[0].clamp(ex, 1.0 - ex), uv[1].clamp(ey, 1.0 - ey)]
+}
+
+/// CPU model of `compose.wgsl` backward source search for one output pixel.
+///
+/// `sample_motion(uv)` returns `(motion_xy, valid)` where `motion_xy` is forward motion
+/// `target_uv - source_uv` stored at reference location `uv`.
+pub fn compose_search_source_cpu(
+    dst_uv: [f32; 2],
+    texel_size: [f32; 2],
+    strength: f32,
+    mut sample_motion: impl FnMut([f32; 2]) -> ([f32; 2], bool),
+) -> Option<[f32; 2]> {
+    let strength = strength.clamp(0.0, 1.0);
+    let mut src = compose_clamp_uv(dst_uv, texel_size);
+    let mut valid = false;
+    for i in 0..3 {
+        let (m, m_valid) = sample_motion(src);
+        if m_valid {
+            src = compose_clamp_uv(
+                [dst_uv[0] - m[0] * strength, dst_uv[1] - m[1] * strength],
+                texel_size,
+            );
+            valid = true;
+        } else {
+            if i == 0 {
+                let (mc, mc_valid) = sample_motion(dst_uv);
+                if mc_valid {
+                    src = compose_clamp_uv(
+                        [dst_uv[0] - mc[0] * strength, dst_uv[1] - mc[1] * strength],
+                        texel_size,
+                    );
+                    valid = true;
+                }
+            }
+            break;
+        }
+    }
+    if valid {
+        let (_, mfinal_valid) = sample_motion(src);
+        valid = mfinal_valid;
+    }
+    if valid && src[0] >= 0.0 && src[0] <= 1.0 && src[1] >= 0.0 && src[1] <= 1.0 {
+        Some(src)
+    } else {
+        None
     }
 }
 
@@ -1044,6 +1201,54 @@ mod tests {
     }
 
     #[test]
+    fn compose_search_matches_uniform_motion_field() {
+        // Motion stores forward m = target - source. For uniform shift, m is constant.
+        // Compose should recover source ~= dst - m*strength.
+        let texel = [64.0, 64.0];
+        let motion = [0.08_f32, -0.03_f32];
+        let dst = [0.52_f32, 0.41_f32];
+        let got = compose_search_source_cpu(dst, texel, 1.0, |_| (motion, true)).unwrap();
+        let expected = compose_clamp_uv([dst[0] - motion[0], dst[1] - motion[1]], texel);
+        assert!((got[0] - expected[0]).abs() < 1.0e-6);
+        assert!((got[1] - expected[1]).abs() < 1.0e-6);
+
+        // Half-res/edge case: near boundary, clamped expected source.
+        let dst = [0.02_f32, 0.98_f32];
+        let got = compose_search_source_cpu(dst, [32.0, 32.0], 1.0, |_| ([0.05, -0.05], true)).unwrap();
+        let expected = compose_clamp_uv([dst[0] - 0.05, dst[1] + 0.05], [32.0, 32.0]);
+        assert!((got[0] - expected[0]).abs() < 1.0e-6);
+        assert!((got[1] - expected[1]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn compose_search_uses_dst_hint_and_rejects_invalid() {
+        let texel = [64.0, 64.0];
+        // Invalid at first (clamped) src, but valid motion at dst gives deterministic hint.
+        let dst = [0.001_f32, 0.5_f32];
+        let clamped_dst = compose_clamp_uv(dst, texel);
+        assert!(clamped_dst[0] > dst[0]);
+        let hint_motion = [-0.05_f32, 0.0_f32];
+        let got = compose_search_source_cpu(dst, texel, 1.0, |uv| {
+            if (uv[0] - dst[0]).abs() < 1.0e-6 && (uv[1] - dst[1]).abs() < 1.0e-6 {
+                (hint_motion, true)
+            } else if (uv[0] - clamped_dst[0]).abs() < 1.0e-6 && (uv[1] - clamped_dst[1]).abs() < 1.0e-6 {
+                ([0.0, 0.0], false)
+            } else {
+                // final source after hint must be valid
+                ([0.0, 0.0], true)
+            }
+        })
+        .unwrap();
+        let expected = compose_clamp_uv([dst[0] - hint_motion[0], dst[1] - hint_motion[1]], texel);
+        assert!((got[0] - expected[0]).abs() < 1.0e-6, "{got:?} {expected:?}");
+        assert!((got[1] - expected[1]).abs() < 1.0e-6, "{got:?} {expected:?}");
+
+        // No valid motion anywhere -> no source.
+        let none = compose_search_source_cpu([0.5, 0.5], texel, 1.0, |_| ([0.0, 0.0], false));
+        assert!(none.is_none());
+    }
+
+    #[test]
     fn gpu_resources_smoke_if_device_available() {
         let instance = crate::gfx::test_gpu::instance();
         let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1074,6 +1279,42 @@ mod tests {
         assert!(res.ensure(&device, 64, 32));
         assert!(res.resize(&device, 48, 24));
         assert_eq!(res.scene_size, TfrSize::new(48, 24));
-        let _pipelines = TfrPipelines::new(&device, SUPPORTED_COLOR_FORMAT, SUPPORTED_EDGE_FORMAT);
+        let pipelines = TfrPipelines::new(&device, SUPPORTED_COLOR_FORMAT, SUPPORTED_EDGE_FORMAT);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tfr-smoke"),
+        });
+        res.record_blit(
+            &device,
+            &pipelines,
+            &mut encoder,
+            &res.history_color_view,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            res.scene_size.width,
+            res.scene_size.height,
+        );
+        res.record_blit(
+            &device,
+            &pipelines,
+            &mut encoder,
+            &res.history_color_view,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            res.scene_size.width,
+            res.scene_size.height,
+        );
+        assert_eq!(res.bind_group_creates(), 1, "bind group should be cached for same inputs");
+        assert!(res.resize(&device, 32, 16));
+        res.record_blit(
+            &device,
+            &pipelines,
+            &mut encoder,
+            &res.history_color_view,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            res.scene_size.width,
+            res.scene_size.height,
+        );
+        assert_eq!(res.bind_group_creates(), 1, "resize recreates resources/cache; next record creates once");
     }
 }
