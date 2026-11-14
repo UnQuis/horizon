@@ -794,6 +794,9 @@ impl Game<'_> {
             }
             let mut trip = self.server_trips.remove(k);
             if trip.placed {
+                if let Some(r) = &mut self.renderer {
+                    r.invalidate_tfr("dimension changed");
+                }
                 self.tell_mods_changed_dimension(host, trip.conn, trip.left, trip.dim);
                 continue;
             }
@@ -828,6 +831,9 @@ impl Game<'_> {
                     // The respawn already put the player on this column:
                     // vanilla teleports once, so no second move.
                     Ok(at) if host.hub.guests[i].position == [at.x, at.y, at.z] => {
+                        if let Some(r) = &mut self.renderer {
+                            r.invalidate_tfr("dimension changed");
+                        }
                         self.tell_mods_changed_dimension(host, trip.conn, trip.left, trip.dim);
                         continue;
                     }

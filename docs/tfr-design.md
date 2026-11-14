@@ -8,7 +8,7 @@
 
 ## 1. Goals and non-goals
 
-- **Goal:** alternate real (fully rendered world) and synthetic (reprojected from history) frames to reduce world-render cost while keeping HUD/crosshair/first-person view and other live overlays current every presented frame, per `TFR_DESCRIPTION.md`.
+- **Goal:** alternate real (fully rendered world) and synthetic (reprojected from history) frames to reduce world-render cost while keeping HUD/crosshair/first-person view and other live overlays current every presented frame, per the behavioural specification.
 - **Default:** TFR **off** (no behavior change). All TFR-exclusive resources freed when off.
 - **Clean-room:** behavior follows the spec + Horizon’s existing renderer contracts only.
 - **Non-goals (initial):** no Luxium compatibility, no shader-pack-specific TFR path in the initial slice (see §6.5), no changes to Mojang assets/logic beyond integration hooks.
@@ -256,20 +256,20 @@ All passes deterministic for identical inputs/state/path.
 **Reuse-first investigation (required before duplicating history/reprojection):**
 - Evaluate implementing TFR as a **mode over/alongside `world_post`**: real anchors render world into the world target and update a stable history source (reusing scene/depth/history resources and camera-relative reprojection math where compatible) **without** TAA accumulation/jitter cadence; synthetic frames reconstruct/resolve from that history for the current camera **without running the world pass**, then continue through normal present/post/UI stages.
 - Preferred if it satisfies spec cadence (≤1 synthetic after successful real), deterministic reconstruction, and no TAA progressive-blend/jitter semantics leaking into TFR output.
-- **Known constraints/conflicts (to resolve in M2):** Halton jitter sequence, accumulation+neighborhood clip tuned for AA/upscale, `taa_on`/reset coupling, history at output size with upscale/sharpen path, and TAA `previous` invalidation rules differ from TFR. Jitter must not perturb TFR anchor/cut/history semantics; synthetic must not depend on TAA accumulation state.
+- **Known constraints/conflicts (future work):** Halton jitter sequence, accumulation+neighborhood clip tuned for AA/upscale, `taa_on`/reset coupling, history at output size with upscale/sharpen path, and TAA `previous` invalidation rules differ from TFR. Jitter must not perturb TFR anchor/cut/history semantics; synthetic must not depend on TAA accumulation state.
 
 **Deterministic TAA/TFR policy:**
 - **Precedence:** when TFR is enabled and the frame takes the TFR path, TFR owns temporal presentation for that frame.
 - If reuse is viable: TFR uses explicitly controlled resources/state; TAA jitter is not applied to TFR decision/history camera samples, TAA accumulation resolve is not used as TFR synthetic reconstruction, and shared temporal state is reset/segregated so modes do not contaminate each other.
-- If reuse is not viable: bypass TAA temporal accumulation/jitter/previous-history updates for TFR-presented frames (e.g. force TFR path independent of `taa_on` accumulation, do not advance TAA history for synthetic frames) and introduce dedicated TFR buffers. **Before end of M2**, record the concrete code-referenced rationale in this doc (or an appended M2 note committed with the implementation) — not left open.
+- If reuse is not viable: bypass TAA temporal accumulation/jitter/previous-history updates for TFR-presented frames (e.g. force TFR path independent of `taa_on` accumulation, do not advance TAA history for synthetic frames) and introduce dedicated TFR buffers. **Before end of future**, record the concrete code-referenced rationale in code/docs if reused/bypassed (future work).
 
-**HDR concrete plan (validated/finalized in M2, integration point fixed now):**
+**HDR integration plan (v1 target; validation ongoing):**
 - TFR produces the finalized world image (real blit or synthetic reconstruction) in the active world/frame format contract (`Renderer::frame_format`/HDR-capable path), preserving HDR alpha/mark semantics required by downstream passes.
 - Integration point is **before HDR resolve/layered world compositing**: `gfx/hdr.rs`/`hdr.wgsl` (`resolve`/`keep_world`/coverage/layered HUD/composite/`fs_hdr*`) consume the finalized world image as they do for normal world frames. TFR does not create a parallel HDR path.
-- M2 verifies mark propagation for real-blit and synthetic outputs (emissive/light marks, hand mark/coverage interactions, UI layering inputs); if marks are not preserved implicitly, add an explicit deterministic mark-preservation/emission step at this same boundary.
+- Future work verifies mark propagation for real-blit and synthetic outputs (emissive/light marks, hand mark/coverage interactions, UI layering inputs); if marks are not preserved implicitly, add an explicit deterministic mark-preservation/emission step at this same boundary.
 
 ### 6.3 HDR (`gfx/hdr.rs`, `hdr.wgsl`)
-- Real blit preserves scene color+alpha marks written during world rendering. Synthetic reconstruction must output values compatible with HDR resolve/layered expectations (including alpha-mark semantics) so brightness/lift/layered HUD/coverage remain correct; validated in M2 per §6.2.
+- Real blit preserves scene color+alpha marks written during world rendering. Synthetic reconstruction must output values compatible with HDR resolve/layered expectations (including alpha-mark semantics) so brightness/lift/layered HUD/coverage remain correct; to be validated in future work per HDR plan.
 
 ### 6.4 `frame_gen.rs`
 - **Precedence:** TFR has priority. When TFR is enabled/active, frame generation is stopped/paused and its state reset (`FrameGen::stop()` semantics: presenter stopped, pending/generated state cleared) so no generated frames are presented.
@@ -299,7 +299,7 @@ All passes deterministic for identical inputs/state/path.
 
 **Horizon rendering facts (code refs):** `gfx.rs` uses reversed depth (near maps to 1, far to 0, depth compare `GreaterEqual`, e.g. around reversed-depth projection setup and pipeline depth states); TAA/depth reads in `world_post.wgsl` treat larger depth as nearer (`near = max(...)` over neighborhood) consistent with reversed-Z.
 
-**Adaptation of `TFR_DESCRIPTION.md` to Horizon (reversed-Z):**
+**Adaptation to Horizon (reversed-Z):**
 - Spec states far/sky depth ≈ 1.0 in a conventional [0,1] depth. In Horizon reversed-Z, **far/sky is depth ≈ 0.0** and **near is 1.0**.
 - Sky/far (no camera translation) reprojection path is selected when sampled depth is within a small epsilon of **0.0** (not 1.0). Valid geometric depth is away from that far sentinel per tolerance.
 - When reconstructing clip/NDC from stored depth for reprojection, use Horizon’s actual depth/NDC mapping (including reversed-Z). If forming NDC `z` from depth `d` in [0,1], account for reversed-Z (`z_ndc` mapping must match the projection used); CPU and GPU must implement the same convention.
@@ -319,11 +319,19 @@ All passes deterministic for identical inputs/state/path.
 - Math/contract tests: camera-relative matrix conventions, reversed-Z depth/far-sky handling (far≈0), UV/NDC mapping, sky no-translation path, validity/OOB/`w` epsilon rules, CPU/GPU-equivalent expectations.
 - Integration/conformance scenarios from spec table (static camera, small pan/translate, cut thresholds, resize, world switch, shader failure fallback, LSR mode, TFR off) — via renderer hooks/offscreen captures as feasible.
 
-## 10. M2 deliverables/decisions to close in implementation
+## 10. Future work and current v1 limitations
 
-- **TAA reuse outcome:** confirmed reuse/adaptation of `world_post` history/reprojection path for TFR with documented mapping, or dedicated buffers + explicit code-referenced rationale for bypassing TAA accumulation/jitter in TFR mode (recorded before end of M2).
-- **HDR validation:** confirm mark propagation and finalize exact resolve/composite ordering per §6.2 against `gfx/hdr.rs`/`hdr.wgsl`.
-- **Frame-gen/UI enforcement:** precedence and unambiguous settings behavior implemented.
-- **Shader-pack detection:** concrete unsupported-state conditions wired to safe real fallback.
-- **Constants finalized:** meaningful-motion epsilons, w/bounds/far tolerances, motion-field resolution/iteration limits as per spec/perf constraints.
+**Current v1 limitations (implemented vertical slice):**
+- TFR synthetic path is only eligible in the simple DirectScene path: scaled isolated world scene, `world_post.scale == 1.0`, `upscale <= 1.0`, TAA jitter/accumulation disabled for eligible frames, and `Rgba16Float` world/output format.
+- No prepare/LSR stage, no edge/prepare textures in the v1 synthetic compose path; motion/compose operate on direct scene history (color + depth copy).
+- Unsupported/complex paths fall back to real rendering (no synthetic, no frame-hold/repetition): SDR/non-eligible formats, shader packs/native post/material paths that own world composition, frame generation, and other non-simple paths.
+- `WorldKey` is currently a placeholder in render integration; history is explicitly invalidated on world open/load/close/reload and on dimension/level changes to avoid cross-world reuse until full world-generation key plumbing lands.
+- Real-mode history commit happens after history writes are recorded in the frame command stream (before final submit/present); invalidate-on-change/fallback paths protect correctness, but commit timing can be tightened in future work.
+
+**Future work:**
+- Confirm and document TAA reuse/adaptation vs dedicated TFR buffers, with code-referenced rationale and no TAA jitter/accumulation leakage into TFR decisions/history.
+- Validate HDR mark propagation and finalize resolve/composite ordering for real and synthetic outputs.
+- Implement shader-pack/native-post detection and robust safe fallback boundaries.
+- Add prepare/LSR/direct-scene prepared-history support, edge handling, SDR-compatible presentation paths, and full `WorldKey` generation tracking across dimension/server travel.
+- Finalize performance-sensitive constants/resolutions and add runtime/offscreen conformance coverage.
 

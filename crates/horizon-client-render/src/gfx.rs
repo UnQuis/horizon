@@ -11843,6 +11843,11 @@ impl Renderer {
             );
         }
         // TFR real capture (simple DirectScene, scaled): history from scene color+depth.
+        // Commit timing (v1): history copy/depth-copy commands are recorded into this frame's
+        // encoder before CPU commit. We commit here (before final submit/native overlay completion)
+        // because the captured history corresponds to the completed real world scene; later
+        // overlay/HUD work must not affect history. Invalidation/fallback paths reset state on
+        // source/config/size/world changes or unsupported frames.
         if tfr_real_capture && !tfr_synthetic {
             if let (Some((scene_color, scene_depth)), Some(tfr)) = (&scaled, &mut self.tfr_gpu) {
                 tfr.gpu.record_blit(&self.device, &tfr.pipelines, &mut encoder, scene_color, &tfr.gpu.linear_sampler, &tfr.gpu.history_color_view, tfr_scene_size[0], tfr_scene_size[1]);
