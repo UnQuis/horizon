@@ -1,11 +1,11 @@
-//! TFR core conformance tests (spec: TFR_DESCRIPTION.md).
+//! TFR core conformance tests.
 //!
 //! Targets the CPU-only, GPU-free API in `horizon_client_render::tfr::{core,config}`.
 //! Intended to run without a device or world renderer.
 //!
-//! Zone: Agent #3 (QA/conformance). Clean room: derived from TFR_DESCRIPTION.md only.
-//! Expected values come from the spec, not implementation literals (except where testing
-//! a documented API contract/helper such as world_post-compatible sizing).
+//! Clean room: derived from the behavioural requirements only. Expected values come from
+//! those requirements, not implementation literals (except where testing a documented API
+//! contract/helper such as world_post-compatible sizing).
 
 use horizon_client_render::tfr::config::TfrConfig;
 use horizon_client_render::tfr::core::{
