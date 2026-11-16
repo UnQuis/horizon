@@ -172,7 +172,11 @@ impl ComposeParams {
 
 /// Backward history sample location for a forward motion vector `m = target-current_source`.
 /// Composition searches near `current_uv - m * strength`.
-pub fn history_uv_from_forward_motion(current_uv: [f32; 2], motion: [f32; 2], strength: f32) -> [f32; 2] {
+pub fn history_uv_from_forward_motion(
+    current_uv: [f32; 2],
+    motion: [f32; 2],
+    strength: f32,
+) -> [f32; 2] {
     [
         current_uv[0] - motion[0] * strength,
         current_uv[1] - motion[1] * strength,
@@ -189,12 +193,18 @@ pub fn deterministic_fill_select(valid_edge_ok: impl IntoIterator<Item = bool>) 
 pub const FILL_NEUTRAL_RGBA: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
 /// Returns whether `(color_format, edge_format)` are supported by the current TFR WGSL.
-pub fn formats_supported(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) -> bool {
+pub fn formats_supported(
+    color_format: wgpu::TextureFormat,
+    edge_format: wgpu::TextureFormat,
+) -> bool {
     color_format == SUPPORTED_COLOR_FORMAT && edge_format == SUPPORTED_EDGE_FORMAT
 }
 
 /// Validates pipeline formats. Panics with a clear message if unsupported.
-pub fn assert_supported_formats(color_format: wgpu::TextureFormat, edge_format: wgpu::TextureFormat) {
+pub fn assert_supported_formats(
+    color_format: wgpu::TextureFormat,
+    edge_format: wgpu::TextureFormat,
+) {
     assert!(
         formats_supported(color_format, edge_format),
         "unsupported TFR formats: color={color_format:?} edge={edge_format:?}; \
@@ -204,7 +214,7 @@ TFR targets an intermediate Rgba16Float color target (not SDR/swapchain)."
 }
 
 fn workgroups(width: u32, height: u32) -> (u32, u32, u32) {
-    ((width + 7) / 8, (height + 7) / 8, 1)
+    (width.div_ceil(8), height.div_ceil(8), 1)
 }
 
 /// Compiled pipelines, layouts and dispatch helpers for TFR passes.
@@ -508,14 +518,15 @@ impl TfrPipelines {
             compilation_options: Default::default(),
             cache: None,
         });
-        let depth_copy_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("TFR depth copy"),
-            layout: Some(&depth_copy_pl),
-            module: &depth_copy_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let depth_copy_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("TFR depth copy"),
+                layout: Some(&depth_copy_pl),
+                module: &depth_copy_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             motion_layout,
@@ -544,9 +555,18 @@ impl TfrPipelines {
             label: Some("TFR motion bg"),
             layout: &self.motion_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(motion_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(motion_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params.as_entire_binding(),
+                },
             ],
         })
     }
@@ -565,12 +585,30 @@ impl TfrPipelines {
             label: Some("TFR prepare bg"),
             layout: &self.prepare_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene_color) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(scene_depth) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(scene_sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(prepared_color) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(edge) },
-                wgpu::BindGroupEntry { binding: 5, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(scene_depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(scene_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(prepared_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(edge),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: params.as_entire_binding(),
+                },
             ],
         })
     }
@@ -591,14 +629,38 @@ impl TfrPipelines {
             label: Some("TFR compose bg"),
             layout: &self.compose_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(history) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(history_sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(motion) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(motion_sampler) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(edge) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(edge_sampler) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(output) },
-                wgpu::BindGroupEntry { binding: 7, resource: params.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(history),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(history_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(motion),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(motion_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(edge),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(edge_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(output),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: params.as_entire_binding(),
+                },
             ],
         })
     }
@@ -614,9 +676,18 @@ impl TfrPipelines {
             label: Some("TFR blit bg"),
             layout: &self.blit_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(dst) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(dst),
+                },
             ],
         })
     }
@@ -631,8 +702,14 @@ impl TfrPipelines {
             label: Some("TFR depth copy bg"),
             layout: &self.depth_copy_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_depth) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(dst_r32) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(dst_r32),
+                },
             ],
         })
     }
@@ -780,7 +857,11 @@ impl TfrGpuResources {
 
         let history_color = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("TFR history color"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -795,7 +876,11 @@ impl TfrGpuResources {
 
         let history_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("TFR history depth (R32Float copy)"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -825,7 +910,11 @@ impl TfrGpuResources {
 
         let edge = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("TFR edge"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -837,7 +926,11 @@ impl TfrGpuResources {
 
         let compose_out = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("TFR compose out"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -914,12 +1007,22 @@ impl TfrGpuResources {
         let key = src_depth as *const _ as usize;
         let mut cache = self.bind_groups.borrow_mut();
         let bg = if let Some((k, bg)) = &cache.depth_copy {
-            if *k == key { bg } else {
-                cache.creates += 1; cache.depth_copy = Some((key, pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view)));
+            if *k == key {
+                bg
+            } else {
+                cache.creates += 1;
+                cache.depth_copy = Some((
+                    key,
+                    pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view),
+                ));
                 &cache.depth_copy.as_ref().unwrap().1
             }
         } else {
-            cache.creates += 1; cache.depth_copy = Some((key, pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view)));
+            cache.creates += 1;
+            cache.depth_copy = Some((
+                key,
+                pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view),
+            ));
             &cache.depth_copy.as_ref().unwrap().1
         };
         pipelines.encode_depth_copy(encoder, bg, self.scene_size.width, self.scene_size.height);
@@ -938,7 +1041,11 @@ impl TfrGpuResources {
         let bg = match &cache.motion {
             Some((k, bg)) if *k == key => bg,
             _ => {
-                cache.creates += 1; cache.motion = Some((key, pipelines.motion_bind_group(device, depth_view, &self.motion_view, params)));
+                cache.creates += 1;
+                cache.motion = Some((
+                    key,
+                    pipelines.motion_bind_group(device, depth_view, &self.motion_view, params),
+                ));
                 &cache.motion.as_ref().unwrap().1
             }
         };
@@ -971,7 +1078,8 @@ impl TfrGpuResources {
         let bg = match &cache.prepare {
             Some((k, bg)) if *k == key => bg,
             _ => {
-                cache.creates += 1; cache.prepare = Some((
+                cache.creates += 1;
+                cache.prepare = Some((
                     key,
                     pipelines.prepare_bind_group(
                         device,
@@ -1015,7 +1123,8 @@ impl TfrGpuResources {
         let bg = match &cache.compose {
             Some((k, bg)) if *k == key => bg,
             _ => {
-                cache.creates += 1; cache.compose = Some((
+                cache.creates += 1;
+                cache.compose = Some((
                     key,
                     pipelines.compose_bind_group(
                         device,
@@ -1055,7 +1164,11 @@ impl TfrGpuResources {
         let bg = match &cache.blit {
             Some((k, bg)) if *k == key => bg,
             _ => {
-                cache.creates += 1; cache.blit = Some((key, pipelines.blit_bind_group(device, src, src_sampler, dst)));
+                cache.creates += 1;
+                cache.blit = Some((
+                    key,
+                    pipelines.blit_bind_group(device, src, src_sampler, dst),
+                ));
                 &cache.blit.as_ref().unwrap().1
             }
         };
@@ -1162,7 +1275,10 @@ mod tests {
 
     #[test]
     fn deterministic_fill_picks_first_valid_else_neutral() {
-        assert_eq!(deterministic_fill_select([false, false, true, true]), Some(2));
+        assert_eq!(
+            deterministic_fill_select([false, false, true, true]),
+            Some(2)
+        );
         assert_eq!(deterministic_fill_select([false, false]), None);
         assert_eq!(FILL_NEUTRAL_RGBA, [0.0, 0.0, 0.0, 1.0]);
     }
@@ -1214,7 +1330,8 @@ mod tests {
 
         // Half-res/edge case: near boundary, clamped expected source.
         let dst = [0.02_f32, 0.98_f32];
-        let got = compose_search_source_cpu(dst, [32.0, 32.0], 1.0, |_| ([0.05, -0.05], true)).unwrap();
+        let got =
+            compose_search_source_cpu(dst, [32.0, 32.0], 1.0, |_| ([0.05, -0.05], true)).unwrap();
         let expected = compose_clamp_uv([dst[0] - 0.05, dst[1] + 0.05], [32.0, 32.0]);
         assert!((got[0] - expected[0]).abs() < 1.0e-6);
         assert!((got[1] - expected[1]).abs() < 1.0e-6);
@@ -1231,7 +1348,9 @@ mod tests {
         let got = compose_search_source_cpu(dst, texel, 1.0, |uv| {
             if (uv[0] - dst[0]).abs() < 1.0e-6 && (uv[1] - dst[1]).abs() < 1.0e-6 {
                 (hint_motion, true)
-            } else if (uv[0] - clamped_dst[0]).abs() < 1.0e-6 && (uv[1] - clamped_dst[1]).abs() < 1.0e-6 {
+            } else if (uv[0] - clamped_dst[0]).abs() < 1.0e-6
+                && (uv[1] - clamped_dst[1]).abs() < 1.0e-6
+            {
                 ([0.0, 0.0], false)
             } else {
                 // final source after hint must be valid
@@ -1240,8 +1359,14 @@ mod tests {
         })
         .unwrap();
         let expected = compose_clamp_uv([dst[0] - hint_motion[0], dst[1] - hint_motion[1]], texel);
-        assert!((got[0] - expected[0]).abs() < 1.0e-6, "{got:?} {expected:?}");
-        assert!((got[1] - expected[1]).abs() < 1.0e-6, "{got:?} {expected:?}");
+        assert!(
+            (got[0] - expected[0]).abs() < 1.0e-6,
+            "{got:?} {expected:?}"
+        );
+        assert!(
+            (got[1] - expected[1]).abs() < 1.0e-6,
+            "{got:?} {expected:?}"
+        );
 
         // No valid motion anywhere -> no source.
         let none = compose_search_source_cpu([0.5, 0.5], texel, 1.0, |_| ([0.0, 0.0], false));
@@ -1251,24 +1376,28 @@ mod tests {
     #[test]
     fn gpu_resources_smoke_if_device_available() {
         let instance = crate::gfx::test_gpu::instance();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .ok() else {
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                ..Default::default()
+            }))
+            .ok()
+        else {
             return;
         };
         let limits = adapter.limits();
-        let Some((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("tfr-test"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(limits),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            ..Default::default()
-        }))
-        .ok() else {
+        let Some((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("tfr-test"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(limits),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                ..Default::default()
+            }))
+            .ok()
+        else {
             return;
         };
         let Some(mut res) = TfrGpuResources::new(&device, 64, 32) else {
@@ -1303,7 +1432,11 @@ mod tests {
             res.scene_size.width,
             res.scene_size.height,
         );
-        assert_eq!(res.bind_group_creates(), 1, "bind group should be cached for same inputs");
+        assert_eq!(
+            res.bind_group_creates(),
+            1,
+            "bind group should be cached for same inputs"
+        );
         assert!(res.resize(&device, 32, 16));
         res.record_blit(
             &device,
@@ -1315,6 +1448,10 @@ mod tests {
             res.scene_size.width,
             res.scene_size.height,
         );
-        assert_eq!(res.bind_group_creates(), 1, "resize recreates resources/cache; next record creates once");
+        assert_eq!(
+            res.bind_group_creates(),
+            1,
+            "resize recreates resources/cache; next record creates once"
+        );
     }
 }

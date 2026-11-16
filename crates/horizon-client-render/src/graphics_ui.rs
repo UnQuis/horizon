@@ -411,27 +411,27 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::Tfr,
                             Medium,
-                            "Temporal Frame Reprojection: alternates a fully rendered frame with a reprojected one for performance. Off by default; may add artifacts.",
+                            "Alternates rendered and reprojected frames. Off by default.",
                         ),
                         h(
                             H::TfrReprojectionStrength,
                             Low,
-                            "How strongly TFR reconstructs from history (1.0: full).",
+                            "How strongly history is reused (1.0: full).",
                         ),
                         h(
                             H::TfrHistoryStability,
                             Low,
-                            "Stabilizes reprojection in consistent areas; too high can blur motion.",
+                            "Smooths stable areas; too high blurs motion.",
                         ),
                         h(
                             H::TfrCutDistance,
                             Low,
-                            "Camera movement (world units) that forces a fully rendered frame.",
+                            "Camera movement that forces a rendered frame.",
                         ),
                         h(
                             H::TfrCutAngle,
                             Low,
-                            "Camera rotation (degrees) that forces a fully rendered frame.",
+                            "Camera rotation that forces a rendered frame.",
                         ),
                     ],
                 ),
@@ -983,7 +983,9 @@ impl H {
             H::ScreenshotQuality => {
                 labelled("Screenshot Quality", format!("{}x", g.screenshot_quality))
             }
-            H::FrameGeneration => labelled("Frame Generation", g.frame_generation_effective().label()),
+            H::FrameGeneration => {
+                labelled("Frame Generation", g.frame_generation_effective().label())
+            }
             H::Tfr => labelled("Temporal Reprojection", on_off(g.tfr)),
             H::TfrReprojectionStrength => labelled(
                 "TFR Reprojection Strength",

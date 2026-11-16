@@ -208,12 +208,9 @@ pub fn reproject_sample(
     let valid = ndc.x.is_finite()
         && ndc.y.is_finite()
         && ndc.z.is_finite()
-        && uv.x >= -BOUNDS_EPSILON
-        && uv.x <= 1.0 + BOUNDS_EPSILON
-        && uv.y >= -BOUNDS_EPSILON
-        && uv.y <= 1.0 + BOUNDS_EPSILON
-        && target_depth >= -BOUNDS_EPSILON
-        && target_depth <= 1.0 + BOUNDS_EPSILON;
+        && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&uv.x)
+        && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&uv.y)
+        && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&target_depth);
     ReprojectedSample {
         uv,
         depth: target_depth,
