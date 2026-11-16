@@ -2346,9 +2346,7 @@ impl Game<'_> {
             .map(|d| (d.dimension.clone(), d.pos));
         if !same {
             // A new ClientLevel/dimension invalidates view-history dependent effects (TFR).
-            if let Some(r) = &mut self.renderer {
-                r.invalidate_tfr("dimension changed");
-            }
+            self.tfr_world_changed(self.dim, "dimension changed");
             // A new ClientLevel: Minecraft.setLevel stops every sound.
             self.stop_sounds_for_new_level();
             let mut streaming = Streaming::new(
@@ -3380,9 +3378,7 @@ impl Game<'_> {
                     self.dim.id(),
                 );
                 if dimension_changed {
-                    if let Some(r) = &mut self.renderer {
-                        r.invalidate_tfr("dimension changed");
-                    }
+                    self.tfr_world_changed(Dim::from_id(&p.spawn.dimension), "dimension changed");
                     horizon_client::spans::startup::arm("dimension.change");
                 }
                 // handleRespawn makes a new ClientLevel for another dimension

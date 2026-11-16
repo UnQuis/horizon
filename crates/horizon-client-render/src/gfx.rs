@@ -1553,6 +1553,8 @@ pub struct Renderer {
     /// Temporal Frame Reprojection state/config (clean-room, off by default).
     tfr_state: crate::tfr::core::TfrState,
     tfr_cfg: crate::tfr::config::TfrConfig,
+    /// Identity of the world this renderer is drawing; applied by `Game` each frame.
+    tfr_world: crate::tfr::core::WorldKey,
     tfr_gpu: Option<TfrGpuState>,
 }
 
@@ -1590,6 +1592,15 @@ impl Renderer {
     /// Invalidate TFR history (resize/scale/source/world changes).
     pub fn invalidate_tfr(&mut self, reason: &'static str) {
         self.tfr_state.invalidate(reason);
+    }
+
+    /// Apply the current world identity (dimension + generation) before drawing a frame.
+    /// A change invalidates history, independent of the explicit world-change hooks in `Game`.
+    pub fn set_tfr_world(&mut self, world: crate::tfr::core::WorldKey) {
+        if self.tfr_world != world {
+            self.tfr_world = world;
+            self.tfr_state.invalidate("world key changed");
+        }
     }
 
     fn tfr_simple_path_supported(
@@ -5230,6 +5241,7 @@ impl Renderer {
             capture_result: None,
             tfr_state: crate::tfr::core::TfrState::new(),
             tfr_cfg: crate::tfr::config::TfrConfig::default(),
+            tfr_world: crate::tfr::core::WorldKey::unknown(),
             tfr_gpu: None,
         })
     }
@@ -8187,6 +8199,7 @@ impl Renderer {
         // Simple path (initial): scale 1.0, no upscale/TAA jitter conflicts.
         let tfr_wants_simple = self.tfr_cfg.enabled
             && !frame.title
+            && self.tfr_world.is_known()
             && self.world_post.scale == 1.0
             && self.world_post.upscale <= 1.0
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
@@ -10016,6 +10029,7 @@ impl Renderer {
             fg_frames.is_some(),
             scaled.is_some(),
         ) && self.output.frame.format == wgpu::TextureFormat::Rgba16Float
+            && self.tfr_world.is_known()
             && tfr_scene_size[0] > 0
             && tfr_scene_size[1] > 0;
         if tfr_simple_pre {
@@ -10121,10 +10135,7 @@ impl Renderer {
             };
             let ctx = crate::tfr::core::FrameContext {
                 world_active: true,
-                world: crate::tfr::core::WorldKey {
-                    dimension: 0,
-                    generation: 1,
-                },
+                world: self.tfr_world,
                 scene_size: crate::tfr::core::FrameSize {
                     width: tfr_scene_size[0],
                     height: tfr_scene_size[1],
@@ -11948,10 +11959,7 @@ impl Renderer {
                     let inv_vp = view_proj.inverse();
                     tfr.prev_camera = [frame.camera.x, frame.camera.y, frame.camera.z];
                     self.tfr_state.commit_real(crate::tfr::core::RealFrameMeta {
-                        world: crate::tfr::core::WorldKey {
-                            dimension: 0,
-                            generation: 1,
-                        },
+                        world: self.tfr_world,
                         scene_size: crate::tfr::core::FrameSize {
                             width: tfr_scene_size[0],
                             height: tfr_scene_size[1],

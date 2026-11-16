@@ -27,6 +27,94 @@ pub struct WorldKey {
     pub generation: u64,
 }
 
+impl WorldKey {
+    /// No world has been announced yet; never eligible for TFR.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            dimension: -1,
+            generation: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        self.dimension >= 0 && self.generation > 0
+    }
+}
+
+/// Numeric id for a dimension identifier, for `WorldKey::dimension`.
+///
+/// Vanilla dimensions get stable small ids; other dimensions get a stable hash of their id so a
+/// custom dimension cannot be mistaken for one of the vanilla ones.
+#[must_use]
+pub fn dimension_id(id: &str) -> i32 {
+    match id {
+        "minecraft:overworld" | "overworld" => 0,
+        "minecraft:the_nether" | "the_nether" | "nether" => 1,
+        "minecraft:the_end" | "the_end" | "end" => 2,
+        other => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            other.hash(&mut hasher);
+            let hashed = hasher.finish() as i32;
+            if (0..=2).contains(&hashed) { 3 } else { hashed }
+        }
+    }
+}
+
+/// CPU-side world epoch: the dimension and the generation of the loaded world instance.
+///
+/// Kept outside the renderer so callers can advance it on world load/reload/dimension travel and
+/// pass the resulting `WorldKey` to the renderer, which invalidates history when it changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldEpoch {
+    dimension: i32,
+    generation: u64,
+}
+
+impl WorldEpoch {
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            dimension: -1,
+            generation: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_known(self) -> bool {
+        self.dimension >= 0 && self.generation > 0
+    }
+
+    /// Observe a dimension. A new dimension (or the first known one) starts a new generation.
+    /// Returns whether the dimension changed.
+    pub fn observe(&mut self, dimension: i32) -> bool {
+        if !self.is_known() || self.dimension != dimension {
+            self.dimension = dimension;
+            self.generation = self.generation.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A reload of the same world still makes its history stale.
+    pub fn reload(&mut self) {
+        if self.is_known() {
+            self.generation = self.generation.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    pub const fn key(self) -> WorldKey {
+        WorldKey {
+            dimension: self.dimension,
+            generation: self.generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct FrameSize {
     pub width: u32,
@@ -789,6 +877,71 @@ mod tests {
             FrameSize {
                 width: 960,
                 height: 540
+            }
+        );
+    }
+
+    #[test]
+    fn dimension_ids_are_stable_and_distinct() {
+        assert_eq!(dimension_id("minecraft:overworld"), 0);
+        assert_eq!(dimension_id("minecraft:the_nether"), 1);
+        assert_eq!(dimension_id("minecraft:the_end"), 2);
+        // A custom dimension must not alias a vanilla one, and must be deterministic.
+        let custom = dimension_id("modded:dim");
+        assert!(!(0..=2).contains(&custom));
+        assert_eq!(custom, dimension_id("modded:dim"));
+        assert_ne!(custom, dimension_id("modded:other"));
+        assert!(!WorldKey::unknown().is_known());
+    }
+
+    #[test]
+    fn world_epoch_tracks_dimension_and_reload() {
+        let mut epoch = WorldEpoch::unknown();
+        assert!(!epoch.is_known());
+        // The first known world starts at generation 1.
+        assert!(epoch.observe(0));
+        assert_eq!(
+            epoch.key(),
+            WorldKey {
+                dimension: 0,
+                generation: 1
+            }
+        );
+        // Staying in the same dimension does not move the key on its own.
+        assert!(!epoch.observe(0));
+        assert_eq!(
+            epoch.key(),
+            WorldKey {
+                dimension: 0,
+                generation: 1
+            }
+        );
+        // A reload of the same world still invalidates its history.
+        epoch.reload();
+        assert_eq!(
+            epoch.key(),
+            WorldKey {
+                dimension: 0,
+                generation: 2
+            }
+        );
+        // Travelling to another dimension changes both parts of the key.
+        assert!(epoch.observe(1));
+        assert_eq!(
+            epoch.key(),
+            WorldKey {
+                dimension: 1,
+                generation: 3
+            }
+        );
+        assert!(!epoch.observe(1));
+        // A later reload keeps the dimension and advances only the generation.
+        epoch.reload();
+        assert_eq!(
+            epoch.key(),
+            WorldKey {
+                dimension: 1,
+                generation: 4
             }
         );
     }

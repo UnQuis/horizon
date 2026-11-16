@@ -313,9 +313,7 @@ impl Game<'_> {
     /// Reload the content tables with the world's packs, as
     /// `/reload` reloads a server's (`ReloadableServerResources`).
     pub(super) fn reload_world_tables(&mut self) {
-        if let Some(r) = &mut self.renderer {
-            r.invalidate_tfr("world reload");
-        }
+        self.tfr_world_changed(self.dim, "world reload");
         if self.remote.is_some() {
             return;
         }

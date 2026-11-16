@@ -325,13 +325,14 @@ All passes deterministic for identical inputs/state/path.
 - TFR synthetic path is only eligible in the simple DirectScene path: scaled isolated world scene, `world_post.scale == 1.0`, `upscale <= 1.0`, TAA jitter/accumulation disabled for eligible frames, and `Rgba16Float` world/output format.
 - No prepare/LSR stage, no edge/prepare textures in the v1 synthetic compose path; motion/compose operate on direct scene history (color + depth copy).
 - Unsupported/complex paths fall back to real rendering (no synthetic, no frame-hold/repetition): SDR/non-eligible formats, shader packs/native post/material paths that own world composition, frame generation, and other non-simple paths.
-- `WorldKey` is currently a placeholder in render integration; history is explicitly invalidated on world open/load/close/reload and on dimension/level changes to avoid cross-world reuse until full world-generation key plumbing lands.
+- With this frame-selection scheme, the `Rgba16Float` output required by the v1 simple path is only selected with `hdr:true` plus `HORIZON_HDR_FRAME=float` (an experimental configuration); the default SDR (`hdr:false`) output is not TFR-eligible. Offscreen smoke compared off/on under that HDR-float setting (mean per-channel difference below 0.25, no black/broken frames, clean wgpu log).
+- `WorldKey` is now bound to the loaded world: `dimension` is a stable id for the dimension and `generation` advances on world open/load/close/reload and dimension travel (`tfr::core::WorldEpoch` in `Game`, applied to the renderer before each frame). The existing explicit invalidation on those events is kept as a second line of defence.
 - Real-mode history commit happens after history writes are recorded in the frame command stream (before final submit/present); invalidate-on-change/fallback paths protect correctness, but commit timing can be tightened in future work.
 
 **Future work:**
 - Confirm and document TAA reuse/adaptation vs dedicated TFR buffers, with code-referenced rationale and no TAA jitter/accumulation leakage into TFR decisions/history.
 - Validate HDR mark propagation and finalize resolve/composite ordering for real and synthetic outputs.
 - Implement shader-pack/native-post detection and robust safe fallback boundaries.
-- Add prepare/LSR/direct-scene prepared-history support, edge handling, SDR-compatible presentation paths, and full `WorldKey` generation tracking across dimension/server travel.
+- Add prepare/LSR/direct-scene prepared-history support, edge handling, and SDR-compatible presentation paths so TFR is eligible without the experimental HDR-float configuration.
 - Finalize performance-sensitive constants/resolutions and add runtime/offscreen conformance coverage.
 

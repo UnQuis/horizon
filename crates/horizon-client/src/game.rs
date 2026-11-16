@@ -548,6 +548,7 @@ use horizon_client::{
     vanillagen::VanillaTerrain,
     world::World,
 };
+use horizon_client_render::tfr::core::{WorldEpoch, dimension_id};
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
     geometry::{Aabb, Direction},
@@ -2326,6 +2327,9 @@ struct Game<'a> {
     observed_screen: Option<native_hooks::ObservedScreen>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// TFR world identity: advanced on world load/reload/dimension travel and applied to the
+    /// renderer before each frame, so reprojection history never crosses world instances.
+    tfr_world: WorldEpoch,
     /// Avoid an endless rebuild loop if the new device is lost as well.
     last_device_recovery: Option<Instant>,
     /// CPU geometry storage retained across frames, including empty/title frames.
@@ -3175,6 +3179,10 @@ impl Dim {
             Self::End => "minecraft:the_end",
         }
     }
+    /// Stable TFR world-key id for the current dimension.
+    fn tfr_id(self) -> i32 {
+        dimension_id(self.id())
+    }
     fn from_id(id: &str) -> Self {
         match id {
             "minecraft:the_nether" => Self::Nether,
@@ -3192,6 +3200,29 @@ impl Dim {
         }
     }
 }
+
+impl Game<'_> {
+    /// Apply the current TFR world identity to the renderer, including a fresh renderer after a
+    /// device change. Called every frame; a changed key invalidates history in the renderer.
+    fn apply_tfr_world(&mut self) {
+        let key = self.tfr_world.key();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_tfr_world(key);
+        }
+    }
+
+    /// A world opened, reloaded, closed or entered from another dimension: advance the epoch and
+    /// keep the explicit invalidation (history must never survive such a change).
+    pub(super) fn tfr_world_changed(&mut self, dim: Dim, reason: &'static str) {
+        self.tfr_world.observe(dim.tfr_id());
+        self.tfr_world.reload();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.invalidate_tfr(reason);
+        }
+        self.apply_tfr_world();
+    }
+}
+
 fn death_drops(
     inventory: &mut [Option<ItemStack>],
     offhand: &mut Option<ItemStack>,
@@ -9767,6 +9798,9 @@ impl Game<'_> {
                 use horizon_client::client_perf::request::GpuSwitch;
                 let capture_gpu = self.profile.gpu();
                 let recording = capture_gpu != GpuSwitch::Off;
+                // Applied every frame so a recreated renderer (device change, settings, split)
+                // also gets the current world identity before its first TFR decision.
+                renderer.set_tfr_world(self.tfr_world.key());
                 renderer.set_pass_timing(debug_passes || self.gpu_passes || recording);
                 renderer.set_keep_timed_frames(recording);
                 renderer.set_pass_detail(self.gpu_pass_detail || capture_gpu == GpuSwitch::Detail);
@@ -11494,6 +11528,7 @@ impl<'a> Game<'a> {
             observed_screen: None,
             window: None,
             renderer: None,
+            tfr_world: WorldEpoch::unknown(),
             last_device_recovery: None,
             entity_vertices: Vec::new(),
             falling_vertices: Default::default(),
