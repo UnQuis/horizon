@@ -17,9 +17,10 @@
 //!   that create bind groups internally so the integrator does not assemble them manually.
 //!
 //! Notes:
-//! - `record_*` cache bind groups in `TfrGpuResources` and recreate them only when input
-//!   view/buffer handles change or on resize/recreate (call `invalidate_bind_groups` if an
-//!   external view is replaced in-place).
+//! - `record_*` cache bind groups in `TfrGpuResources`, keyed by refcounted wgpu handle
+//!   identity (not raw pointer addresses), and recreate them only when input view/buffer
+//!   handles change or on resize/recreate (call `invalidate_bind_groups` if an external view
+//!   is replaced in-place).
 //! - `DEPTH_COPY_WGSL` reads `texture_depth_2d` (`Depth32Float`) and writes sampleable `R32Float`.
 //!   Motion expects depth as `texture_2d<f32>` (R32Float copy); prepare reads `texture_depth_2d` directly.
 //!
@@ -800,13 +801,36 @@ impl TfrPipelines {
     }
 }
 
+/// Identity token for a cached bind group: clones of the actual wgpu handles.
+/// wgpu handles are refcounted and implement `Eq`/`Hash` by underlying resource identity,
+/// so a dropped view cannot be confused with a later view reusing the same memory address.
+type DepthCopyKey = wgpu::TextureView;
+type MotionKey = (wgpu::TextureView, wgpu::Buffer);
+type PrepareKey = (
+    wgpu::TextureView,
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::TextureView,
+    wgpu::TextureView,
+    wgpu::Buffer,
+);
+type ComposeKey = (
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::TextureView,
+    wgpu::Buffer,
+);
+type BlitKey = (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView);
+
 #[derive(Default)]
 struct BindGroupCache {
-    depth_copy: Option<(usize, wgpu::BindGroup)>,
-    motion: Option<([usize; 2], wgpu::BindGroup)>,
-    prepare: Option<([usize; 6], wgpu::BindGroup)>,
-    compose: Option<([usize; 6], wgpu::BindGroup)>,
-    blit: Option<([usize; 3], wgpu::BindGroup)>,
+    depth_copy: Option<(DepthCopyKey, wgpu::BindGroup)>,
+    motion: Option<(MotionKey, wgpu::BindGroup)>,
+    prepare: Option<(PrepareKey, wgpu::BindGroup)>,
+    compose: Option<(ComposeKey, wgpu::BindGroup)>,
+    blit: Option<(BlitKey, wgpu::BindGroup)>,
     creates: u64,
 }
 
@@ -1004,25 +1028,15 @@ impl TfrGpuResources {
         encoder: &mut wgpu::CommandEncoder,
         src_depth: &wgpu::TextureView,
     ) {
-        let key = src_depth as *const _ as usize;
+        let key = src_depth.clone();
         let mut cache = self.bind_groups.borrow_mut();
-        let bg = if let Some((k, bg)) = &cache.depth_copy {
-            if *k == key {
-                bg
-            } else {
-                cache.creates += 1;
-                cache.depth_copy = Some((
-                    key,
-                    pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view),
-                ));
-                &cache.depth_copy.as_ref().unwrap().1
-            }
+        let bg = if cache.depth_copy.as_ref().is_some_and(|(k, _)| *k == key) {
+            &cache.depth_copy.as_ref().unwrap().1
         } else {
+            let group =
+                pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view);
             cache.creates += 1;
-            cache.depth_copy = Some((
-                key,
-                pipelines.depth_copy_bind_group(device, src_depth, &self.history_depth_view),
-            ));
+            cache.depth_copy = Some((key, group));
             &cache.depth_copy.as_ref().unwrap().1
         };
         pipelines.encode_depth_copy(encoder, bg, self.scene_size.width, self.scene_size.height);
@@ -1036,18 +1050,15 @@ impl TfrGpuResources {
         depth_view: &wgpu::TextureView,
         params: &wgpu::Buffer,
     ) {
-        let key = [depth_view as *const _ as usize, params as *const _ as usize];
+        let key = (depth_view.clone(), params.clone());
         let mut cache = self.bind_groups.borrow_mut();
-        let bg = match &cache.motion {
-            Some((k, bg)) if *k == key => bg,
-            _ => {
-                cache.creates += 1;
-                cache.motion = Some((
-                    key,
-                    pipelines.motion_bind_group(device, depth_view, &self.motion_view, params),
-                ));
-                &cache.motion.as_ref().unwrap().1
-            }
+        let bg = if cache.motion.as_ref().is_some_and(|(k, _)| *k == key) {
+            &cache.motion.as_ref().unwrap().1
+        } else {
+            let group = pipelines.motion_bind_group(device, depth_view, &self.motion_view, params);
+            cache.creates += 1;
+            cache.motion = Some((key, group));
+            &cache.motion.as_ref().unwrap().1
         };
         pipelines.encode_motion(encoder, bg, self.motion_size.width, self.motion_size.height);
     }
@@ -1066,33 +1077,30 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let key = [
-            scene_color as *const _ as usize,
-            scene_depth as *const _ as usize,
-            scene_sampler as *const _ as usize,
-            prepared_color as *const _ as usize,
-            edge as *const _ as usize,
-            params as *const _ as usize,
-        ];
+        let key = (
+            scene_color.clone(),
+            scene_depth.clone(),
+            scene_sampler.clone(),
+            prepared_color.clone(),
+            edge.clone(),
+            params.clone(),
+        );
         let mut cache = self.bind_groups.borrow_mut();
-        let bg = match &cache.prepare {
-            Some((k, bg)) if *k == key => bg,
-            _ => {
-                cache.creates += 1;
-                cache.prepare = Some((
-                    key,
-                    pipelines.prepare_bind_group(
-                        device,
-                        scene_color,
-                        scene_depth,
-                        scene_sampler,
-                        prepared_color,
-                        edge,
-                        params,
-                    ),
-                ));
-                &cache.prepare.as_ref().unwrap().1
-            }
+        let bg = if cache.prepare.as_ref().is_some_and(|(k, _)| *k == key) {
+            &cache.prepare.as_ref().unwrap().1
+        } else {
+            let group = pipelines.prepare_bind_group(
+                device,
+                scene_color,
+                scene_depth,
+                scene_sampler,
+                prepared_color,
+                edge,
+                params,
+            );
+            cache.creates += 1;
+            cache.prepare = Some((key, group));
+            &cache.prepare.as_ref().unwrap().1
         };
         pipelines.encode_prepare(encoder, bg, width, height);
     }
@@ -1111,35 +1119,32 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let key = [
-            history as *const _ as usize,
-            history_sampler as *const _ as usize,
-            edge as *const _ as usize,
-            edge_sampler as *const _ as usize,
-            output as *const _ as usize,
-            params as *const _ as usize,
-        ];
+        let key = (
+            history.clone(),
+            history_sampler.clone(),
+            edge.clone(),
+            edge_sampler.clone(),
+            output.clone(),
+            params.clone(),
+        );
         let mut cache = self.bind_groups.borrow_mut();
-        let bg = match &cache.compose {
-            Some((k, bg)) if *k == key => bg,
-            _ => {
-                cache.creates += 1;
-                cache.compose = Some((
-                    key,
-                    pipelines.compose_bind_group(
-                        device,
-                        history,
-                        history_sampler,
-                        &self.motion_view,
-                        &self.linear_sampler,
-                        edge,
-                        edge_sampler,
-                        output,
-                        params,
-                    ),
-                ));
-                &cache.compose.as_ref().unwrap().1
-            }
+        let bg = if cache.compose.as_ref().is_some_and(|(k, _)| *k == key) {
+            &cache.compose.as_ref().unwrap().1
+        } else {
+            let group = pipelines.compose_bind_group(
+                device,
+                history,
+                history_sampler,
+                &self.motion_view,
+                &self.linear_sampler,
+                edge,
+                edge_sampler,
+                output,
+                params,
+            );
+            cache.creates += 1;
+            cache.compose = Some((key, group));
+            &cache.compose.as_ref().unwrap().1
         };
         pipelines.encode_compose(encoder, bg, width, height);
     }
@@ -1155,22 +1160,15 @@ impl TfrGpuResources {
         width: u32,
         height: u32,
     ) {
-        let key = [
-            src as *const _ as usize,
-            src_sampler as *const _ as usize,
-            dst as *const _ as usize,
-        ];
+        let key = (src.clone(), src_sampler.clone(), dst.clone());
         let mut cache = self.bind_groups.borrow_mut();
-        let bg = match &cache.blit {
-            Some((k, bg)) if *k == key => bg,
-            _ => {
-                cache.creates += 1;
-                cache.blit = Some((
-                    key,
-                    pipelines.blit_bind_group(device, src, src_sampler, dst),
-                ));
-                &cache.blit.as_ref().unwrap().1
-            }
+        let bg = if cache.blit.as_ref().is_some_and(|(k, _)| *k == key) {
+            &cache.blit.as_ref().unwrap().1
+        } else {
+            let group = pipelines.blit_bind_group(device, src, src_sampler, dst);
+            cache.creates += 1;
+            cache.blit = Some((key, group));
+            &cache.blit.as_ref().unwrap().1
         };
         pipelines.encode_blit(encoder, bg, width, height);
     }
@@ -1227,6 +1225,27 @@ pub fn compose_search_source_cpu(
     } else {
         None
     }
+}
+
+#[cfg(test)]
+fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = crate::gfx::test_gpu::instance();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        ..Default::default()
+    }))
+    .ok()?;
+    let limits = adapter.limits();
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("tfr-test"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(limits),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        ..Default::default()
+    }))
+    .ok()
 }
 
 #[cfg(test)]
@@ -1375,29 +1394,7 @@ mod tests {
 
     #[test]
     fn gpu_resources_smoke_if_device_available() {
-        let instance = crate::gfx::test_gpu::instance();
-        let Some(adapter) =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-                ..Default::default()
-            }))
-            .ok()
-        else {
-            return;
-        };
-        let limits = adapter.limits();
-        let Some((device, _queue)) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("tfr-test"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(limits),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                ..Default::default()
-            }))
-            .ok()
-        else {
+        let Some((device, _queue)) = test_device() else {
             return;
         };
         let Some(mut res) = TfrGpuResources::new(&device, 64, 32) else {
@@ -1452,6 +1449,120 @@ mod tests {
             res.bind_group_creates(),
             1,
             "resize recreates resources/cache; next record creates once"
+        );
+    }
+
+    #[test]
+    fn depth_contract_wgsl_declarations() {
+        // prepare reads scene depth as a depth texture; motion reads a sampleable float copy.
+        assert!(PREPARE_WGSL.contains("@group(0) @binding(1) var scene_depth: texture_depth_2d;"));
+        assert!(MOTION_WGSL.contains("@group(0) @binding(0) var depth_tex: texture_2d<f32>;"));
+        assert!(DEPTH_COPY_WGSL.contains("@group(0) @binding(0) var depth_src: texture_depth_2d;"));
+        assert!(DEPTH_COPY_WGSL.contains("texture_storage_2d<r32float, write>"));
+    }
+
+    #[test]
+    fn depth_contract_bind_groups_validate_on_device() {
+        let Some((device, _queue)) = test_device() else {
+            return;
+        };
+        let pipelines = TfrPipelines::new(&device, SUPPORTED_COLOR_FORMAT, SUPPORTED_EDGE_FORMAT);
+        let Some(res) = TfrGpuResources::new(&device, 64, 32) else {
+            return;
+        };
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tfr-test scene depth (Depth32Float)"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tfr-test params"),
+            size: std::mem::size_of::<PrepareParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Depth32Float view must satisfy prepare b1 (texture_depth_2d, Depth layout).
+        // R32Float copy must satisfy motion b0 (texture_2d<f32>, non-filterable float).
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _prepare = pipelines.prepare_bind_group(
+            &device,
+            &res.history_color_view,
+            &depth_view,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            &res.edge_view,
+            &params,
+        );
+        let _motion = pipelines.motion_bind_group(
+            &device,
+            &res.history_depth_view,
+            &res.motion_view,
+            &params,
+        );
+        let _copy = pipelines.depth_copy_bind_group(&device, &depth_view, &res.history_depth_view);
+        assert!(
+            pollster::block_on(scope.pop()).is_none(),
+            "prepare/motion/depth-copy bind groups must validate with their depth contracts"
+        );
+    }
+
+    #[test]
+    fn bind_group_cache_uses_handle_identity_not_addresses() {
+        let Some((device, _queue)) = test_device() else {
+            return;
+        };
+        let pipelines = TfrPipelines::new(&device, SUPPORTED_COLOR_FORMAT, SUPPORTED_EDGE_FORMAT);
+        let Some(res) = TfrGpuResources::new(&device, 64, 32) else {
+            return;
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tfr-cache-identity"),
+        });
+        let view1 = res
+            .history_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        res.record_blit(
+            &device,
+            &pipelines,
+            &mut encoder,
+            &view1,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            64,
+            32,
+        );
+        assert_eq!(res.bind_group_creates(), 1);
+        drop(view1);
+        // A new view over the same texture is a different handle, even if the allocator
+        // reuses the memory address of the dropped view. Handle-identity keys must notice.
+        let view2 = res
+            .history_color
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        res.record_blit(
+            &device,
+            &pipelines,
+            &mut encoder,
+            &view2,
+            &res.linear_sampler,
+            &res.compose_out_view,
+            64,
+            32,
+        );
+        assert_eq!(
+            res.bind_group_creates(),
+            2,
+            "a replaced view must recreate the bind group"
         );
     }
 }
