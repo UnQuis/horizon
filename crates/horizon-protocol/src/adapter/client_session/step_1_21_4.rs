@@ -142,12 +142,12 @@ fn heightmaps_down(r: &mut Reader, w: &mut Writer) -> Result<()> {
             .find(|(k, _)| *k == kind)
         {
             map.insert(
-                horizon_world::nbt::JavaString::from(name),
-                horizon_world::nbt::Tag::LongArray(longs),
+                horizon_core::nbt::JavaString::from(name),
+                horizon_core::nbt::Tag::LongArray(longs),
             );
         }
     }
-    w.nbt(&horizon_world::nbt::Tag::Compound(map));
+    w.nbt(&horizon_core::nbt::Tag::Compound(map));
     Ok(())
 }
 
@@ -241,10 +241,10 @@ fn container_click(ids: &'static Ids, payload: &[u8]) -> Result<Vec<u8>> {
     for _ in 0..n {
         w.i16(r.i16()?);
         let stack = slot(ids, &mut r)?;
-        HashedSlot::write(&hashed(stack), &mut w);
+        hashed_slot(ids, stack, &mut w);
     }
     let carried = slot(ids, &mut r)?;
-    HashedSlot::write(&hashed(carried), &mut w);
+    hashed_slot(ids, carried, &mut w);
     w.bytes(r.rest());
     Ok(w.data)
 }
@@ -253,6 +253,13 @@ fn container_click(ids: &'static Ids, payload: &[u8]) -> Result<Vec<u8>> {
 fn slot(ids: &'static Ids, r: &mut Reader<'_>) -> Result<Option<Stack>> {
     let _up = ids::renumbering(ids, Way::Up);
     Slot::read(r)
+}
+
+/// A hashed slot in the client's own ids, as a 1.21.5 client sends it: the session maps the whole
+/// click to the pinned ids afterwards, as for every newer client.
+fn hashed_slot(ids: &'static Ids, stack: Option<Stack>, w: &mut Writer) {
+    let _down = ids::renumbering(ids, Way::Down);
+    HashedSlot::write(&hashed(stack), w);
 }
 
 fn hashed(stack: Option<Stack>) -> Option<Hashed> {
@@ -446,14 +453,14 @@ mod tests {
         w.i32(0);
         let mut map = std::collections::BTreeMap::new();
         map.insert(
-            horizon_world::nbt::JavaString::from("WORLD_SURFACE"),
-            horizon_world::nbt::Tag::LongArray(vec![5]),
+            horizon_core::nbt::JavaString::from("WORLD_SURFACE"),
+            horizon_core::nbt::Tag::LongArray(vec![5]),
         );
         map.insert(
-            horizon_world::nbt::JavaString::from("WORLD_SURFACE_WG"),
-            horizon_world::nbt::Tag::LongArray(vec![6]),
+            horizon_core::nbt::JavaString::from("WORLD_SURFACE_WG"),
+            horizon_core::nbt::Tag::LongArray(vec![6]),
         );
-        w.nbt(&horizon_world::nbt::Tag::Compound(map));
+        w.nbt(&horizon_core::nbt::Tag::Compound(map));
         w.byte_array(&[]);
         let up = translate::client_layout_v1_21_4::chunk_up(&w.data).unwrap();
         let mut r = Reader::new(&up);

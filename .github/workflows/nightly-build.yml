@@ -32,9 +32,8 @@ run-name: nightly build${{ inputs.request && format(' (request {0})', inputs.req
 #   gh workflow run "nightly build"                     # now (skips when the pick is the same commit as last night's)
 #   gh workflow run "nightly build" -f force=true       # build and publish even if unchanged
 #   gh workflow run "nightly build" -f dry_run=true     # build and sign with a throwaway key, publish nothing
+# Since 2026-11-15 only by hand (release.yml, `/nightly`, or a dispatch): no scheduled build.
 on:
-  schedule:
-    - cron: '17 20 * * *'  # 20:17 UTC: after the day's waves, before the 03:07 Paris parity audit takes the Mac mini
   workflow_dispatch:
     inputs:
       force:
@@ -219,9 +218,9 @@ jobs:
           SHORT: ${{ needs.pick.outputs.short }}
         run: |
           key=(); [[ -n "$EPHEMERAL" ]] && key=(--key "$(cat dist/ephemeral.pub)")
-          cargo run --locked --quiet -p horizon-release-sign -- verify --tag nightly --publishing "${key[@]}" dist
+          cargo run --locked --quiet -p horizon-release-sign -- verify --repository "$GITHUB_REPOSITORY" --tag nightly --publishing "${key[@]}" dist
           # The version's own signature, which current launchers require: the title below names the same version.
-          cargo run --locked --quiet -p horizon-release-sign -- verify --tag "nightly-${DATE}-${SHORT}" \
+          cargo run --locked --quiet -p horizon-release-sign -- verify --repository "$GITHUB_REPOSITORY" --tag "nightly-${DATE}-${SHORT}" \
             --signature SHA256SUMS.v2.sig --publishing "${key[@]}" dist
       - name: Ready to publish (the smoke test drew a world, no release-blocker is open)
         # Right before publishing, as for a release: an issue labelled while the builds ran still holds it. A dry run

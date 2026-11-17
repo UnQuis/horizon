@@ -2,6 +2,31 @@
 
 How parity work is run, checked and merged. What is ported and where it is checked: [Rust rewrite status](rust-parity.md).
 
+## Datafix downloads and author self-checks
+
+Datafix generation owns a private writable root, defaulting to checkout `.local/datafix`.
+`HORIZON_DATAFIX_ROOT` overrides it (relative values resolve from the invoking working directory).
+Minecraft input symlinks never select this output root. The tool refuses shared vanilla
+roots and their ancestors, escaping default symlinks, escaping descendant symlinks, file roots and unwritable
+ancestors before downloads, world generation or `generate.lock` creation. Choose a new private
+directory on refusal; never change permissions on shared fixtures to bypass the guard.
+
+Author `pr_ready` excludes datafix by default and prints one opt-in reminder. To explicitly
+allow it among the affected harnesses, use a private directory. Local opt-in preflights the
+root conservatively even when affected dependencies are unknown, and passes its validated
+absolute path into subprocesses so a working-directory change cannot reinterpret it:
+
+```sh
+HORIZON_DATAFIX_ROOT="$PWD/.local/datafix-private" python3 tools/pr_ready.py --datafix
+```
+
+Direct `tools/parity.py datafix` is also an explicit harness run and may download jars and
+runtimes, launch servers and generate worlds. Metadata for cold Linux 1.8.9 alone lists
+8,320,755 bytes for the server jar plus 235,129,362 bytes for the pinned legacy runtime:
+243,450,117 bytes before JSON metadata and generated worlds. Other versions/runtimes add
+more; cached payload can be zero. No runtime measurement is available for this repair.
+Fork issue arismoko/horizon#3027 tracks whether CI runs datafix.
+
 ## Running the vanilla harnesses
 
 Same-machine fixtures created with `lab.game_env` use `HORIZON_TEST_LOOPBACK=1`: Horizon
@@ -131,6 +156,11 @@ The LAN checks open and fill machines through the guest's inventory packets, obs
 powered dispenser's projectile on both clients, and open a chest to activate a sculk sensor
 and shrieker. They supplement the deterministic component comparisons.
 
+A new `command_exec` group goes into a file of its own under `tools/command_exec_groups/`: a module
+with `GROUP` (its name) and `cases(cmd, setup)` (its ops). The corpus finds it by file name, so two
+pull requests that each add a group don't touch the same lines (#16833). Most existing groups are
+still functions in `tools/command_exec_corpus.py`.
+
 ### Randoms that repeat
 
 Vanilla seeds every unseeded random (`RandomSource.create()`: each entity's own, the level's, a raid's...) from `RandomSupport.generateUniqueSeed`, a shared uniquifier XORed with `System.nanoTime()`, and numbers entities from `ServerLevel.ENTITY_COUNTER`; Horizon ports both (`random_source::unique_seed`, `Game.next_entity`). A command script can make what they decide comparable exactly: a dropped item's position, primed TNT's kick, a dispensed item's motion, which tick of four a resting item moves on.
@@ -161,7 +191,7 @@ python3 tools/parity_fuzz.py --replay scenarios.json                            
 ## Reading vanilla
 
 Game jars, decompiled sources and reports live in the gitignored `.local/`, rebuilt from your own copy of the game;
-nothing of Mojang's is committed or downloaded by the tools ([README](../README.md#build-from-source)):
+nothing of Mojang's is committed or downloaded by the tools ([README](native-client.md#run-from-a-checkout)):
 
 ```sh
 python3 tools/lab.py prepare --server-jar ~/Downloads/server.jar   # checks the pinned jars (research-lock.json)
@@ -190,7 +220,7 @@ the same path as normal single player. `python3 tools/test_friends.py --client
 target/fast/horizon-client --relay target/fast/horizon-relay --baseline` covers
 plain LAN, direct invitations, a local relay and ended invitations in that mode.
 Run Linux games under `xvfb-run -a` when no display is available. Each
-process gets scratch game, launcher, XDG data and config homes; telemetry, audio
+process gets scratch game, launcher, XDG data and config homes; audio
 and launcher self-update are disabled.
 
 `lan_integration` and `friends_integration` register these suites with `parity.py`.

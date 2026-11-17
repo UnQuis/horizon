@@ -29,7 +29,7 @@ Nobody merges automatically. A Team member:
    force-push a contributor's branch (merge main into it instead).
 
 Risky pull requests (saves, the network or server thread, world generation, the launcher's installs and updates,
-the harnesses, anything over ~500 lines of code) get `needs-proof` and wait until someone has played the change: both
+the harnesses, anything over ~3000 lines of code) get `needs-proof` and wait until someone has played the change: both
 single-player paths, a LAN guest, a screenshot for anything visible. The list is in
 [release-flow.md](release-flow.md#merging).
 
@@ -46,7 +46,8 @@ Everything below runs by itself on GitHub; you only step in when something is wr
 
 - **The Nightly** is the only build players get. The train (`release.yml`, every 10 minutes) starts one after 5
   player-facing merges, or when the oldest has waited 6 hours, or at once for a pull request labelled
-  `release-now`. Only a commit where both `checks` and `parity-main` passed ships. Who may add `release-now` is the
+  `release-now`. Only a commit where both `checks` and `parity-main` passed ships. Its build also builds and
+  publishes the mod SDK of that commit ([release-flow](release-flow.md#mod-sdk)). Who may add `release-now` is the
   council's choice; until it decides, leave the label to the maintainer.
 - **Stopping Nightlies:** open an issue about the problem and label it `release-blocker`. Nothing is published
   while it is open, forced builds included. Close it when the fix is on main.

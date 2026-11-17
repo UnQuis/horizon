@@ -623,7 +623,8 @@ def check_menu_transfer(host, guest, out):
         guest.raw('key', 'e', 'tap')
         guest.raw('wait-for', 'screen', 'inventory', '--timeout', 10)
         inventory = guest('screen')
-        stale = [s for s in inventory.get('slots', []) if s.get('slot', 0) >= 300]
+        # 300-499 are a container's slots; 500-504 are the player's own armor and offhand.
+        stale = [s for s in inventory.get('slots', []) if 300 <= s.get('slot', 0) < 500]
         diamonds = guest('inventory')['counts'].get('minecraft:diamond', 0)
         guest.shot(out, f'menu-transfer-{label}')
         guest.raw('key', 'esc', 'tap')
@@ -650,6 +651,10 @@ def check_menu_transfer(host, guest, out):
         settled('respawn')
     finally:
         back_to_game(guest)
+        # A failure after the trip must not leave the guest in the Nether for the checks that follow.
+        if guest('state').get('dimension') != OVERWORLD:
+            guest('command', command=f'execute in {OVERWORLD} run tp @s {home[0]:.2f} {home[1]:.2f} {home[2]:.2f}')
+            wait_dimension(guest, OVERWORLD, 400)
         guest('command', command=f'execute in {OVERWORLD} run setblock {chest[0]} {chest[1]} {chest[2]} minecraft:air')
     return results
 
@@ -1267,11 +1272,16 @@ def check_damage(host, guest, out):
     guest.wait(10)
     before = remote(guest)['health']
     x, y, z = pos_of(guest)
+    guest('command', command=f'setblock {int(x // 1)} {int(y // 1) - 1} {int(z // 1)} minecraft:stone')
+    fall_sound = 'minecraft:block.stone.fall'
+    heard_before = {p.name: heard(p, fall_sound) for p in (host, guest)}
     guest('command', command=f'tp @s {x:.2f} {y + 12:.2f} {z:.2f}')
     guest.wait(50)
     after = remote(guest)['health']
     guest.shot(out, 'damage')
     assert after < before, f'health {before} -> {after} after a 12-block fall'
+    for p in (host, guest):
+        assert heard(p, fall_sound) - heard_before[p.name] == 1, f'{p.name}: expected one stone fall sound'
     # Into water: the fall does no damage.
     x, y, z = pos_of(guest)
     guest('command', command=f'setblock {int(x // 1)} {int(y // 1)} {int(z // 1)} minecraft:water')
@@ -7438,7 +7448,7 @@ def main():
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-client', '-p', 'horizon-client-lib',
+        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib',
                         '--bin', 'horizon-client', '--bin', 'horizon-ctl'],
                        cwd=ROOT, check=True)
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
@@ -14216,7 +14226,9 @@ def check_ride_seats(host, guest, out):
     """RideCommand.mount forces the ride (startRiding(vehicle, true, true)), so an item display, an
     armor stand or a marker takes a rider: the guest sits on the vehicle's passenger point (its box
     height, less the player's 0.6 vehicle attachment), follows it when it is moved, and gets off on top
-    of it on sneak (Entity.getDismountLocationForPassenger); a mob rides a marker the same way."""
+    of it on sneak (Entity.getDismountLocationForPassenger). A marker is the exception:
+    Marker.couldAcceptPassenger() is false and Entity.startRiding checks it before `force`, so a mob
+    cannot ride one."""
     x, y, z = (int(v // 1) for v in pos_of(host))
     x, z = x + 4, z + 4
     host('command', command=f'fill {x - 2} {y - 1} {z - 2} {x + 6} {y - 1} {z + 2} minecraft:stone')
@@ -14266,7 +14278,7 @@ def check_ride_seats(host, guest, out):
         assert abs(r['followed']) < 0.01, f'the guest follows the moved {kind}: {seen}'
         # Off on top of the vehicle, then falling to the floor below like any player (10 ticks later).
         assert r['off'] and -0.01 <= r['off_y'] <= r['expected'][1] + 0.01, f'the guest gets off the {kind}: {seen}'
-    assert any('started riding' in line for line in seen['zombie on marker'] or []), f'a mob rides a marker: {seen}'
+    assert any("couldn't start riding" in line for line in seen['zombie on marker'] or []), f'a marker refuses a mob: {seen}'
     return seen
 
 

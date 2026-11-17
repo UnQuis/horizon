@@ -9,7 +9,17 @@ import sys
 
 PRIVATE_ROOTS = {".local", "decompiled", "minecraft", "assets", "run", "logs"}
 PRIVATE_EXTENSIONS = {".jar", ".class", ".jfr", ".hprof", ".java"}
-ORIGINAL_JDK_TOOLS = {"tools/JfrSummary.java", "tests/java/JfrFixture.java"}
+ORIGINAL_JDK_TOOLS = {
+    # Original observer of public Paper API events, with no server implementation code.
+    "tools/fixtures/paper-trace-plugin/PaperTrace.java",
+    "tools/JfrSummary.java",
+    # Original generator of the Java character tables: calls only the public Character API and prints ranges; no JDK implementation source.
+    "tools/JavaCharacterTables.java",
+    "tests/java/JfrFixture.java",
+    # HISTORY-ONLY: this original comparison driver is no longer in the current tree.
+    # Keep its old path allowed so --history/--pre-push accept its legitimate historical addition.
+    "tools/refactors/api-pr3/JsonNbtOracle.java",
+}
 # The prepared folder's files in one file (crates/horizon-core/src/prepared_files.rs): Mojang's data.
 PRIVATE_NAMES = {"horizon-data.bin"}
 # Vanilla's 1.13 data fixer tables, copied from its code until 2026-11; horizon-prepare now exports them from the
@@ -60,9 +70,11 @@ def paths_in_repository(history=False, revisions=None):
         return []
     roots = ["--all"] if revisions is None else revisions
     # Include diffs against merge parents so merge-resolution-only artifacts are caught.
+    # --no-renames: a rename is listed as a deletion and an addition, so both paths still show, and git skips its
+    # rename search on every large merge diff (53 s -> 8 s on main's whole history).
     # Git pushes the stored objects, not the history presented by local replace refs.
     result = subprocess.check_output(["git", "--no-replace-objects", "log", "--format=", "--name-only",
-                                      "-z", "-m", *roots, "--"])
+                                      "-z", "-m", "--no-renames", *roots, "--"])
     return [path.lstrip("\n") for path in result.decode("utf-8").split("\0")]
 
 
@@ -79,15 +91,17 @@ def pushed_revisions(stream):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--history", action="store_true", help="Inspect paths in all local Git history")
+    mode.add_argument("--history", action="store_true", help="Inspect paths in the history reachable from HEAD")
     mode.add_argument("--pre-push", action="store_true", help="Inspect history reachable from Git's ref updates on stdin")
     # CI's pull requests: only the commits a merge would add, not every ref's whole history.
     mode.add_argument("--range", metavar="BASE..HEAD", help="Inspect the commits of a revision range")
     args = parser.parse_args()
-    revisions = pushed_revisions(sys.stdin) if args.pre_push else [args.range] if args.range else None
+    # CI checks out every branch, so `--all` would fail main on any other branch's file: scan HEAD's ancestry.
+    revisions = (pushed_revisions(sys.stdin) if args.pre_push else [args.range] if args.range
+                 else ["HEAD"] if args.history else None)
     history = args.history or args.pre_push or bool(args.range)
-    rejected = sorted({path for path in paths_in_repository(history, revisions)
-                       if path and prohibited(path)})
+    # Millions of entries in a long history repeat a few thousand paths: judge each path once.
+    rejected = sorted(path for path in set(paths_in_repository(history, revisions)) if path and prohibited(path))
     tables = [] if history else sorted(copied_tables())
     if tables:
         print("Vanilla's data fixer tables come from the player's jar (horizon-prepare), not from Git:",

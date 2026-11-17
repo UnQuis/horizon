@@ -145,7 +145,7 @@ impl Step {
     }
 }
 
-struct Layout {
+pub(crate) struct Layout {
     top: f32,
     hint: Vec<Text>,
     slider: (f32, f32, f32),
@@ -223,7 +223,11 @@ impl Calibration {
             Step::Black => format!("{v:.2}"),
             _ => format!("{v:.0}"),
         };
-        Text::literal(format!("{}: {}", step.name(), value))
+        Text::literal(format!(
+            "{}: {}",
+            step.name(),
+            lang::tr("%s nits", &[&value])
+        ))
     }
     /// The current step's test picture in a GUI of `size`.
     pub fn picture(&self, font: &Font, size: (f32, f32)) -> Picture {
@@ -233,12 +237,22 @@ impl Calibration {
             self.layout(font, size).top / size.1.max(1.0),
         )
     }
-    pub fn draw(&self, batch: &mut HudBatch, atlas: &HudAtlas, cursor: (f32, f32)) {
+    pub(crate) fn draw_background(&self, batch: &mut HudBatch, atlas: &HudAtlas) -> Layout {
         let (w, h) = (batch.width, batch.height);
         let l = self.layout(&atlas.font, (w, h));
         // Above the band HDR output draws the test picture over whatever is here.
         batch.fill(atlas, 0.0, 0.0, w, h, rgba(0, 0, 0, 255));
         batch.fill(atlas, 0.0, l.top, w, h - l.top, rgba(24, 24, 24, 255));
+        l
+    }
+    pub(crate) fn draw_contents(
+        &self,
+        batch: &mut HudBatch,
+        atlas: &HudAtlas,
+        cursor: (f32, f32),
+        l: Layout,
+    ) {
+        let w = batch.width;
         let step = self.current();
         let title = Text::literal(lang::tr(
             "HDR Calibration %s/%s: %s",
@@ -377,7 +391,7 @@ mod tests {
     const NONE: EffectiveOutput = EffectiveOutput::NONE;
 
     fn font() -> Font {
-        Font::metrics(std::path::Path::new("/nonexistent/horizon-test-assets"))
+        Font::metrics(&horizon_assets::resource_source::ResourceSource::default())
     }
     /// At the default GUI scale of the game's first window (854 x 480 at 2).
     fn picture(c: &Calibration) -> Picture {
@@ -423,6 +437,19 @@ mod tests {
             c.key(KeyCode::Enter);
             assert_eq!(picture(&c).1, paper_white);
         }
+    }
+
+    /// Each step's slider reads in nits, as the HDR page does.
+    #[test]
+    fn each_step_reads_in_nits() {
+        let mut s = Settings::default();
+        s.horizon.hdr_black_level = 5;
+        let mut c = Calibration::new(&s, &NONE);
+        assert_eq!(c.label().plain(), "Black Level: 0.05 nits");
+        c.key(KeyCode::Enter);
+        assert_eq!(c.label().plain(), "Peak Brightness: 1000 nits");
+        c.key(KeyCode::Enter);
+        assert_eq!(c.label().plain(), "Paper White: 203 nits");
     }
 
     #[test]

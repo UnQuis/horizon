@@ -136,8 +136,8 @@ impl Arena {
         } else {
             wgpu::BufferUsages::VERTEX
         };
-        // BLAS builds read sections' vertices here (`ray_scene`).
-        let usage = usage | super::surface_setup::ray_query::blas_input(device);
+        // Ray tracing's unpack pass reads sections here (`ray_scene`).
+        let usage = usage | super::surface_setup::ray_query::arena_input(device);
         Self::with_usage(device, stride, capacity, usage, PAGE_BYTES)
     }
     /// Sorted translucent indices; `storage` when compute passes read them.
@@ -505,8 +505,8 @@ impl Arena {
         self.pages.iter().enumerate().find_map(|(i, p)| {
             let p = p.as_ref()?;
             let used = p.capacity - p.free_vertices();
-            let capacity = self
-                .grown(used, 0)
+            // Room for its ranges to double, bounded as growth is.
+            let capacity = (used + used.min(saving))
                 .max(self.initial_capacity)
                 .next_multiple_of(GRAIN)
                 .min(self.page_limit);
@@ -612,11 +612,13 @@ impl Arena {
             }
         }
     }
-    /// The capacity the newest page grows to for a range of `len`: double, but
-    /// by at most `PAGE_BYTES` past that size, so a large page is never left
-    /// half empty (nor held twice during the copy) by hundreds of MiB.
+    /// The capacity the newest page grows to for a range of `len`: half as
+    /// large again, but by at most `PAGE_BYTES` past that size, so a large page
+    /// is never left half empty (nor held twice during the copy) by hundreds of
+    /// MiB. Doubling left the section arena of a loaded view at render distance
+    /// 12 at 192 MiB for some 95 MiB of vertices.
     fn grown(&self, current: u64, len: u64) -> u64 {
-        let step = current.min(PAGE_BYTES / self.stride);
+        let step = (current / 2).min(PAGE_BYTES / self.stride);
         (current + step).max(current + len).min(self.page_limit)
     }
     /// Moves a page into a larger buffer; false (the page unchanged) when
@@ -827,6 +829,7 @@ mod tests {
 
     #[test]
     fn writes_recorded_before_a_grow_reach_the_grown_page() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -860,6 +863,7 @@ mod tests {
     /// empties the arena at once), while a page keeping some ranges frees only the others.
     #[test]
     fn ranges_released_at_once_free_exactly_their_vertices() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -893,6 +897,7 @@ mod tests {
 
     #[test]
     fn a_sparse_page_empties_into_the_others_and_is_reclaimed() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -969,6 +974,7 @@ mod tests {
     /// quads move with them.
     #[test]
     fn compaction_moves_what_sections_hold_in_the_section_arena() {
+        let _gpu = crate::gfx::test_gpu::lock();
         use super::super::{Part, SectionGpu, gpu_culling, move_off_page};
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
@@ -1104,6 +1110,7 @@ mod tests {
     /// put them at another section's origin.
     #[test]
     fn moved_translucent_quads_keep_their_section_s_flat_id() {
+        let _gpu = crate::gfx::test_gpu::lock();
         use super::super::{Part, SectionGpu, flat, move_off_page, upload::Uploads};
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
@@ -1145,7 +1152,7 @@ mod tests {
             })
         };
         let pipeline = &pipeline;
-        let solid = |layout: &wgpu::PipelineLayout, label: &str, _: &str, _: &str| {
+        let solid = |layout: &wgpu::PipelineLayout, label: &str, _: &str, _: &str, _| {
             super::super::SolidPipeline {
                 plain: pipeline(layout, label, "", "", None, None, true),
                 hdr: None,
@@ -1239,22 +1246,24 @@ mod tests {
     /// submitted, so a grown page bound whole had its new tail cleared on the GPU.
     #[test]
     fn large_pages_are_bound_up_to_their_last_range_in_use() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
         let mut arena = Arena::translucent(&device, 24, GRAIN);
-        let ranges: Vec<_> = (0..3)
+        let ranges: Vec<_> = (0..4)
             .map(|_| alloc(&mut arena, &device, &queue, GRAIN).unwrap())
             .collect();
-        // The third grain grew the page to four.
-        assert_eq!(arena.buffer(0).size(), 4 * GRAIN * 24);
-        assert_eq!(arena.binding(0).size(), 3 * GRAIN * 24);
+        // The fourth grain grew the page from three to five (half again, in grains).
+        assert_eq!(arena.buffer(0).size(), 5 * GRAIN * 24);
+        assert_eq!(arena.binding(0).size(), 4 * GRAIN * 24);
         // A free range before the last in use stays bound, none after it; an empty
         // page binds a grain (wgpu refuses an empty slice).
         arena.release(0, ranges[1].1, GRAIN);
-        assert_eq!(arena.binding(0).size(), 3 * GRAIN * 24);
         arena.release(0, ranges[2].1, GRAIN);
+        assert_eq!(arena.binding(0).size(), 4 * GRAIN * 24);
+        arena.release(0, ranges[3].1, GRAIN);
         assert_eq!(arena.binding(0).size(), GRAIN * 24);
         arena.release(0, ranges[0].1, GRAIN);
         assert_eq!(arena.binding(0).size(), GRAIN * 24);
@@ -1262,6 +1271,7 @@ mod tests {
 
     #[test]
     fn empty_pages_are_reclaimed_without_moving_live_ranges() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -1306,6 +1316,7 @@ mod tests {
     /// whole-page storage bindings of flat draws and shader packs included.
     #[test]
     fn pages_stay_within_their_caps_and_the_device_limits() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let devices = devices();
         if devices.is_empty() {
             eprintln!("no GPU adapter: skipped");
@@ -1340,6 +1351,7 @@ mod tests {
     /// `translucent_split`), translucent quads keep to the section arena.
     #[test]
     fn translucent_arenas_follow_the_layout() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let devices = devices();
         if devices.is_empty() {
             eprintln!("no GPU adapter: skipped");
@@ -1374,6 +1386,7 @@ mod tests {
     /// Pages double up to `PAGE_BYTES`, then grow by `PAGE_BYTES` at most.
     #[test]
     fn large_pages_grow_by_bounded_steps() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -1382,8 +1395,9 @@ mod tests {
         // Exercise the policy past the test device's own buffer limit.
         arena.page_limit = LARGE_PAGE_BYTES / 24 / GRAIN * GRAIN;
         let step = PAGE_BYTES / 24;
-        assert_eq!(arena.grown(1 << 18, GRAIN), 1 << 19);
-        assert_eq!(arena.grown(step, GRAIN), 2 * step);
+        assert_eq!(arena.grown(1 << 18, GRAIN), 3 << 17);
+        assert_eq!(arena.grown(1 << 18, 1 << 18), 1 << 19);
+        assert_eq!(arena.grown(step, GRAIN), step + step / 2);
         assert_eq!(arena.grown(3 * step, GRAIN), 4 * step);
         assert_eq!(arena.grown(3 * step, step + GRAIN), 4 * step + GRAIN);
         assert_eq!(
@@ -1400,6 +1414,7 @@ mod tests {
     /// `trim` returns it. Translucent vertices and sorted indices alike.
     #[test]
     fn a_large_page_moves_into_one_of_the_size_its_ranges_get() {
+        let _gpu = crate::gfx::test_gpu::lock();
         use super::super::{Part, SectionGpu, begin_shrink, move_off_page};
         // Where system memory could take the new page, it must not.
         let Some((device, queue)) = device_with(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) else {
@@ -1537,6 +1552,7 @@ mod tests {
     /// smaller: at the smallest page that shrinks and at the largest.
     #[test]
     fn large_pages_shrink_when_that_halves_them_or_saves_a_page() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, _)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -1580,6 +1596,7 @@ mod tests {
 
     #[test]
     fn clearing_an_arena_releases_buffers_and_can_allocate_again() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             eprintln!("no GPU adapter: skipped");
             return;
@@ -1676,6 +1693,7 @@ mod tests {
 
     #[test]
     fn full_video_memory_spills_to_system_memory() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device_with(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS) else {
             return;
         };
@@ -1710,6 +1728,7 @@ mod tests {
 
     #[test]
     fn no_memory_left_is_not_an_error() {
+        let _gpu = crate::gfx::test_gpu::lock();
         let Some((device, queue)) = device() else {
             return;
         };

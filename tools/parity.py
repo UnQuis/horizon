@@ -206,9 +206,22 @@ def environment_key(hasher):
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
+# Directories whose modules a harness finds by file name (tools/command_exec_corpus.py, discovered_groups): a
+# harness that recorded one of their files depends on all of them, also on one added after its record was made.
+GROUP_DIRECTORIES = ("tools/command_exec_groups/",)
+
+
+def group_files(dependencies):
+    """The .py files now in the GROUP_DIRECTORIES that dependencies name a file of, as paths from ROOT."""
+    plain = {path.split(KEEP)[0].replace("\\", "/") for path in dependencies}
+    return {file.relative_to(ROOT).as_posix()
+            for directory in GROUP_DIRECTORIES if any(path.startswith(directory) for path in plain)
+            for file in (ROOT / directory).glob("*.py")}
+
+
 def key(record, hasher, environment):
     digest = hashlib.sha256(environment.encode())
-    for path in sorted(record["dependencies"]):
+    for path in sorted({*record["dependencies"], *group_files(record["dependencies"])}):
         digest.update(f"{path}\0{hasher(ROOT / path)}\n".encode())
     return digest.hexdigest()
 
@@ -401,7 +414,7 @@ def impl_targets(header, text, workspace):
 def narrow_rust_sources(sources, scope):
     """Drop the workspace Rust sources a harness's declared PARITY_RUST_SCOPE proves it can't reach.
 
-    The scope lists source prefixes (crates/horizon-world/src/nbt.rs,
+    The scope lists source prefixes (crates/horizon-core/src/nbt.rs,
     crates/horizon-world/src/datafix/). It applies only if it is closed: no
     file in it names a module, crate item or macro outside it (crate::,
     super::, other workspace crates), declares a module it doesn't cover, or
@@ -826,7 +839,8 @@ def outcome(name, script, passed, elapsed, trace_path, hasher=None):
         if passed:
             clear_large_outputs(name, trace)
         if hasher is not None:
-            record["hashes"] = {path: hasher(ROOT / path) for path in record["dependencies"]}
+            record["hashes"] = {path: hasher(ROOT / path)
+                                for path in {*record["dependencies"], *group_files(record["dependencies"])}}
     else:
         record["dependencies"], record["artifacts"] = [], []
     return record
@@ -1529,6 +1543,9 @@ def affected_harnesses(found, records, changed, reach=True, base=None):
         dependencies = [canonical_dependency_path(path) for path in dependencies]
         plain = {path.split(KEEP)[0] for path in dependencies}
         hit = (plain & changed) | parity_reach.unrecorded(ROOT, plain, changed)
+        # A group file added since the record was made isn't in it: the directory's other files stand for it.
+        hit |= {path for path in changed for directory in GROUP_DIRECTORIES
+                if path.startswith(directory) and any(known.startswith(directory) for known in plain)}
         if not hit:
             continue
         if graph is None or any(not path.startswith("crates/") for path in hit):
@@ -1626,6 +1643,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("names", nargs="*", help="harness names, e.g. food or block_update")
     parser.add_argument("--all", action="store_true", help="run every harness from scratch, ignoring earlier passes")
+    parser.add_argument("--exclude", action="append", default=[], help="exclude a harness and its shards")
     parser.add_argument("--fresh", action="store_true", help="run the vanilla oracles even if their inputs are unchanged")
     parser.add_argument("--failed", action="store_true", help="rerun the harnesses that failed last time")
     parser.add_argument("--list", action="store_true", help="print what would run, then stop")
@@ -1699,6 +1717,7 @@ def main():
               f"depend on them, {len(chosen)} without a pass for their current inputs.", flush=True)
     else:
         chosen = [name for name in found if stale(name, state, hasher, environment)]
+    chosen = [name for name in chosen if base_name(name) not in args.exclude]
     skips = platform_skips(host_config())
     for name in [name for name in chosen if base_name(name) in skips and not args.names]:
         print(f"skipped on {HOST} ({sys.platform}): {name}: {skips[base_name(name)]}", flush=True)
@@ -1709,7 +1728,8 @@ def main():
         chosen.remove(name)
     rounds = {name: args.repeat for name in chosen} if args.repeat > 1 else {}
     if args.flake_check:
-        changed = {name for name in changed_harnesses(found, records, args.flake_check) if base_name(name) not in manual}
+        changed = {name for name in changed_harnesses(found, records, args.flake_check)
+                   if base_name(name) not in manual and base_name(name) not in args.exclude}
         for name in sorted(changed):
             # A pass counts for a changed harness only if it held over enough runs.
             if name not in chosen and records.get(name, {}).get("rounds", 1) < args.flake_rounds:
