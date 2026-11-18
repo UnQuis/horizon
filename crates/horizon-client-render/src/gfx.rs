@@ -11528,39 +11528,6 @@ impl Renderer {
                     },
                 });
             }
-            if !frame.title {
-                self.draw_world_views(&mut encoder, frame, globals, flat_frame, entity_quads);
-                let (depth, depth_size) = match &scaled {
-                    Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
-                    None => (&self.depth, size),
-                };
-                native_render::world_drawn(&mut native_render::WorldDrawn {
-                    device: &self.device,
-                    queue: &self.queue,
-                    encoder: &mut encoder,
-                    color: &target_texture,
-                    color_view: &view_target,
-                    color_format: self.output.frame.overlay_format,
-                    size,
-                    depth,
-                    depth_size,
-                    view_proj,
-                    jittered,
-                    camera: frame.camera,
-                    entities: frame.entities,
-                    spans: frame.entity_spans,
-                    motion: frame.entity_motion,
-                    atlas: self.hud.atlas_texture.as_ref(),
-                    quad_indices: &self.indices,
-                    block_sprites: native_render::BlockSpriteArrays {
-                        views: &self.sprite_views,
-                        split: self.sprite_split,
-                        size: self.sprite_textures[0].width(),
-                        nearest: &self.sprite_nearest,
-                        filtered: &self.sprite_sampler,
-                    },
-                });
-            }
         }
         if tfr_synthetic {
             self.tfr_state.commit_synthetic();
