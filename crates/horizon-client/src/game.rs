@@ -169,8 +169,8 @@ use horizon_client::{
     vanillagen::VanillaTerrain,
     world::World,
 };
-use horizon_client_render::tfr::core::{WorldEpoch, dimension_id};
 use horizon_client::{fast_hash::FxHashMap, held::Source};
+use horizon_client_render::tfr::core::{WorldEpoch, dimension_id};
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
     geometry::{Aabb, Direction},
