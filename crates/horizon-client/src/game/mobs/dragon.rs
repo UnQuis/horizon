@@ -2504,8 +2504,7 @@ impl Game<'_> {
                             f64::from(-trig::cos(r)),
                         ));
                         let dot = dir.dot(aim) as f32;
-                        let angle = (f64::from(dot).acos() * 180.0
-                            / f64::from(std::f32::consts::PI))
+                        let angle = (f64::from(dot).acos() * f64::from(trig::RAD_TO_DEG))
                             as f32
                             + 0.5;
                         if angle < 0.0 || angle > 10.0 {
@@ -2513,7 +2512,7 @@ impl Game<'_> {
                             let (xd, zd) = (pp.x - head.x, pp.z - head.z);
                             let delta = wrap64(
                                 180.0
-                                    - trig::atan2(xd, zd) * 180.0 / f64::from(std::f32::consts::PI)
+                                    - trig::atan2(xd, zd) * f64::from(trig::RAD_TO_DEG)
                                     - f64::from(d.yaw),
                             )
                             .clamp(-100.0, 100.0);
@@ -3079,7 +3078,10 @@ impl Game<'_> {
     /// direction.normalize())`, whose `AbstractHurtingProjectile` constructor
     /// takes the dragon as its owner and `assignDirectionalMovement`s the
     /// direction normalized again times `accelerationPower` (0.1), then
-    /// `snapTo` the start. It joins the level's other projectiles.
+    /// `snapTo` the start with the angles (0, 0), which undoes the
+    /// constructor's `setRot(dragon)`: unlike a blaze's, ghast's or wither's,
+    /// it does not start at its shooter's rotation. It joins the level's other
+    /// projectiles.
     fn spawn_dragon_fireball(&mut self, at: Vec3, dir: Vec3) {
         // Vec3.normalize: a vector shorter than 1e-5 is zero.
         let normalize = |v: Vec3| {
@@ -4125,22 +4127,16 @@ impl Game<'_> {
 /// Respawning the dragon with end crystals on the exit portal
 /// (`EndCrystalItem.useOn`, `EnderDragonFight.tryRespawn`, `DragonRespawnStage`).
 impl Game<'_> {
-    /// `EndCrystalItem.useOn`: on obsidian or bedrock with room above.
-    pub(super) fn place_end_crystal(
-        &mut self,
-        hit: &super::Hit,
-        stack: &horizon_client::items::ItemStack,
-    ) -> bool {
-        if &*stack.item != "minecraft:end_crystal" {
-            return false;
-        }
-        let name = self
+    /// `EndCrystalItem.useOn`'s checks, which are the same on a client level:
+    /// obsidian or bedrock clicked, air above it, and no entity in the 1x2x1 room.
+    /// SUCCESS when they hold, FAIL otherwise.
+    pub(super) fn end_crystal_fits(&self, hit: &super::Hit) -> bool {
+        let name = &self
             .res
             .facts()
             .get(self.world.block(hit.pos[0], hit.pos[1], hit.pos[2]))
-            .name
-            .clone();
-        if !matches!(&*name, "minecraft:obsidian" | "minecraft:bedrock") {
+            .name;
+        if !matches!(&**name, "minecraft:obsidian" | "minecraft:bedrock") {
             return false;
         }
         let above = [hit.pos[0], hit.pos[1] + 1, hit.pos[2]];
@@ -4157,9 +4153,23 @@ impl Game<'_> {
             f64::from(above[2]),
         );
         let room = Aabb::new(Vec3::new(x, y, z), Vec3::new(x + 1.0, y + 2.0, z + 1.0));
-        if self.entity_in(room) {
+        !self.entity_in(room)
+    }
+    /// `EndCrystalItem.useOn`: on obsidian or bedrock with room above.
+    pub(super) fn place_end_crystal(
+        &mut self,
+        hit: &super::Hit,
+        stack: &horizon_client::items::ItemStack,
+    ) -> bool {
+        if &*stack.item != "minecraft:end_crystal" || !self.end_crystal_fits(hit) {
             return false;
         }
+        let above = [hit.pos[0], hit.pos[1] + 1, hit.pos[2]];
+        let (x, y, z) = (
+            f64::from(above[0]),
+            f64::from(above[1]),
+            f64::from(above[2]),
+        );
         // EndCrystal's constructor: `this.random.nextInt(100000)`, the crystal's own random.
         let drawn = random_source::entity().next_int_bound(100_000).unwrap_or(0);
         let at = Vec3::new(x + 0.5, y, z + 0.5);

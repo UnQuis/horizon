@@ -239,6 +239,7 @@ impl Launcher {
         self.client_started =
             Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
         self.starting_client = Some(instance.id.clone());
+        self.starting_instance = Some(instance.id.clone());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let log = |line: String| {
@@ -279,6 +280,22 @@ impl Launcher {
     /// Starts the game: the session first (a network round trip when the token needs
     /// renewing), then `drain` starts the process when it arrives.
     pub(crate) fn start_client(&mut self, tag: String, instance_id: Option<String>) {
+        // The folder this start reads, a pack's carried mods among it: never one being ported.
+        let work = self.starting_pack.clone().or_else(|| {
+            self.instances
+                .list
+                .iter()
+                .find(|i| Some(&i.id) == instance_id.as_ref())
+                .map(|i| i.work.clone())
+        });
+        if let Some(why) = work.as_deref().and_then(|w| self.pack_folder_busy(w)) {
+            self.client_error = Some(tr(why).into());
+            self.starting_pack = None;
+            self.joining = None;
+            self.quick_play = None;
+            return;
+        }
+        self.starting_work = work;
         self.client_error = None;
         self.crash = None;
         self.prepare_log.clear();

@@ -455,6 +455,7 @@ struct Launcher {
     /// The game is waiting for its session (a token renewal), or a Java instance for its files
     /// and Java (`start_java`), before it starts.
     starting_client: Option<String>,
+    /// The instance that start is for, whatever is selected by the time it ends.
     starting_instance: Option<String>,
     /// Play was pressed on a version not prepared yet: it starts once this preparation ends well.
     play_when_prepared: Option<(String, String)>,
@@ -534,6 +535,8 @@ struct Launcher {
     /// Modpacks installed from Horizon's registry, each its own profile.
     registry_packs: Vec<horizon_launcher::browser::horizon::pack::Installed>,
     packs_loaded: Option<Instant>,
+    /// The imported packs' read on a thread, and whether it may still apply (`load_packs`).
+    packs_reading: modpacks_page::PackReads,
     pack_open: Option<String>,
     pack_filter: Option<horizon_port_pack::report::Status>,
     pack_busy: bool,
@@ -545,6 +548,10 @@ struct Launcher {
     found_scanning: bool,
     /// The game starting now plays this pack's profile (its work folder).
     starting_pack: Option<std::path::PathBuf>,
+    /// The folder of the instance a start is preparing, while `starting_client` is set.
+    starting_work: Option<std::path::PathBuf>,
+    /// The pack folder a Port step is rebuilding now.
+    porting: Option<std::path::PathBuf>,
     /// The Mods page: the browser's search, installs and updates (`mods_page.rs`).
     mods: mods_page::Mods,
     github: github_mods_page::Github,
@@ -558,6 +565,8 @@ struct Launcher {
     /// Pictures from disk made at their drawn size (`picture_cache`).
     pictures: picture_cache::Pictures,
     game_packs: packs_page::Packs,
+    /// The games' answers about their shader API seen so far (`game_shader_api::answers`).
+    shader_answers: u64,
     world_packs: datapacks_page::WorldPacks,
     export: Option<export_page::ExportPanel>,
     launch: Option<launch_page::LaunchPanel>,
@@ -818,6 +827,32 @@ mod tests {
         assert!(!starts_now(true, true, false), "prepared again under way");
         assert!(!starts_now(false, false, false), "not prepared");
         assert!(!starts_now(true, false, true), "already running");
+    }
+
+    /// A sidebar row says Running or Starting for the instance that was started, not for
+    /// whichever one is selected (#16186).
+    #[test]
+    fn a_row_shows_the_game_of_its_own_instance_only() {
+        use super::frame::{row_phase, running_ids, RowPhase};
+        assert_eq!(row_phase("a", &["a"], None), Some(RowPhase::Running));
+        assert_eq!(row_phase("b", &["a"], None), None, "B is only selected");
+        assert_eq!(row_phase("a", &[], Some("a")), Some(RowPhase::Starting));
+        assert_eq!(row_phase("b", &[], Some("a")), None);
+        assert_eq!(row_phase("a", &[], None), None, "nothing runs");
+        // Several games: one runs while another starts.
+        assert_eq!(row_phase("a", &["a"], Some("b")), Some(RowPhase::Running));
+        assert_eq!(row_phase("b", &["a"], Some("b")), Some(RowPhase::Starting));
+        assert_eq!(row_phase("b", &["a", "b"], None), Some(RowPhase::Running));
+        // The started instance deleted (ids don't change on a rename): no row has its game.
+        assert_eq!(row_phase("c", &["a"], Some("b")), None);
+        // The ids come from the run's own instance, and only while its game runs.
+        let run = ("a".to_string(), std::time::Instant::now());
+        assert_eq!(running_ids(true, Some(&run)), ["a"]);
+        assert!(running_ids(false, Some(&run)).is_empty());
+        assert!(
+            running_ids(true, None).is_empty(),
+            "a pack with no instance"
+        );
     }
 
     #[test]

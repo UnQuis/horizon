@@ -1764,7 +1764,7 @@ impl Game<'_> {
             };
             // PotionContents.getPotionDescription: the effect names are
             // translatable, read in the selected language like every other line.
-            for (text, cat) in brewing::tooltip(stack.potion(), scale, &translate) {
+            for (text, cat) in brewing::tooltip(stack, scale, &translate) {
                 let c = match cat {
                     brewing::Category::Beneficial => rgba(85, 85, 255, 255),
                     brewing::Category::Harmful => rgba(255, 85, 85, 255),
@@ -1949,20 +1949,16 @@ impl Game<'_> {
         }
         details.end(lines.len());
         if display.shows("minecraft:damage")
-            && let Some(info) = item_info
-            && info.max_damage > 0
-            && stack.damage > 0
             && advanced
+            && let Some((left, max)) = stations::durability(self.items(), stack)
         {
             // `item.durability`, in the selected language.
             lines.push((
                 horizon_client::text::Text::translate(
                     "item.durability",
                     &[
-                        horizon_client::text::Text::literal(
-                            info.max_damage.saturating_sub(stack.damage).to_string(),
-                        ),
-                        horizon_client::text::Text::literal(info.max_damage.to_string()),
+                        horizon_client::text::Text::literal(left.to_string()),
+                        horizon_client::text::Text::literal(max.to_string()),
                     ],
                 ),
                 u32::MAX,

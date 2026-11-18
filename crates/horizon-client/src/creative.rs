@@ -909,6 +909,27 @@ impl Creative {
         self.scrolling = self.can_scroll(names);
         true
     }
+    /// `CreativeModeInventoryScreen.extractRenderState`: over the scrollbar the
+    /// cursor is the pointing hand, the vertical resize while it is held, and
+    /// not-allowed when there is nothing to scroll. `mouse` is relative to the
+    /// screen origin, like [`Self::inside_scrollbar`]; None away from the bar.
+    pub fn scrollbar_cursor(
+        &self,
+        mouse: (f32, f32),
+        names: &Names,
+    ) -> Option<crate::widgets::Cursor> {
+        use crate::widgets::Cursor;
+        if !self.inside_scrollbar(mouse.0, mouse.1) {
+            return None;
+        }
+        Some(if !self.can_scroll(names) {
+            Cursor::NotAllowed
+        } else if self.scrolling {
+            Cursor::ResizeNs
+        } else {
+            Cursor::PointingHand
+        })
+    }
     /// mouseDragged while the scrollbar is held, at a cursor height relative to
     /// the screen origin, wherever the cursor is (even off the track or the window).
     pub fn drag_scrollbar(&mut self, y: f32) -> bool {
@@ -1093,6 +1114,19 @@ pub fn slot_locked(stack: &ItemStack) -> bool {
         .is_some_and(|d| d.other("minecraft:creative_slot_lock").is_some())
 }
 
+/// `ItemStack.getMaxStackSize` for a copy taken from the creative screen: the
+/// stack's `minecraft:max_stack_size` component, clamped to the codec's
+/// 1..=99, otherwise the item's own size.
+pub fn creative_stack_limit(stack: &ItemStack, item_max: u32) -> u32 {
+    match stack
+        .data()
+        .and_then(|data| data.other("minecraft:max_stack_size"))
+    {
+        Some(horizon_core::nbt::Tag::Int(n)) => (*n).clamp(1, 99) as u32,
+        _ => item_max,
+    }
+}
+
 /// `CreativeModeInventoryScreen.slotClicked` on a display slot
 /// (`slot.container == CONTAINER`): `shown` is the slot's item (None past
 /// the tab's end) and `max` gives an item's max stack size. The tab's items
@@ -1181,6 +1215,25 @@ mod tests {
             damage: 0,
             extra: None,
         }
+    }
+
+    /// A middle-click on a display item copies `getMaxStackSize`. The component
+    /// wins over the item's 64; a stack without one still copies the item's size.
+    #[test]
+    fn a_display_click_copies_the_stacks_own_max_stack_size() {
+        use crate::menu::Input;
+        let limit = |s: &ItemStack| creative_stack_limit(s, 64);
+        let mut plain = None;
+        click_display(&mut plain, Some(&stack("stone", 1)), limit, 0, Input::Clone);
+        assert_eq!(plain.unwrap().count, 64);
+
+        let mut shown = stack("stone", 1);
+        shown
+            .data_mut()
+            .set_other("minecraft:max_stack_size", Some(Tag::Int(16)));
+        let mut carried = None;
+        click_display(&mut carried, Some(&shown), limit, 0, Input::Clone);
+        assert_eq!(carried.unwrap().count, 16);
     }
 
     /// One click on a display slot showing one stone (max 64; pearls 16).
@@ -1918,6 +1971,39 @@ mod tests {
         c.selected = 0;
         assert!(c.press_scrollbar(180.0, 60.0, &names));
         assert!(!c.scrolling);
+    }
+
+    #[test]
+    fn scrollbar_asks_for_the_cursor_its_state_calls_for() {
+        use crate::widgets::Cursor;
+        let names = Names {
+            map: HashMap::new(),
+        };
+        let mut c = creative(90);
+        c.selected = 1;
+        // Over the track: the hand. Beside it: no request at all.
+        assert_eq!(
+            c.scrollbar_cursor((180.0, 60.0), &names),
+            Some(Cursor::PointingHand)
+        );
+        assert_eq!(c.scrollbar_cursor((170.0, 60.0), &names), None);
+        // Held: the vertical resize, until it is released.
+        assert!(c.press_scrollbar(180.0, 60.0, &names));
+        assert_eq!(
+            c.scrollbar_cursor((180.0, 60.0), &names),
+            Some(Cursor::ResizeNs)
+        );
+        c.release();
+        assert_eq!(
+            c.scrollbar_cursor((180.0, 60.0), &names),
+            Some(Cursor::PointingHand)
+        );
+        // The inventory tab has nothing to scroll, so the bar is not allowed.
+        c.selected = 0;
+        assert_eq!(
+            c.scrollbar_cursor((180.0, 60.0), &names),
+            Some(Cursor::NotAllowed)
+        );
     }
 
     /// `CreativeModeInventoryScreen.selectTab`: the search box is focused on

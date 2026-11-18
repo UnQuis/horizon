@@ -2224,6 +2224,8 @@ fn java(
         .map_err(|e| {
         format!("{missing}\n  • Horizon also tried to download Minecraft's own Java from Mojang, but: {e}")
     })?;
+    // On macOS the download's Java home is inside its jre.bundle (#17894).
+    let home = prepare::java::runtime_home(&home).unwrap_or(home);
     find(major, &[home]).map(|jdk| jdk.home())
 }
 
@@ -4000,6 +4002,8 @@ pub struct Running {
 /// Launcher-owned tree-lock primitives and optional Windows runtime state.
 pub struct RuntimeGuard {
     _leases: Vec<crate::run_leases::Claim>,
+    /// Why the command starts without its leases, for the launch log.
+    pub warning: Option<String>,
     #[cfg(windows)]
     _windows: Option<crate::windows_runtime::Guard>,
 }
@@ -4008,7 +4012,31 @@ pub use crate::run_leases::control::startup_cleanup;
 
 pub fn prepare_command(cmd: Command) -> Result<(Command, RuntimeGuard), String> {
     crate::developer_offline::validate(&cmd)?;
-    let leases = crate::run_leases::shared(&cmd).map_err(crate::native_mods::cache_error)?;
+    let mut warning = None;
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut leases = match crate::run_leases::shared(&cmd) {
+        Ok(leases) => leases,
+        // Leases keep cleanup away from what a running game uses, and only Horizon's own game
+        // runs from what the launcher cleans up: Java Edition starts without them (#18018).
+        // A busy tree is a cleanup that ends soon, and its message says to wait for it.
+        Err(error)
+            if !crate::run_leases::is_horizon(&cmd)
+                && !matches!(error, crate::native_cache::Error::Busy) =>
+        {
+            warning = Some(crate::i18n::trf(
+                "Starting without marking the game's folders as in use: {error}",
+                &[("error", &crate::native_mods::cache_error(error))],
+            ));
+            Vec::new()
+        }
+        Err(error @ crate::native_cache::Error::Io(_)) => {
+            return Err(crate::i18n::trf(
+                "{error}. Make sure your account can write to the game's and the launcher's folders, then try again.",
+                &[("error", &crate::native_mods::cache_error(error))],
+            ));
+        }
+        Err(error) => return Err(crate::native_mods::cache_error(error)),
+    };
     #[cfg(windows)]
     let cmd = crate::windows_runtime::redirect(cmd);
     #[cfg(windows)]
@@ -4021,10 +4049,14 @@ pub fn prepare_command(cmd: Command) -> Result<(Command, RuntimeGuard), String> 
             ],
         )
     })?;
+    // The staged copy is a new unit: the game can lease it only once it is registered.
+    #[cfg(windows)]
+    leases.extend(crate::windows_runtime::leases(&cmd).map_err(crate::native_mods::cache_error)?);
     Ok((
         cmd,
         RuntimeGuard {
             _leases: leases,
+            warning,
             #[cfg(windows)]
             _windows: guard,
         },
@@ -4037,7 +4069,10 @@ pub fn spawn_attached(cmd: &mut Command) -> std::io::Result<std::process::Child>
 }
 
 pub fn spawn(job: Job, cmd: Command, tx: Sender<Msg>) -> Result<Running, String> {
-    let (mut cmd, runtime) = prepare_command(cmd)?;
+    let (mut cmd, mut runtime) = prepare_command(cmd)?;
+    if let Some(warning) = runtime.warning.take() {
+        let _ = tx.send(Msg::Line(job, warning));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

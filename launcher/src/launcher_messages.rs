@@ -4,6 +4,14 @@ use super::*;
 impl Launcher {
     pub(crate) fn drain(&mut self, window: gpui::AnyWindowHandle, cx: &mut Context<Self>) {
         let mut changed = false;
+        // A game said which shader API it serves: the packs judged by the launcher's own line
+        // while it was asked are judged again.
+        let answers = horizon_launcher::game_shader_api::answers();
+        if answers != self.shader_answers {
+            self.shader_answers = answers;
+            self.game_packs.stale();
+            changed = true;
+        }
         self.perf.tick();
         match self.bench.as_mut().map(|b| b.tick(&self.perf)) {
             Some(perf::Step::Go(page)) => {
@@ -89,6 +97,7 @@ impl Launcher {
                 Msg::OfficialPlayers(players) => self.official_players = players,
                 Msg::JavaGame(id, home, cmd) => {
                     self.starting_client = None;
+                    self.starting_instance = None;
                     let spawned = cmd.and_then(|(cmd, vars)| {
                         self.client_vars = vars;
                         backend::spawn(Job::Client, cmd, self.tx.clone())
@@ -116,6 +125,7 @@ impl Launcher {
                 Msg::JarConsent { jars, reply } => jar_launch::consent(window, jars, reply, cx),
                 Msg::JarClient { run, prepared } => {
                     self.starting_client = None;
+                    self.starting_instance = None;
                     match *prepared {
                         Ok(cmd) => {
                             self.client_home = cmd.get_current_dir().map(|d| d.to_path_buf());
@@ -319,6 +329,7 @@ impl Launcher {
                     }
                 }
                 Msg::PackDone(result) => self.pack_done(result),
+                Msg::ImportedPacks(asked, packs) => self.packs_read(asked, packs),
                 Msg::FoundPacks(found) => {
                     self.found_scanning = false;
                     self.found_packs = found;

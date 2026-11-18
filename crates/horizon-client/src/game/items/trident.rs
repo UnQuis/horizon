@@ -346,14 +346,9 @@ impl ThrownTrident {
             return;
         }
         self.in_ground_time = 0;
+        // The same turn as the host's tick: a fifth of the way, `Mth.atan2`.
+        self.turn_towards_movement();
         let m = self.velocity;
-        let (x, z) = if self.no_physics {
-            (-m.x, -m.z)
-        } else {
-            (m.x, m.z)
-        };
-        self.yaw = x.atan2(z).to_degrees() as f32;
-        self.pitch = m.y.atan2(m.x.hypot(m.z)).to_degrees() as f32;
         let to = self.position.add_vector(m);
         if !self.no_physics
             && let Some((at, _, _)) = w.clip(self.position, to)
@@ -441,15 +436,8 @@ impl Game<'_> {
     }
     pub(in crate::game) fn in_water_or_rain(&mut self) -> bool {
         let Some(p) = &self.player else { return false };
-        let (x, y, z) = (
-            p.position.x.floor() as i32,
-            p.position.y.floor() as i32,
-            p.position.z.floor() as i32,
-        );
-        let water = self.res.facts().get(self.world.block(x, y, z)).fluid
-            == horizon_client::blocks::Fluid::Water;
         let (at, top) = (p.position, p.bounds().max_position().y);
-        water || self.in_rain(at, top)
+        p.fluids.was_touching_water || self.in_rain(at, top)
     }
     /// The `summon_entity` and `play_sound` effects of `channeling.json`: in a
     /// thunderstorm (`weather_check`) a spot that sees the sky (`can_see_sky`)
@@ -1752,6 +1740,29 @@ mod tests {
         assert!(t.needs_sync, "the turn goes out at once");
     }
 
+    /// `AbstractArrow.tick` runs on a guest too: before the move the angles
+    /// turn a fifth of the way (`lerpRotation`) toward the motion, which faces
+    /// back without physics (a Loyalty trident coming home). Along (1, 0, 1)
+    /// that is yRot 45 and xRot 0, so from (0, 10) a fifth: (9, 8).
+    #[test]
+    fn a_remote_trident_turns_a_fifth_of_the_way_toward_its_motion() {
+        let mut trident = ThrownTrident::remote(1, Vec3::new(0.5, 100.0, 0.5), 0.0, 10.0);
+        trident.velocity = Vec3::new(1.0, 0.0, 1.0);
+        trident.remote_tick(&Air, None);
+        assert!((trident.yaw - 9.0).abs() < 1e-5, "yaw {}", trident.yaw);
+        assert!(
+            (trident.pitch - 8.0).abs() < 1e-5,
+            "pitch {}",
+            trident.pitch
+        );
+        let mut home = ThrownTrident::remote(2, Vec3::new(0.5, 100.0, 0.5), 0.0, 0.0);
+        home.no_physics = true;
+        home.velocity = Vec3::new(1.0, 0.0, 1.0);
+        home.remote_tick(&Air, None);
+        // atan2(-1, -1) = -135: a fifth of the way is -27.
+        assert!((home.yaw + 27.0).abs() < 1e-5, "yaw {}", home.yaw);
+    }
+
     #[test]
     fn remote_trident_waits_for_a_non_self_move_to_leave_its_block() {
         let mut trident = ThrownTrident::remote(1, Vec3::new(0.5, 100.0, 0.5), 0.0, 0.0);
@@ -1827,6 +1838,17 @@ mod tests {
         .unwrap();
         game.player =
             Some(PlayerMotion::new(game.motion, super::Vec3::new(4.5, 200.0, 4.5)).unwrap());
+
+        // `Entity.isInWaterOrRain` follows the live fluid interaction. The
+        // player's feet can be in air at the water surface while the body is
+        // still touching water, so the block at the feet is not sufficient.
+        let mut riptide = super::ItemStack::new("minecraft:trident", 1);
+        riptide.enchant("minecraft:riptide", 3);
+        game.player.as_mut().unwrap().fluids.was_touching_water = true;
+        *game.held_mut() = Some(riptide.clone());
+        assert!(game.use_trident(&riptide));
+        game.using = None;
+
         let mut stack = super::ItemStack::new("minecraft:trident", 1);
         stack.damage = 8;
         stack

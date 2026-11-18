@@ -4,6 +4,7 @@ use super::*;
 
 impl Launcher {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        horizon_launcher::game_shader_api::draws_here();
         horizon_launcher::storage::eviction::cleanup_after_start();
         let (tx, rx) = channel();
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
@@ -260,6 +261,7 @@ impl Launcher {
             packs: Vec::new(),
             registry_packs: Vec::new(),
             packs_loaded: None,
+            packs_reading: Default::default(),
             pack_open: None,
             pack_filter: None,
             pack_busy: false,
@@ -268,6 +270,8 @@ impl Launcher {
             found_packs: Vec::new(),
             found_scanning: false,
             starting_pack: None,
+            starting_work: None,
+            porting: None,
             mods: mods_page::Mods::new(cx),
             github: github_mods_page::Github::new(cx),
             instances: instances_page::Instances::default(),
@@ -277,6 +281,7 @@ impl Launcher {
             shot_blur: Default::default(),
             pictures: Default::default(),
             game_packs: packs_page::Packs::default(),
+            shader_answers: 0,
             world_packs: datapacks_page::WorldPacks::default(),
             export: None,
             launch: None,

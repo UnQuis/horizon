@@ -7,6 +7,7 @@
 //! unpacks them into the launcher's data folder. No rustup or player-installed compiler is used.
 //! Windows also gets a pinned C/link toolchain: WinLibs for x64 and LLVM-MinGW for ARM64.
 use crate::backend;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -309,6 +310,14 @@ impl Toolchain {
     /// opens no console window: cargo is a console program, and the launcher has none to share, so
     /// each build showed an empty one for as long as it ran (#4770).
     pub fn command(&self, program: &Path) -> Command {
+        self.command_through(program, crate::proxy::for_programs())
+    }
+
+    /// [`Toolchain::command`], its downloads going through `proxy`, the launcher's setting: Cargo
+    /// fetches the crates and horizon-mixins itself and doesn't read the launcher's settings, so the
+    /// Settings page's proxy is handed to it (#16718). Without one it reads `HTTPS_PROXY` from the
+    /// environment, as the launcher does.
+    fn command_through(&self, program: &Path, proxy: Option<String>) -> Command {
         let mut cmd = crate::process::command(program);
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mingw = self.host.c_toolchain.map(|_| self.mingw_bin());
@@ -328,6 +337,15 @@ impl Toolchain {
         if fs::create_dir_all(&tmp).is_ok() {
             cmd.env("TMPDIR", &tmp).env("TMP", &tmp).env("TEMP", &tmp);
         }
+        // MinGW-w64's windres starts gcc through the command processor `ComSpec` names (#16889).
+        if cfg!(windows) {
+            let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"));
+            if let Some(shell) =
+                command_processor(std::env::var_os("ComSpec").as_deref(), root.as_deref())
+            {
+                cmd.env("ComSpec", shell);
+            }
+        }
         for name in SCRUBBED {
             cmd.env_remove(name);
         }
@@ -335,6 +353,9 @@ impl Toolchain {
             if name.to_str().is_some_and(scrubbed) {
                 cmd.env_remove(name);
             }
+        }
+        if let Some(proxy) = proxy {
+            cmd.env("CARGO_HTTP_PROXY", proxy);
         }
         // These are the launcher's own settings, so add them after removing the player's Cargo
         // target overrides. The ARM64 target's linker is LLVM-MinGW's Clang driver; Rust and cc
@@ -393,6 +414,19 @@ impl Toolchain {
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
+}
+
+/// Windows' own command processor for a build, when the `ComSpec` it would inherit names no file
+/// (#16889); `None` leaves the build the player's. MinGW-w64's windres runs gcc, its preprocessor,
+/// through MSVCRT's `popen`, which starts the program `ComSpec` names. Without the variable it
+/// looks for `cmd.exe` in `PATH`'s folders; with one that names no file it finds nothing, and the
+/// game's icon step ended the build: "windres: can't popen `gcc -E …': No error".
+fn command_processor(comspec: Option<&OsStr>, system_root: Option<&OsStr>) -> Option<PathBuf> {
+    if comspec.is_some_and(|shell| Path::new(shell).is_file()) {
+        return None;
+    }
+    let shell = Path::new(system_root?).join("System32").join("cmd.exe");
+    shell.is_file().then_some(shell)
 }
 
 /// Whether the player's environment variable `name` stays out of a build: it would pick another
@@ -1274,6 +1308,27 @@ mod tests {
         assert!(get("CARGO_HOME").flatten().unwrap().ends_with("cargo"));
     }
 
+    /// #16718: the Settings page's proxy reaches the build's Cargo, which downloads the crates and
+    /// horizon-mixins itself; without one Cargo is left to the environment's, like the launcher.
+    #[test]
+    fn the_settings_proxy_reaches_cargo() {
+        let toolchain = Toolchain {
+            dir: PathBuf::from("/rust/1.99.1-x"),
+            host: &HOSTS[0],
+        };
+        let proxy = |setting: Option<&str>| {
+            let cmd = toolchain.command_through(&toolchain.cargo(), setting.map(String::from));
+            cmd.get_envs()
+                .find(|(name, _)| *name == "CARGO_HTTP_PROXY")
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            proxy(Some("socks5h://127.0.0.1:7891")),
+            Some(Some("socks5h://127.0.0.1:7891".into()))
+        );
+        assert_eq!(proxy(None), None, "the player's own CARGO_HTTP_PROXY stays");
+    }
+
     /// The tools' scratch dir is the build's own (#5189): MinGW-w64's gcc, as and ld can't
     /// open a non-ASCII %TEMP%, like the one under a Cyrillic user name.
     #[test]
@@ -1299,6 +1354,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #16889: MinGW-w64's windres runs gcc through the command processor `ComSpec` names, so one
+    /// that names no file ended the game's build at its icon. The build then gets Windows' own; a
+    /// `ComSpec` that names a file stays the player's.
+    #[test]
+    fn a_build_gets_windows_command_processor_when_comspec_names_no_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let windows_shell = root.join("System32").join("cmd.exe");
+        fs::create_dir_all(windows_shell.parent().unwrap()).unwrap();
+        fs::write(&windows_shell, b"").unwrap();
+        let other_shell = root.join("tcc.exe");
+        fs::write(&other_shell, b"").unwrap();
+        let chosen = |comspec: Option<&Path>| {
+            command_processor(comspec.map(Path::as_os_str), Some(root.as_os_str()))
+        };
+
+        assert_eq!(chosen(None), Some(windows_shell.clone()));
+        assert_eq!(
+            chosen(Some(&root.join("gone").join("cmd.exe"))),
+            Some(windows_shell.clone())
+        );
+        // The registry's value, read without its variable expanded.
+        assert_eq!(
+            chosen(Some(Path::new("%SystemRoot%\\system32\\cmd.exe"))),
+            Some(windows_shell.clone())
+        );
+        // A folder is no program.
+        assert_eq!(chosen(Some(root)), Some(windows_shell));
+        assert_eq!(chosen(Some(&other_shell)), None);
+
+        // Without Windows' own there is nothing to hand over.
+        assert_eq!(command_processor(None, None), None);
+        assert_eq!(
+            command_processor(None, Some(root.join("gone").as_os_str())),
+            None
+        );
     }
 
     #[test]
@@ -1641,8 +1734,9 @@ mod tests {
                 "--locked",
                 "--profile",
                 "fast",
+                // The game's `horizon-client` bin is in the horizon-game package.
                 "-p",
-                "horizon-client",
+                "horizon-game",
                 "--bin",
                 "horizon-client",
             ])

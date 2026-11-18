@@ -1285,6 +1285,8 @@ impl Game<'_> {
             if observe_level && let Some(level) = self.level(dim.id()) {
                 self.native_level_tick_post(level);
             }
+            #[cfg(feature = "state-digest")]
+            self.state_digest_tick(dim, running);
             horizon_client::spans::time("server_debug", || self.publish_server_debug(dim));
             // An entity that crossed into a level that already ticked this
             // server tick is in it when the tick ends (`addDuringTeleport`).
@@ -1348,6 +1350,8 @@ impl Game<'_> {
         record: impl FnOnce(TickTiming),
     ) -> Result<()> {
         let started = Instant::now();
+        // The game carried on past any turn a caught panic interrupted before this tick.
+        self.lan_interrupted_turns.clear();
         horizon_threads::work::tick_start();
         let result = self.tick_server_recorded(paused, record);
         horizon_threads::work::tick_end(started.elapsed().as_nanos() as u64);

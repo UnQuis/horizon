@@ -445,6 +445,10 @@ pub struct Guest {
     pub glide_end_unsent: bool,
     /// Pose last delivered to this player's own entity data, initially Standing.
     pub sent_pose: Pose,
+    /// The skin parts (Avatar.DATA_PLAYER_MODE_CUSTOMISATION) last delivered to
+    /// this player's own entity data, initially 0: the bits the client's own model
+    /// shows, which its player starts at (no layer) until the server sends them.
+    pub sent_skin: u8,
     /// The shoulder parrots (Player.DATA_SHOULDER_PARROT_LEFT and _RIGHT) the
     /// player's client was last sent about itself.
     pub sent_shoulders: [Option<i32>; 2],
@@ -826,6 +830,7 @@ impl Guest {
             sent_shared: 0,
             glide_end_unsent: false,
             sent_pose: Pose::Standing,
+            sent_skin: 0,
             sent_shoulders: [None; 2],
             sent_stuck: (0, 0),
             last_death: None,
@@ -1169,17 +1174,22 @@ impl Guest {
     }
     /// The inventory menu's 46 slots (ServerPlayer.inventoryMenu): 0 crafting
     /// result, 1..=4 crafting grid, 5..=8 armor, 9..=35 main, 36..=44 hotbar,
-    /// 45 off hand.
-    pub fn menu_slot(&self, slot: usize) -> Option<ItemStack> {
+    /// 45 off hand. The stack where it lies, for comparing against what the
+    /// client was last sent without copying it.
+    pub fn menu_slot_ref(&self, slot: usize) -> Option<&ItemStack> {
         match slot {
-            0 => self.craft_result.clone(),
-            1..=4 => self.craft_grid[slot - 1].clone(),
-            5..=8 => self.armor[slot - 5].clone(),
-            9..=35 => self.inventory.get(slot).cloned().flatten(),
-            36..=44 => self.inventory.get(slot - 36).cloned().flatten(),
-            45 => self.offhand.clone(),
+            0 => self.craft_result.as_ref(),
+            1..=4 => self.craft_grid[slot - 1].as_ref(),
+            5..=8 => self.armor[slot - 5].as_ref(),
+            9..=35 => self.inventory.get(slot).and_then(|s| s.as_ref()),
+            36..=44 => self.inventory.get(slot - 36).and_then(|s| s.as_ref()),
+            45 => self.offhand.as_ref(),
             _ => None,
         }
+    }
+    /// [`Self::menu_slot_ref`], copied: the slot's stack as it is now.
+    pub fn menu_slot(&self, slot: usize) -> Option<ItemStack> {
+        self.menu_slot_ref(slot).cloned()
     }
     /// The open menu's packets told the client every inventory slot: the
     /// inventory menu's own sync has nothing to add. Sent again, it could land
@@ -1362,9 +1372,229 @@ fn builtin_component(
             }
         }
         "minecraft:tool" => write_tool(value, ids, &mut w)?,
+        "minecraft:consumable" => write_consumable(value, ids, &mut w)?,
+        "minecraft:bees" => write_bees(value, ids, &mut w)?,
+        "minecraft:block_state" => write_block_state(value, &mut w)?,
         _ => return None,
     }
     Some(horizon_protocol::item::Component::Raw(w.data))
+}
+
+/// `ItemUseAnimation`'s network id (`ItemUseAnimation.STREAM_CODEC`, by ordinal).
+fn use_animation_id(name: &str) -> Option<i32> {
+    const NAMES: [&str; 12] = [
+        "none",
+        "eat",
+        "drink",
+        "block",
+        "bow",
+        "trident",
+        "crossbow",
+        "spyglass",
+        "toot_horn",
+        "brush",
+        "bundle",
+        "spear",
+    ];
+    NAMES.iter().position(|n| *n == name).map(|i| i as i32)
+}
+
+/// A string tag's text.
+fn tag_text(value: &horizon_core::nbt::Tag) -> Option<String> {
+    match value {
+        horizon_core::nbt::Tag::String(text) => text.to_string().ok(),
+        _ => None,
+    }
+}
+
+/// `SoundEvent.STREAM_CODEC` (a holder) from its saved form: a registered event's
+/// name, or an event of its own (`sound_id`, optional `range`).
+fn write_sound(
+    value: &horizon_core::nbt::Tag,
+    ids: &dyn Fn(&str, &str) -> Option<i32>,
+    w: &mut horizon_protocol::buf::Writer,
+) -> Option<()> {
+    use horizon_world::datafix::dynamic::{as_number, namespaced};
+    if let Some(name) = tag_text(value) {
+        let name = namespaced(&name);
+        match ids("minecraft:sound_event", &name) {
+            Some(id) => w.varint(id.checked_add(1)?),
+            None => {
+                w.varint(0);
+                w.string(&name);
+                w.bool(false);
+            }
+        }
+        return Some(());
+    }
+    w.varint(0);
+    w.string(&namespaced(&tag_text(value.get("sound_id")?)?));
+    match value.get("range") {
+        Some(range) => {
+            w.bool(true);
+            w.f32(as_number(range)?.float_value());
+        }
+        None => w.bool(false),
+    }
+    Some(())
+}
+
+/// `ConsumeEffect.STREAM_CODEC` from its saved form: the type's id, then its fields.
+fn write_consume_effect(
+    value: &horizon_core::nbt::Tag,
+    ids: &dyn Fn(&str, &str) -> Option<i32>,
+    w: &mut horizon_protocol::buf::Writer,
+) -> Option<()> {
+    use horizon_core::nbt::Tag;
+    use horizon_world::datafix::dynamic::{as_bool_opt, as_number, namespaced};
+    match namespaced(&tag_text(value.get("type")?)?).as_str() {
+        "minecraft:apply_effects" => {
+            w.varint(0);
+            let effects = match value.get("effects")? {
+                Tag::List(list) => list.as_slice(),
+                single @ Tag::Compound(_) => std::slice::from_ref(single),
+                _ => return None,
+            };
+            w.varint(i32::try_from(effects.len()).ok()?);
+            for effect in effects {
+                w.varint(ids(
+                    "minecraft:mob_effect",
+                    &namespaced(&tag_text(effect.get("id")?)?),
+                )?);
+                write_effect_details(effect, w);
+            }
+            w.f32(
+                value
+                    .get("probability")
+                    .map_or(Some(1.0), |p| Some(as_number(p)?.float_value()))?,
+            );
+        }
+        "minecraft:remove_effects" => {
+            w.varint(1);
+            write_holder_set("minecraft:mob_effect", value.get("effects")?, ids, w)?;
+        }
+        "minecraft:clear_all_effects" => w.varint(2),
+        "minecraft:teleport_randomly" => {
+            w.varint(3);
+            w.f32(
+                value
+                    .get("diameter")
+                    .map_or(Some(16.0), |d| Some(as_number(d)?.float_value()))?,
+            );
+            w.bool(
+                value
+                    .get("directional_particles")
+                    .map_or(Some(true), |d| as_bool_opt(Some(d)))?,
+            );
+        }
+        "minecraft:play_sound" => {
+            w.varint(4);
+            write_sound(value.get("sound")?, ids, w)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// `Consumable.STREAM_CODEC` from `Consumable.CODEC`'s saved form. A field the
+/// stack leaves out is written at its codec default: 1.6 seconds, eat, the
+/// generic eat sound, particles, no effects.
+fn write_consumable(
+    value: &horizon_core::nbt::Tag,
+    ids: &dyn Fn(&str, &str) -> Option<i32>,
+    w: &mut horizon_protocol::buf::Writer,
+) -> Option<()> {
+    use horizon_core::nbt::{Tag, Tag::Compound};
+    use horizon_world::datafix::dynamic::{as_bool_opt, as_number};
+    let Compound(_) = value else { return None };
+    w.f32(
+        value
+            .get("consume_seconds")
+            .map_or(Some(1.6), |s| Some(as_number(s)?.float_value()))?,
+    );
+    w.varint(use_animation_id(
+        &value
+            .get("animation")
+            .map_or(Some("eat".to_owned()), tag_text)?,
+    )?);
+    match value.get("sound") {
+        Some(sound) => write_sound(sound, ids, w)?,
+        None => write_sound(&Tag::String("minecraft:entity.generic.eat".into()), ids, w)?,
+    }
+    w.bool(
+        value
+            .get("has_consume_particles")
+            .map_or(Some(true), |p| as_bool_opt(Some(p)))?,
+    );
+    let effects = match value.get("on_consume_effects") {
+        Some(Tag::List(list)) => list.as_slice(),
+        Some(_) => return None,
+        None => &[],
+    };
+    w.varint(i32::try_from(effects.len()).ok()?);
+    for effect in effects {
+        write_consume_effect(effect, ids, w)?;
+    }
+    Some(())
+}
+
+/// `Bees.STREAM_CODEC` from the saved list: each `Occupant` as its
+/// `TypedEntityData` (the entity type's registry id, then its data without
+/// the id), `ticksInHive` and `minTicksInHive`.
+fn write_bees(
+    value: &horizon_core::nbt::Tag,
+    ids: &dyn Fn(&str, &str) -> Option<i32>,
+    w: &mut horizon_protocol::buf::Writer,
+) -> Option<()> {
+    use horizon_core::nbt::Tag;
+    // An empty list is the hive item's default, which a patch leaves out.
+    let Tag::List(bees) = value else {
+        return None;
+    };
+    if bees.is_empty() {
+        return None;
+    }
+    w.varint(i32::try_from(bees.len()).ok()?);
+    for bee in bees {
+        let Some(Tag::Compound(data)) = bee.get("entity_data") else {
+            return None;
+        };
+        let mut data = data.clone();
+        let Some(Tag::String(kind)) = data.remove(&"id".into()) else {
+            return None;
+        };
+        let kind = horizon_world::datafix::dynamic::namespaced(&kind.to_string().ok()?);
+        w.varint(ids("minecraft:entity_type", &kind)?);
+        w.nbt(&Tag::Compound(data));
+        let int = |key: &str| match bee.get(key) {
+            Some(Tag::Int(v)) => Some(*v),
+            _ => None,
+        };
+        w.varint(int("ticks_in_hive")?);
+        w.varint(int("min_ticks_in_hive")?);
+    }
+    Some(())
+}
+
+/// `BlockItemStateProperties.STREAM_CODEC` from the saved map: the count of
+/// properties, then each name and value as strings.
+fn write_block_state(
+    value: &horizon_core::nbt::Tag,
+    w: &mut horizon_protocol::buf::Writer,
+) -> Option<()> {
+    use horizon_core::nbt::Tag;
+    let Tag::Compound(properties) = value else {
+        return None;
+    };
+    w.varint(i32::try_from(properties.len()).ok()?);
+    for (name, value) in properties {
+        let Tag::String(value) = value else {
+            return None;
+        };
+        w.string(&name.to_string().ok()?);
+        w.string(&value.to_string().ok()?);
+    }
+    Some(())
 }
 
 /// `Tool.STREAM_CODEC` from `Tool.CODEC`'s saved form: the rules (blocks, an
@@ -1675,6 +1905,84 @@ fn trim_component(
         (material, pattern) => Component::TrimDirect { material, pattern },
     })
 }
+/// `PotionContents.STREAM_CODEC`: the potion's `minecraft:potion` id, the custom
+/// colour, and the custom effects and name as the bytes the component keeps.
+fn potion_contents(
+    d: &crate::item_data::StackData,
+    synced_id: &dyn Fn(&str, &str) -> Option<i32>,
+) -> Option<horizon_protocol::item::Component> {
+    use horizon_core::nbt::Tag;
+    let extra = |key: &str| {
+        d.potion_extra
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    };
+    let potion = d.potion.as_deref().and_then(|potion| {
+        synced_id(
+            "minecraft:potion",
+            &horizon_world::datafix::dynamic::namespaced(potion),
+        )
+    });
+    let color = crate::save::number(extra("custom_color")).map(|c| c as i32);
+    let effects: Vec<_> = match extra("custom_effects") {
+        Some(Tag::List(list)) => list
+            .iter()
+            .filter_map(|e| {
+                let name = crate::save::text(e.get("id"))?;
+                let id = synced_id(
+                    "minecraft:mob_effect",
+                    &horizon_world::datafix::dynamic::namespaced(&name),
+                )?;
+                Some((id, e))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let name = crate::save::text(extra("custom_name"));
+    if potion.is_none() && color.is_none() && effects.is_empty() && name.is_none() {
+        return None;
+    }
+    let mut rest = horizon_protocol::buf::Writer::new();
+    if !effects.is_empty() || name.is_some() {
+        rest.varint(effects.len() as i32);
+        for (id, effect) in effects {
+            rest.varint(id);
+            write_effect_details(effect, &mut rest);
+        }
+        rest.bool(name.is_some());
+        if let Some(name) = &name {
+            rest.string(name);
+        }
+    }
+    Some(horizon_protocol::item::Component::Potion {
+        potion,
+        color,
+        rest: rest.data,
+    })
+}
+/// `MobEffectInstance.Details.STREAM_CODEC` of a saved effect, as
+/// `MobEffectInstance.CODEC` defaults it: the icon follows the particles, and
+/// the hidden effect nests the same fields.
+fn write_effect_details(effect: &horizon_core::nbt::Tag, w: &mut horizon_protocol::buf::Writer) {
+    let flag =
+        |key: &str, default: bool| crate::save::number(effect.get(key)).map_or(default, |v| v != 0);
+    let visible = flag("show_particles", true);
+    w.varint(
+        crate::save::number(effect.get("amplifier"))
+            .unwrap_or(0)
+            .clamp(0, 255) as i32,
+    );
+    w.varint(crate::save::number(effect.get("duration")).unwrap_or(0) as i32);
+    w.bool(flag("ambient", false));
+    w.bool(visible);
+    w.bool(flag("show_icon", visible));
+    let hidden = effect.get("hidden_effect");
+    w.bool(hidden.is_some());
+    if let Some(hidden) = hidden {
+        write_effect_details(hidden, w);
+    }
+}
 /// Convert a borrowed item template with the same component codecs as inventory slots.
 pub(super) fn network_stack(
     item_id: &dyn Fn(&str) -> i32,
@@ -1768,8 +2076,20 @@ pub(super) fn network_stack(
             // the stack's own attribute modifiers (#14641).
             ("minecraft:tool", horizon_protocol::item::component::TOOL),
             (
+                "minecraft:consumable",
+                horizon_protocol::item::component::CONSUMABLE,
+            ),
+            (
                 "minecraft:attribute_modifiers",
                 horizon_protocol::item::component::ATTRIBUTE_MODIFIERS,
+            ),
+            // A hive item's bees: its tooltip, its bundle weight and whether
+            // it stacks all read them.
+            ("minecraft:bees", horizon_protocol::item::component::BEES),
+            // A block item's state: a hive's honey level, a statue's pose.
+            (
+                "minecraft:block_state",
+                horizon_protocol::item::component::BLOCK_STATE,
             ),
         ] {
             if d.other(&format!("!{name}")).is_some() {
@@ -1868,12 +2188,33 @@ pub(super) fn network_stack(
                 horizon_protocol::item::component::RARITY,
                 horizon_protocol::item::Component::Int(1),
             ));
+        }
+        // `tooltip_display`: `hide_tooltip` and the hidden components, which
+        // the client's tooltip reads. The raid banner hides its layers too.
+        let display = d.other("minecraft:tooltip_display");
+        if display.is_some() || d.ominous_banner {
+            let hide = display
+                .and_then(|t| crate::save::number(t.get("hide_tooltip")))
+                .is_some_and(|v| v != 0);
+            let mut hidden: Vec<i32> = match display.and_then(|t| t.get("hidden_components")) {
+                Some(horizon_core::nbt::Tag::List(names)) => names
+                    .iter()
+                    .filter_map(|name| {
+                        synced_id(
+                            "minecraft:data_component_type",
+                            &crate::save::text(Some(name))?,
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let layers = horizon_protocol::item::component::BANNER_PATTERNS;
+            if d.ominous_banner && !hidden.contains(&layers) {
+                hidden.push(layers);
+            }
             stack.added.push((
                 horizon_protocol::item::component::TOOLTIP_DISPLAY,
-                horizon_protocol::item::Component::TooltipDisplay {
-                    hide: false,
-                    hidden: vec![horizon_protocol::item::component::BANNER_PATTERNS],
-                },
+                horizon_protocol::item::Component::TooltipDisplay { hide, hidden },
             ));
         }
         // `painting/variant`: a reference into the synced registry.
@@ -1969,21 +2310,12 @@ pub(super) fn network_stack(
                 horizon_protocol::item::Component::LodestoneTracker { target, tracked },
             ));
         }
-        // PotionContents: the potion by its `minecraft:potion` id.
-        if let Some(id) = (d.potion.as_deref()).and_then(|potion| {
-            synced_id(
-                "minecraft:potion",
-                &horizon_world::datafix::dynamic::namespaced(potion),
-            )
-        }) {
-            stack.added.push((
-                horizon_protocol::item::component::POTION_CONTENTS,
-                horizon_protocol::item::Component::Potion {
-                    potion: Some(id),
-                    color: None,
-                    rest: Vec::new(),
-                },
-            ));
+        // PotionContents: the potion by its `minecraft:potion` id, the custom
+        // colour, custom effects and custom name.
+        if let Some(contents) = potion_contents(d, synced_id) {
+            stack
+                .added
+                .push((horizon_protocol::item::component::POTION_CONTENTS, contents));
         }
         // SuspiciousStewEffects: each effect by its `minecraft:mob_effect` id.
         if !d.stew_effects.is_empty() {
@@ -2269,6 +2601,48 @@ mod tests {
     use horizon_protocol::buf::{Codec, Reader, Writer};
     use horizon_protocol::item::{Component, component};
 
+    /// A consumable a client made goes out as `Consumable.STREAM_CODEC`. A byte
+    /// flag is `Codec.BOOL` (non-zero is true). An unknown animation is refused.
+    #[test]
+    fn a_saved_consumable_is_written_as_the_stream_codec() {
+        use horizon_core::nbt::parse_snbt;
+        let (value, _) = parse_snbt(
+            r#"{consume_seconds:3.2f,animation:"toot_horn",sound:"minecraft:block.fire.ambient",has_consume_particles:0b,on_consume_effects:[{type:"minecraft:apply_effects",effects:[{id:"minecraft:nausea",amplifier:7b,duration:2400,show_particles:0b,show_icon:0b}]}]}"#,
+        )
+        .unwrap();
+        let ids = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:sound_event", "minecraft:block.fire.ambient") => Some(300),
+            ("minecraft:mob_effect", "minecraft:nausea") => Some(8),
+            _ => None,
+        };
+        let Some(horizon_protocol::item::Component::Raw(bytes)) =
+            builtin_component("minecraft:consumable", &value, &ids)
+        else {
+            panic!("not written");
+        };
+        let mut w = horizon_protocol::buf::Writer::new();
+        w.f32(3.2);
+        w.varint(8);
+        w.varint(301);
+        w.bool(false);
+        w.varint(1);
+        w.varint(0);
+        w.varint(1);
+        w.varint(8);
+        w.varint(7);
+        w.varint(2400);
+        w.bool(false);
+        w.bool(false);
+        w.bool(false);
+        w.bool(false);
+        w.f32(1.0);
+        assert_eq!(bytes, w.data);
+        let (defaults, _) = parse_snbt("{}").unwrap();
+        assert!(builtin_component("minecraft:consumable", &defaults, &ids).is_some());
+        let (unknown, _) = parse_snbt(r#"{animation:"juggle"}"#).unwrap();
+        assert!(builtin_component("minecraft:consumable", &unknown, &ids).is_none());
+    }
+
     #[test]
     fn builtin_predicate_streams_keep_typed_conjunctions_and_reject_whole_unknown_forms() {
         let ids = |registry: &str, name: &str| match (registry, name) {
@@ -2549,6 +2923,62 @@ mod tests {
     }
 
     #[test]
+    fn a_stacks_tooltip_display_reaches_the_client() {
+        let synced_id = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:data_component_type", "minecraft:enchantments") => Some(13),
+            ("minecraft:data_component_type", "minecraft:lore") => Some(9),
+            _ => None,
+        };
+        let mut pickaxe = ItemStack::new("minecraft:diamond_pickaxe", 1);
+        assert_eq!(
+            stack_to_network(|_| 7, synced_id, &Some(pickaxe.clone()))
+                .unwrap()
+                .component(component::TOOLTIP_DISPLAY),
+            None
+        );
+        pickaxe.data_mut().set_other(
+            "minecraft:tooltip_display",
+            Some(Tag::compound([
+                ("hide_tooltip", Tag::Byte(1)),
+                (
+                    "hidden_components",
+                    Tag::List(vec![
+                        Tag::String("minecraft:enchantments".into()),
+                        Tag::String("minecraft:not_a_component".into()),
+                        Tag::String("minecraft:lore".into()),
+                    ]),
+                ),
+            ])),
+        );
+        let sent = stack_to_network(|_| 7, synced_id, &Some(pickaxe)).unwrap();
+        assert_eq!(
+            sent.component(component::TOOLTIP_DISPLAY),
+            Some(&Component::TooltipDisplay {
+                hide: true,
+                hidden: vec![13, 9],
+            })
+        );
+        // The raid captain's banner adds its hidden layers to the stack's own.
+        let mut banner = ItemStack::new("minecraft:white_banner", 1);
+        banner.data_mut().ominous_banner = true;
+        banner.data_mut().set_other(
+            "minecraft:tooltip_display",
+            Some(Tag::compound([(
+                "hidden_components",
+                Tag::List(vec![Tag::String("minecraft:lore".into())]),
+            )])),
+        );
+        let sent = stack_to_network(|_| 7, synced_id, &Some(banner)).unwrap();
+        assert_eq!(
+            sent.component(component::TOOLTIP_DISPLAY),
+            Some(&Component::TooltipDisplay {
+                hide: false,
+                hidden: vec![9, component::BANNER_PATTERNS],
+            })
+        );
+    }
+
+    #[test]
     fn potions_go_as_potion_registry_ids() {
         let synced_id = |registry: &str, name: &str| match (registry, name) {
             ("minecraft:potion", "minecraft:swiftness") => Some(14),
@@ -2562,6 +2992,70 @@ mod tests {
                 potion: Some(14),
                 color: None,
                 rest: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn custom_potion_contents_reach_the_client() {
+        use horizon_protocol::buf::Writer;
+        let synced_id = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:mob_effect", "minecraft:speed") => Some(1),
+            _ => None,
+        };
+        let send = |potion: &ItemStack| {
+            stack_to_network(|_| 7, synced_id, &Some(potion.clone()))
+                .unwrap()
+                .component(component::POTION_CONTENTS)
+                .cloned()
+        };
+        let mut potion = ItemStack::new("minecraft:potion", 1);
+        assert_eq!(send(&potion), None);
+        // Only a colour: no type, no effects.
+        potion.data_mut().potion_extra = vec![("custom_color".into(), Tag::Int(0x00FF_8800))];
+        assert_eq!(
+            send(&potion),
+            Some(Component::Potion {
+                potion: None,
+                color: Some(0x00FF_8800),
+                rest: Vec::new(),
+            })
+        );
+        // A colour, a speed II effect for 600 ticks (the default particles and
+        // icon), an effect the connection has no id for, and a name: with no type.
+        let effect = |id: &str| {
+            Tag::compound([
+                ("id", Tag::String(id.into())),
+                ("amplifier", Tag::Byte(1)),
+                ("duration", Tag::Int(600)),
+            ])
+        };
+        potion.data_mut().potion_extra = vec![
+            ("custom_color".into(), Tag::Int(0x00FF_8800)),
+            (
+                "custom_effects".into(),
+                Tag::List(vec![effect("minecraft:speed"), effect("minecraft:unknown")]),
+            ),
+            ("custom_name".into(), Tag::String("Tea".into())),
+        ];
+        // `PotionContents.STREAM_CODEC`: the effects (id, amplifier, duration,
+        // ambient, particles, icon, no hidden effect) then the optional name.
+        let mut tail = Writer::new();
+        tail.varint(1);
+        for v in [1, 1, 600] {
+            tail.varint(v);
+        }
+        for b in [false, true, true, false] {
+            tail.bool(b);
+        }
+        tail.bool(true);
+        tail.string("Tea");
+        assert_eq!(
+            send(&potion),
+            Some(Component::Potion {
+                potion: None,
+                color: Some(0x00FF_8800),
+                rest: tail.data,
             })
         );
     }
