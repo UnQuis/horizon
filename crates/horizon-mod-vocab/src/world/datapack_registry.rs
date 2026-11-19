@@ -66,7 +66,8 @@ pub enum DatapackFieldKind {
     Object {
         /// The fields the object accepts, each named once.
         fields: Vec<DatapackField>,
-        /// The most encoded bytes accepted.
+        /// The most bytes of the decoded value's compact JSON accepted, not
+        /// of the source file (ids are normalized before this is measured).
         max_len: u32,
     },
 }
@@ -300,7 +301,7 @@ impl DatapackFieldKind {
                                     .is_some_and(|default| field.kind.accepts(default))
                             })
                     })
-                    && json_len(&DatapackValue::Object(values.clone())) <= *max_len as usize
+                    && object_json_len(values) <= *max_len as usize
             }
             _ => false,
         }
@@ -319,27 +320,44 @@ impl DatapackFieldKind {
     }
 }
 
-/// The compact JSON length of a value: the one measure used by both the decoder
-/// and schema validation, so a default that passes registration decodes too.
-fn json_len(value: &DatapackValue) -> usize {
-    fn to_json(value: &DatapackValue) -> Value {
-        match value {
-            DatapackValue::Bool(v) => Value::Bool(*v),
-            DatapackValue::Int(v) => Value::Number((*v).into()),
-            DatapackValue::Float(v) => serde_json::Number::from_f64(*v)
-                .map(Value::Number)
-                .unwrap_or(Value::Null),
-            DatapackValue::Text(v) => Value::String(v.clone()),
-            DatapackValue::List(values) => Value::Array(values.iter().map(to_json).collect()),
-            DatapackValue::Object(values) => Value::Object(
-                values
-                    .iter()
-                    .map(|(name, value)| (name.clone(), to_json(value)))
-                    .collect(),
-            ),
-        }
+fn to_json(value: &DatapackValue) -> Value {
+    match value {
+        DatapackValue::Bool(v) => Value::Bool(*v),
+        DatapackValue::Int(v) => Value::Number((*v).into()),
+        DatapackValue::Float(v) => serde_json::Number::from_f64(*v)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        DatapackValue::Text(v) => Value::String(v.clone()),
+        DatapackValue::List(values) => Value::Array(values.iter().map(to_json).collect()),
+        DatapackValue::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), to_json(value)))
+                .collect(),
+        ),
     }
+}
+
+/// The compact JSON length of a decoded value: the one measure used by both
+/// the decoder and schema validation, so a default that passes registration
+/// decodes too. This is the length of the decoded value, not of the source
+/// file: an id such as `stone` is normalized to `minecraft:stone` first.
+fn json_len(value: &DatapackValue) -> usize {
     serde_json::to_string(&to_json(value))
+        .map(|text| {
+            text.len()
+        })
+        .unwrap_or(usize::MAX)
+}
+
+/// The same measure for the fields of an object, without cloning the value
+/// tree the caller still owns.
+fn object_json_len(values: &[(String, DatapackValue)]) -> usize {
+    let object: serde_json::Map<String, Value> = values
+        .iter()
+        .map(|(name, value)| (name.clone(), to_json(value)))
+        .collect();
+    serde_json::to_string(&Value::Object(object))
         .map(|text| {
             text.len()
         })
@@ -989,7 +1007,10 @@ mod tests {
     #[test]
     fn existing_kinds_and_values_keep_their_wire_tags() {
         use crate::wire::{Reader, Writer};
-        for kind in [
+        fn tag(bytes: &[u8]) -> u32 {
+            Reader::new(bytes).take::<u32>().expect("variant tag")
+        }
+        for (index, kind) in [
             DatapackFieldKind::Bool,
             DatapackFieldKind::Int { min: 0, max: 1 },
             DatapackFieldKind::Float {
@@ -1001,21 +1022,31 @@ mod tests {
             DatapackFieldKind::Reference {
                 registry: "example:spell".into(),
             },
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut out = Writer::new();
             out.put(&kind);
             assert_eq!(out.error(), None);
+            // The byte tag is the variant index: appending List/Object must
+            // not move any of the six existing tags.
+            assert_eq!(tag(out.bytes()), index as u32);
             assert_eq!(Reader::decode::<DatapackFieldKind>(out.bytes()), Ok(kind));
         }
-        for value in [
+        for (index, value) in [
             DatapackValue::Bool(true),
             DatapackValue::Int(7),
             DatapackValue::Float(0.5),
             DatapackValue::Text("example:fire".into()),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut out = Writer::new();
             out.put(&value);
             assert_eq!(out.error(), None);
+            assert_eq!(tag(out.bytes()), index as u32);
             assert_eq!(Reader::decode::<DatapackValue>(out.bytes()), Ok(value));
         }
     }
