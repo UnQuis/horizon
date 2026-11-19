@@ -275,6 +275,8 @@ impl From<AttachmentError> for DataMapProjectionError {
 
 /// Decode every entry of `map` into an ordered, client-safe projection. A
 /// malformed value fails the whole projection rather than being skipped.
+/// This walks the whole map on each call (O(entries)): call it after a data
+/// load, not every tick.
 pub fn project_data_map<M: DataMap>(
     host: &dyn Host,
     map: &M,
@@ -317,7 +319,9 @@ where
     }
 
     /// Read the map now, replace the projection at `holder` and queue its sync.
-    /// Call this from a server hook after the data load, not from a client.
+    /// `set` already queues the sync of a `sync: true` attachment, so this does
+    /// not send a second notification. Call this from a server hook after the
+    /// data load, not from a client.
     pub fn sync(
         &self,
         host: &mut dyn ServerHost,
@@ -328,7 +332,6 @@ where
         }
         let projected = project_data_map(&*host, &self.map)?;
         self.attachment.set(host, holder, projected)?;
-        self.attachment.sync_data(host, holder)?;
         Ok(())
     }
 }
@@ -474,6 +477,31 @@ mod tests {
         assert_eq!(
             project_data_map(&Bare, &Hardness),
             Err(DataMapProjectionError::Read(DataMapError::Unavailable))
+        );
+    }
+
+    /// A server host with no backend: enough for the policy check, which runs
+    /// before the projection reads or writes anything.
+    struct NoBackendServer;
+    impl Host for NoBackendServer {}
+    crate::impl_host_areas!(NoBackendServer);
+    impl ServerHost for NoBackendServer {}
+    crate::impl_server_host_areas!(NoBackendServer);
+
+    #[test]
+    fn a_projection_refuses_a_non_sync_attachment_before_touching_the_host() {
+        let non_sync = AttachmentType::<BTreeMap<String, i64>> {
+            namespace: "test",
+            name: "local",
+            default: BTreeMap::new,
+            codec: None,
+            copy_on_death: false,
+            sync: false,
+        };
+        let mut host = NoBackendServer;
+        assert_eq!(
+            DataMapProjection::new(Hardness, non_sync).sync(&mut host, Holder::Level),
+            Err(DataMapProjectionError::NotSync)
         );
     }
 
