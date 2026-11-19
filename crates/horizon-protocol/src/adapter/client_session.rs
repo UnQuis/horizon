@@ -32,6 +32,7 @@ mod step_1_21_8;
 mod step_26_1;
 mod sync_registries;
 mod synced;
+mod text_down;
 mod world;
 
 use super::{
@@ -1079,6 +1080,7 @@ fn renumber(ids: &Ids, p: &mut play::Clientbound) -> Option<()> {
             Some(())
         }
         play::Clientbound::BlockEntityData(b) => {
+            world::pot_sherds_down(ids, &mut b.tag);
             b.kind = ids.block_entity_type.down(b.kind)?;
             Some(())
         }
@@ -1135,6 +1137,9 @@ fn renumber(ids: &Ids, p: &mut play::Clientbound) -> Option<()> {
 /// One entity data value renumbered for the older client: false drops it (a particle it lacks).
 fn entity_value(ids: &Ids, kind: i32, value: &mut Value) -> bool {
     let particle = |p: &mut crate::entity_data::Particle| {
+        if ids.quirks.simple_spell_particles {
+            p.without_plain_options();
+        }
         if let Some(ParticleData::State(s)) = &mut p.data {
             *s = state_down(ids, *s);
         }
@@ -2181,6 +2186,297 @@ mod tests {
             s.writing.store(to_u8(State::Play), Ordering::Release);
             let sent = s.clientbound(&data).unwrap().unwrap();
             assert!(sent.ends_with(tail), "{version:?}: {sent:?}");
+        }
+    }
+
+    /// An explosion's particle goes through the explode step, which reads it back in the client's layout and writes
+    /// it again: for a client through 1.21.8 `dragon_breath`, `effect`, `instant_effect` and `flash` carry no options
+    /// there either, so the sound after the particle stays where the client reads it.
+    #[test]
+    fn an_explosion_particle_keeps_no_options_for_a_client_through_1_21_8() {
+        use crate::adapter::pinned_ids::particle_type;
+        use crate::entity_data::{Particle, ParticleData as D};
+        let send = |version, particle| {
+            let packet = play::Clientbound::Explode(play::Explode {
+                center: [1.0, 2.0, 3.0],
+                radius: 3.0,
+                block_count: 0,
+                knockback: None,
+                particle,
+                sound: (-1, Some(("minecraft:entity.generic.explode".into(), None))),
+                block_particles: Vec::new(),
+                play_sound: true,
+            })
+            .encode();
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            s.clientbound(&packet).unwrap().unwrap()
+        };
+        for version in [ServerVersion::V1_21_5, ServerVersion::V1_21_8] {
+            // A particle without options, as the reference: a one-byte id between the knockback flag and the sound.
+            let reference = send(
+                version,
+                Particle {
+                    id: particle_type::EXPLOSION,
+                    data: None,
+                },
+            );
+            for (id, data) in [
+                (particle_type::DRAGON_BREATH, D::Scalar(1.0)),
+                (particle_type::EFFECT, D::ColorPower(0x1122_3344, 1.0)),
+                (
+                    particle_type::INSTANT_EFFECT,
+                    D::ColorPower(0x1122_3344, 1.0),
+                ),
+                (particle_type::FLASH, D::Color(0x1122_3344)),
+            ] {
+                let sent = send(
+                    version,
+                    Particle {
+                        id,
+                        data: Some(data),
+                    },
+                );
+                assert_eq!(sent.len(), reference.len(), "{version:?} {id}: {sent:?}");
+                // everything after the particle id is the sound, which must come out whole
+                let sound = &reference[27..];
+                assert!(sent.ends_with(sound), "{version:?} {id}: {sent:?}");
+            }
+        }
+    }
+
+    /// Every particle with options, written for the clients before 1.21.2 (1.20.5 to 1.21.1 read the same bytes)
+    /// as their `ParticleTypes` read them, checked against the 1.20.6 and 1.21.1 client jars: the particle follows the
+    /// count, dust colours are three floats, `entity_effect` is one ARGB int, and `effect`, `instant_effect`,
+    /// `dragon_breath` and `flash` carry nothing. A particle they lack (`block_crumble`, `tinted_leaves`, `trail`)
+    /// is not sent. Each tail is the count (1), the particle's id and its options.
+    #[test]
+    fn particles_with_options_are_written_as_1_20_6_and_1_21_1_read_them() {
+        use crate::entity_data::{Particle, ParticleData as D};
+        let cases: [(i32, D, Option<&str>); 16] = [
+            (1, D::State(1), Some(concat!("00000001", "01", "01"))),
+            (2, D::State(1), Some(concat!("00000001", "02", "01"))),
+            (36, D::State(1), Some(concat!("00000001", "1c", "01"))),
+            (121, D::State(1), Some(concat!("00000001", "69", "01"))),
+            (125, D::State(1), None),
+            (
+                28,
+                D::Color(0x1122_3344),
+                Some(concat!("00000001", "14", "11223344")),
+            ),
+            (46, D::Color(0x1122_3344), None),
+            (52, D::Color(0x1122_3344), Some(concat!("00000001", "27"))),
+            (
+                21,
+                D::ColorScale(0x0011_2233, 1.0),
+                Some(concat!(
+                    "00000001", "0d", "3d888889", "3e088889", "3e4ccccd", "3f800000"
+                )),
+            ),
+            (
+                22,
+                D::ColorScale2(0x0011_2233, 0x0044_5566, 1.0),
+                Some(concat!(
+                    "00000001", "0e", "3d888889", "3e088889", "3e4ccccd", "3e888889", "3eaaaaab",
+                    "3ecccccd", "3f800000"
+                )),
+            ),
+            (
+                23,
+                D::ColorPower(0x1122_3344, 1.0),
+                Some(concat!("00000001", "0f")),
+            ),
+            (
+                56,
+                D::ColorPower(0x1122_3344, 1.0),
+                Some(concat!("00000001", "2b")),
+            ),
+            (15, D::Scalar(1.0), Some(concat!("00000001", "07"))),
+            (
+                48,
+                D::Scalar(0.5),
+                Some(concat!("00000001", "23", "3f000000")),
+            ),
+            (115, D::Delay(3), Some(concat!("00000001", "63", "03"))),
+            (59, D::Trail([1.0, 2.0, 3.0], 0x1122_3344, 20), None),
+        ];
+        for version in [ServerVersion::V1_20_6, ServerVersion::V1_21_1] {
+            for (id, data, tail) in &cases {
+                let packet = play::Clientbound::LevelParticles(play::LevelParticles {
+                    particle: Particle {
+                        id: *id,
+                        data: Some(data.clone()),
+                    },
+                    override_limiter: false,
+                    always_show: false,
+                    pos: [0.0; 3],
+                    dist: [0.0; 3],
+                    max_speed: [0.0; 3],
+                    count: 1,
+                    randomization: 0,
+                })
+                .encode();
+                let s = ClientSession::new(version);
+                s.reading.store(to_u8(State::Play), Ordering::Release);
+                s.writing.store(to_u8(State::Play), Ordering::Release);
+                let sent = s.clientbound(&packet).unwrap();
+                let hex = sent.map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>());
+                match (tail, hex) {
+                    (Some(tail), Some(hex)) => {
+                        // packet id, long distance flag, 3 doubles, 4 floats: 1 + 1 + 24 + 16 bytes of 2 digits
+                        assert!(hex.starts_with("2900"), "{version:?} {id}: {hex}");
+                        assert_eq!(&hex[(1 + 1 + 24 + 16) * 2..], *tail, "{version:?} {id}");
+                    }
+                    (None, None) => {}
+                    (tail, hex) => panic!("{version:?} {id}: {hex:?}, expected {tail:?}"),
+                }
+            }
+        }
+    }
+
+    /// 1.21.9 gave `effect`, `instant_effect` and `dragon_breath` their options and `flash` its colour; 1.21.8 and
+    /// older read none (1.21.5 and 1.21.8 shown, as numbered there).
+    #[test]
+    fn effect_and_flash_options_start_with_1_21_9() {
+        use crate::entity_data::{Particle, ParticleData as D};
+        let send = |version, id, data| {
+            let packet = play::Clientbound::LevelParticles(play::LevelParticles {
+                particle: Particle {
+                    id,
+                    data: Some(data),
+                },
+                override_limiter: false,
+                always_show: false,
+                pos: [0.0; 3],
+                dist: [0.0; 3],
+                max_speed: [0.0; 3],
+                count: 1,
+                randomization: 0,
+            })
+            .encode();
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&packet).unwrap().unwrap();
+            sent[sent.len() - 4..].to_vec()
+        };
+        let power = D::ColorPower(0x1122_3344, 1.0);
+        let tail = |version, id, data| {
+            let t = send(version, id, data);
+            t.iter().map(|x| format!("{x:02x}")).collect::<String>()
+        };
+        // plain: the count and the particle id are the last bytes; with options the colour and power follow
+        assert_eq!(tail(ServerVersion::V1_21_5, 23, power.clone()), "0000010f");
+        assert_eq!(tail(ServerVersion::V1_21_8, 15, D::Scalar(1.0)), "00000107");
+        assert_eq!(tail(ServerVersion::V1_21_8, 52, D::Color(7)), "00000129");
+        assert_eq!(tail(ServerVersion::V1_21_10, 23, power), "3f800000");
+        assert_eq!(tail(ServerVersion::V1_21_10, 52, D::Color(7)), "00000007");
+    }
+
+    /// 26.2 and older read a decorated pot's `sherds` as a list of the four item ids (26.3: a compound of
+    /// stack templates).
+    #[test]
+    fn a_decorated_pot_update_has_its_sherds_as_a_list_for_26_2_and_older() {
+        use horizon_core::nbt::{Compound, JavaString, Tag};
+        let text = |s: &str| Tag::String(JavaString::from(s));
+        let mut front = Compound::new();
+        front.insert(
+            JavaString::from("id"),
+            text("minecraft:angler_pottery_sherd"),
+        );
+        let mut sides = Compound::new();
+        sides.insert(JavaString::from("front"), Tag::Compound(front));
+        let mut root = Compound::new();
+        root.insert(JavaString::from("sherds"), Tag::Compound(sides));
+        let update = play::Clientbound::BlockEntityData(play::BlockEntityData {
+            pos: [1, 64, 2],
+            kind: 41,
+            tag: Tag::Compound(root),
+        })
+        .encode();
+        let list = Tag::List(vec![
+            text("minecraft:brick"),
+            text("minecraft:brick"),
+            text("minecraft:brick"),
+            text("minecraft:angler_pottery_sherd"),
+        ]);
+        for version in [
+            ServerVersion::V26_2,
+            ServerVersion::V26_1,
+            ServerVersion::V1_21_11,
+            ServerVersion::V1_21_5,
+            ServerVersion::V1_20_6,
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let sent = s.clientbound(&update).unwrap().unwrap();
+            let mut r = Reader::new(&sent);
+            r.varint().unwrap();
+            let tag = play::BlockEntityData::read(&mut r).unwrap().tag;
+            let Tag::Compound(root) = tag else {
+                panic!("{version:?}")
+            };
+            assert_eq!(
+                root.get(&JavaString::from("sherds")),
+                Some(&list),
+                "{version:?}"
+            );
+        }
+        // a 26.3 client reads the compound
+        let s = ClientSession::new(ServerVersion::Current);
+        s.reading.store(to_u8(State::Play), Ordering::Release);
+        s.writing.store(to_u8(State::Play), Ordering::Release);
+        assert_eq!(s.clientbound(&update).unwrap().unwrap(), update);
+    }
+
+    /// 1.21.10, 1.21.11 and 26.1 clients lack what 26.3 added: a new item or entity shows as its nearest older
+    /// equivalent (the way 26.2's and 1.21.8's tables do), not as nothing.
+    #[test]
+    fn a_1_21_10_to_26_1_client_is_shown_stand_ins_for_what_26_3_added() {
+        use crate::item::Stack;
+        for (version, planks, map) in [
+            (ServerVersion::V1_21_10, 38, 1104),
+            (ServerVersion::V1_21_11, 38, 1104),
+            (ServerVersion::V26_1, 38, 1105),
+        ] {
+            let s = ClientSession::new(version);
+            s.reading.store(to_u8(State::Play), Ordering::Release);
+            s.writing.store(to_u8(State::Play), Ordering::Release);
+            let slot = |item: i32| {
+                let p = play::Clientbound::SetCursorItem(play::SetCursorItem {
+                    item: Some(Stack::new(item, 1)),
+                });
+                let sent = s.clientbound(&p.encode()).unwrap().unwrap();
+                let mut r = Reader::new(&sent);
+                r.varint().unwrap();
+                let mut payload = Reader::new(r.rest());
+                crate::item::Slot::read(&mut payload).unwrap().unwrap().item
+            };
+            // poplar_planks (72) is birch_planks, ocean_monument_map (1239) a filled_map
+            assert_eq!(slot(72), planks, "{version:?}");
+            assert_eq!(slot(1239), map, "{version:?}");
+            let add = |kind: i32| {
+                play::Clientbound::AddEntity(play::AddEntity {
+                    id: 5,
+                    uuid: 1,
+                    kind,
+                    position: [0.0; 3],
+                    velocity: [0.0; 3],
+                    pitch: 0,
+                    yaw: 0,
+                    head_yaw: 0,
+                    data: 0,
+                })
+                .encode()
+            };
+            // poplar_boat (106) sails as birch_boat (12); cushion (33) has no stand-in.
+            let sent = s.clientbound(&add(106)).unwrap().unwrap();
+            let mut r = Reader::new(&sent);
+            r.varint().unwrap();
+            assert_eq!(play::AddEntity::read(&mut r).unwrap().kind, 12);
+            assert_eq!(s.clientbound(&add(33)).unwrap(), None);
         }
     }
 }

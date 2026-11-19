@@ -120,6 +120,7 @@ pub enum H {
     HdrPeak,
     HdrPaperWhite,
     HdrUiBrightness,
+    HdrColorBoost,
     HdrLook,
     BatteryMode,
     ShadowCache,
@@ -663,6 +664,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "How bright the HUD and menus are. Auto: at paper white.",
                         ),
                         h(
+                            H::HdrColorBoost,
+                            None,
+                            "0%: exact colours. More: stretched to your display's range, as SDR often is.",
+                        ),
+                        h(
                             H::HdrLook,
                             None,
                             "Horizon: light sources and the sun shine past white. Vanilla: just as SDR.",
@@ -863,6 +869,7 @@ impl H {
             H::TfrHistoryStability => Some((g.tfr_history_stability.clamp(0.0, 0.35)) / 0.35),
             H::TfrCutDistance => Some(((g.tfr_cut_distance.clamp(0.25, 16.0)) - 0.25) / 15.75),
             H::TfrCutAngle => Some(((g.tfr_cut_angle.clamp(5.0, 90.0)) - 5.0) / 85.0),
+            H::HdrColorBoost => Some(g.hdr_color_boost as f32 / 100.0),
             _ => None,
         }
     }
@@ -882,6 +889,8 @@ impl H {
             H::TfrHistoryStability => Some(35),
             H::TfrCutDistance => Some(63),
             H::TfrCutAngle => Some(85),
+            // 0..100% by 5.
+            H::HdrColorBoost => Some(20),
             _ => None,
         }
     }
@@ -1023,6 +1032,7 @@ impl H {
                 "Black Level",
                 lang::tr("%s nits", &[&format!("{:.2}", g.black_level_nits())]),
             ),
+            H::HdrColorBoost => labelled_percent("Color Boost", g.hdr_color_boost),
             // Under a shader pack the look is the pack's: its name, greyed (`Item::blocked`).
             H::HdrLook => Text::option_name_value(
                 Text::literal(lang::get_or("horizon.hdr.look", "Look")),
@@ -1084,6 +1094,7 @@ impl H {
             H::TfrHistoryStability => g.tfr_history_stability = v.clamp(0.0, 1.0) * 0.35,
             H::TfrCutDistance => g.tfr_cut_distance = 0.25 + v.clamp(0.0, 1.0) * 15.75,
             H::TfrCutAngle => g.tfr_cut_angle = 5.0 + v.clamp(0.0, 1.0) * 85.0,
+            H::HdrColorBoost => g.hdr_color_boost = (v * 20.0).round() as u32 * 5,
             _ => {}
         }
     }
@@ -1234,6 +1245,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_frame_supported => Some("Your GPU or graphics API doesn't support it."),
             Item::Horizon(
@@ -1242,6 +1254,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_offered() => Some("Your display or system doesn't offer HDR output."),
             Item::Horizon(
@@ -1250,6 +1263,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.requests_hdr(s.horizon.hdr) => Some(if out.held {
                 HDR_HELD
@@ -1259,6 +1273,9 @@ impl Item {
             // HDR output without the HUD's layer: a `shaders/` pack's frame (`FrameRequest`).
             Item::Horizon(H::HdrUiBrightness) if out.hdr_on() && !out.frame.hud_layer => {
                 Some("The shader pack's picture is shown at Paper White.")
+            }
+            Item::Horizon(H::HdrColorBoost) if out.compositor_stretches() => {
+                Some("In scRGB, your desktop's own color setting applies.")
             }
             Item::Horizon(H::HdrLook) if out.pack_lights => {
                 Some(if out.hdr_on() && !out.frame.hud_layer {
@@ -1573,6 +1590,7 @@ impl Screen for GraphicsScreen {
             id: page,
             name: lang::get(page.name()),
             about: lang::get(page.about()),
+            warning: None,
             groups: groups
                 .into_iter()
                 .map(|(name, settings)| Group {
@@ -2874,6 +2892,7 @@ mod tests {
             H::HdrPeak,
             H::HdrBlackLevel,
             H::HdrUiBrightness,
+            H::HdrColorBoost,
         ];
         for h in options {
             let item = Item::Horizon(h);

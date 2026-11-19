@@ -6188,7 +6188,8 @@ impl Renderer {
             return Err("the graphics device was lost".into());
         }
         if let Some(hdr) = hdr {
-            horizon_hdr::set_metadata(device, surface, hdr.declared_peak(), hdr.black);
+            let (peak, black) = hdr.metadata();
+            horizon_hdr::set_metadata(device, surface, peak, black);
         }
         Ok(())
     }
@@ -6227,7 +6228,8 @@ impl Renderer {
     }
     fn send_hdr_metadata(&self) {
         if let (Some(surface), Some(hdr)) = (&self.surface, &self.hdr) {
-            horizon_hdr::set_metadata(&self.device, surface, hdr.declared_peak(), hdr.black);
+            let (peak, black) = hdr.metadata();
+            horizon_hdr::set_metadata(&self.device, surface, peak, black);
         }
     }
     /// This renderer's output as applied, with what its destination offers and reports.
@@ -6507,7 +6509,9 @@ impl Renderer {
     /// pages get or lose their buffers of looks. The game meshes the world again. Where an
     /// arena's pages no longer hold (`Arena::set_looks`: their most changes, as a translucent
     /// page's does with looks, or a page got no looks), every section goes now, as on a change
-    /// of layout, and new pages keep to the limit.
+    /// of layout, and new pages keep to the limit. So do they when looks turn on: a resident
+    /// section's looks are the new buffers' zeros (face 0, down), and this frame draws before the
+    /// game meshes the world again.
     fn set_terrain_looks(&mut self, on: bool) {
         log::info!(
             "Horizon renderer: terrain quad looks {}",
@@ -6521,7 +6525,7 @@ impl Renderer {
         if let Some(arena) = &mut self.translucent_arena {
             holds &= arena.set_looks(&self.device, on);
         }
-        if !holds {
+        if !holds || on {
             self.sections_dropped |=
                 self.sections.len() > 0 || !self.lods.is_empty() || self.lod_pending.is_some();
             self.clear_sections(self.layout);
@@ -13649,9 +13653,16 @@ impl DisplayReading {
         let hdr = info.coarse.and_then(|coarse| coarse.high_dynamic_range);
         Self {
             luminance: os_reported(info),
+            primaries: os_primaries(info),
             hdr,
+            compositor: false,
         }
     }
+}
+/// The display's primaries as the OS reports them (Windows: DXGI's output description).
+fn os_primaries(info: &wgpu::DisplayHdrInfo) -> Option<hdr::Primaries> {
+    let c = info.chromaticity.as_ref()?;
+    hdr::reported_primaries([c.red?, c.green?, c.blue?])
 }
 /// Potential EDR is fixed for a screen; current EDR follows brightness and must not
 /// repeatedly switch HDR output as the player adjusts the desktop's brightness.
@@ -13690,6 +13701,17 @@ impl DisplayWatch {
             polled: Some(std::time::Instant::now() + DISPLAY_POLL),
         };
         (watch, now)
+    }
+    /// Whether the reading comes from a Wayland compositor.
+    fn wayland(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.wayland.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
     /// What the system reports at each poll that is due at `time` (`read`; on Wayland, at each
     /// event), whether or not it is `last` again: the surface's capabilities are read with it.
@@ -13798,8 +13820,13 @@ fn os_reported(info: &wgpu::DisplayHdrInfo) -> Option<crate::graphics::Reported>
 /// PQ's top, so the metadata never ends below the black level.
 #[cfg(target_os = "linux")]
 fn wayland_reading(now: Option<horizon_hdr::wayland::Luminances>) -> DisplayReading {
-    now.map_or_else(DisplayReading::default, |l| DisplayReading {
+    let compositor = DisplayReading {
+        compositor: true,
+        ..DisplayReading::default()
+    };
+    now.map_or(compositor, |l| DisplayReading {
         luminance: Some(reported(l)),
+        primaries: l.target_primaries.and_then(hdr::reported_primaries),
         // The preferred target's headroom is the compositor's live report, not the
         // swapchain's supported formats. Invalid or absent readings stay unknown.
         hdr: (l.reference.is_finite()
@@ -13807,6 +13834,7 @@ fn wayland_reading(now: Option<horizon_hdr::wayland::Luminances>) -> DisplayRead
             && l.target_max.is_finite()
             && l.target_max > 0.0)
             .then_some(l.target_max > l.reference),
+        ..compositor
     })
 }
 #[cfg(target_os = "linux")]

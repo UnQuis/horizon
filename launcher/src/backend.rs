@@ -652,10 +652,19 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// Every published release of the repository, both kinds, as GitHub's JSON (kept on disk with its
 /// ETag, and read through Kira's mirror past GitHub's rate limit: [`crate::github`]).
 fn release_list() -> Result<serde_json::Value, String> {
-    Ok(crate::github::json_optional(&format!(
-        "https://api.github.com/repos/{REPO}/releases?per_page=100"
-    ))?
-    .unwrap_or_else(|| serde_json::json!([])))
+    Ok(crate::github::json_optional(&release_list_url())?.unwrap_or_else(|| serde_json::json!([])))
+}
+
+fn release_list_url() -> String {
+    format!("https://api.github.com/repos/{REPO}/releases?per_page=100")
+}
+
+/// The game's builds as GitHub (or its mirror) lists them now, never from a copy kept on disk.
+pub fn releases_from_network() -> Result<Vec<Release>, String> {
+    let list = crate::github::json_from_network(&release_list_url())?;
+    Ok(game_releases(
+        &list.unwrap_or_else(|| serde_json::json!([])),
+    ))
 }
 
 /// The releases in `list` whose tag passes `keep`, newest first, with the asset named `asset`.
@@ -2162,11 +2171,20 @@ fn download_for(
             "\n  • No signed-in account owns Minecraft: Java Edition, so Horizon can't download it."
                 .into(),
         ),
-        Err(_) => Err(format!(
-            "\n  • Or sign in with the Microsoft account that owns Minecraft: Horizon then \
-             downloads {v} from Mojang itself."
+        Err(_) => Err(crate::i18n::trf(
+            "\n  • Sign in with a Microsoft account that owns Minecraft: Java Edition to download \
+             {version} from Mojang.",
+            &[("version", v)],
         )),
     }
+}
+
+/// The folder of the Microsoft Store's Minecraft Launcher (the one Windows offers, and the Xbox
+/// app's) under `local`, `%LOCALAPPDATA%`. Its game files are in `%APPDATA%\.minecraft` like the
+/// other launcher's, but the Java it downloads is in this folder's `runtime`, so a preparation
+/// found none and downloaded the same runtime from Mojang again (411 files, 100 MB for 26.3).
+fn store_launcher_folder(local: &Path) -> PathBuf {
+    local.join(r"Packages\Microsoft.4297127D64EC6_8wekyb3d8bbwe\LocalCache\Local")
 }
 
 /// The Java home for this version: a runtime for precompiled exporters, a JDK for older
@@ -2403,6 +2421,9 @@ pub fn preparer(
             .into_iter()
             .map(|(_, dir)| dir),
     );
+    if cfg!(windows) {
+        games.extend(dirs::data_local_dir().map(|local| store_launcher_folder(&local)));
+    }
     set_prepare_step(PrepareStep::Java);
     let java_home = java(
         major,
@@ -4605,9 +4626,29 @@ mod tests {
             Err("no network in tests".into())
         };
         let log = |_: String| {};
+        let refused = download_for(
+            &pins,
+            &dir,
+            Err(account::NoOwner::default()),
+            false,
+            &fetch,
+            &log,
+        )
+        .unwrap_err();
+        // Ordinary prepare appends the refusal to the missing-Minecraft diagnostic.
+        let diagnostic = sources::not_found(&pins.version, &[], Path::new("chosen")) + &refused;
+        let (_, remedies) = diagnostic.split_once("\nTo fix it:").unwrap();
+        assert_eq!(
+            remedies,
+            "\n  • Play 26.3 once in the official Minecraft launcher, or in Prism Launcher, \
+             MultiMC, the Modrinth App, ATLauncher, GDLauncher or Dawn Client, then prepare again.\
+             \n  • Or choose the folder where your launcher keeps Minecraft 26.3 (Minecraft \
+             folder › Choose… in the launcher, --minecraft on the command line).\
+             \n  • Sign in with a Microsoft account that owns Minecraft: Java Edition to download \
+             26.3 from Mojang."
+        );
         let no_owner = || Ok(account::Launch::default());
         for (pass, signed_in) in [
-            (Err(account::NoOwner::default()), false),
             (Err(account::NoOwner::default()), true),
             (no_owner(), false),
             (no_owner(), true),
