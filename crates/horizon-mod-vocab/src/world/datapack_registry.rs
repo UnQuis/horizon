@@ -300,7 +300,7 @@ impl DatapackFieldKind {
                                     .is_some_and(|default| field.kind.accepts(default))
                             })
                     })
-                    && object_len(values) <= *max_len as usize
+                    && json_len(&DatapackValue::Object(values.clone())) <= *max_len as usize
             }
             _ => false,
         }
@@ -319,29 +319,31 @@ impl DatapackFieldKind {
     }
 }
 
-/// The encoded length an object value takes, used for its `max_len` bound.
-fn object_len(values: &[(String, DatapackValue)]) -> usize {
-    let mut len = 2;
-    for (index, (name, value)) in values.iter().enumerate() {
-        if index > 0 {
-            len += 1;
+/// The compact JSON length of a value: the one measure used by both the decoder
+/// and schema validation, so a default that passes registration decodes too.
+fn json_len(value: &DatapackValue) -> usize {
+    fn to_json(value: &DatapackValue) -> Value {
+        match value {
+            DatapackValue::Bool(v) => Value::Bool(*v),
+            DatapackValue::Int(v) => Value::Number((*v).into()),
+            DatapackValue::Float(v) => serde_json::Number::from_f64(*v)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
+            DatapackValue::Text(v) => Value::String(v.clone()),
+            DatapackValue::List(values) => Value::Array(values.iter().map(to_json).collect()),
+            DatapackValue::Object(values) => Value::Object(
+                values
+                    .iter()
+                    .map(|(name, value)| (name.clone(), to_json(value)))
+                    .collect(),
+            ),
         }
-        len += name.len() + 3 + value_len(value);
     }
-    len
-}
-
-fn value_len(value: &DatapackValue) -> usize {
-    match value {
-        DatapackValue::Bool(_) => 5,
-        DatapackValue::Int(v) => v.to_string().len(),
-        DatapackValue::Float(v) => v.to_string().len(),
-        DatapackValue::Text(v) => v.len() + 2,
-        DatapackValue::List(values) => {
-            2 + values.iter().map(value_len).sum::<usize>() + values.len().saturating_sub(1)
-        }
-        DatapackValue::Object(values) => object_len(values),
-    }
+    serde_json::to_string(&to_json(value))
+        .map(|text| {
+            text.len()
+        })
+        .unwrap_or(usize::MAX)
 }
 
 /// Checks a schema at registration: field count and names, kinds and defaults.
@@ -492,9 +494,6 @@ fn decode_kind(
         }
         DatapackFieldKind::Object { fields, max_len } => {
             let object = json.as_object().ok_or_else(wrong)?;
-            if json.to_string().len() > *max_len as usize {
-                return Err(too_long());
-            }
             if let Some(unknown) = object
                 .keys()
                 .find(|key| !fields.iter().any(|field| { field.name == **key }))
@@ -515,7 +514,11 @@ fn decode_kind(
                 };
                 values.push((field.name.clone(), value));
             }
-            Ok(DatapackValue::Object(values))
+            let value = DatapackValue::Object(values);
+            if json_len(&value) > *max_len as usize {
+                return Err(too_long());
+            }
+            Ok(value)
         }
     }
 }
@@ -927,5 +930,93 @@ mod tests {
             check_schema(&list(bad_default)),
             Err(DatapackRegistrationError::InvalidFieldKind)
         );
+    }
+
+    #[test]
+    fn containers_decode_inside_each_other_and_object_length_is_exact() {
+        let mut decl = nested();
+        decl.fields = vec![DatapackField::required(
+            "layers",
+            DatapackFieldKind::List {
+                element: Box::new(DatapackFieldKind::Object {
+                    fields: vec![DatapackField::required(
+                        "id",
+                        DatapackFieldKind::Identifier,
+                    )],
+                    max_len: 128,
+                }),
+                max_len: 2,
+            },
+        )];
+        let entry = decl
+            .decode_entry(r#"{"layers":[{"id":"curios:ring"},{"id":"curios:charm"}]}"#)
+            .expect("list of objects decodes");
+        assert_eq!(
+            entry.get("layers"),
+            Some(&DatapackValue::List(vec![
+                DatapackValue::Object(vec![(
+                    "id".into(),
+                    DatapackValue::Text("curios:ring".into())
+                )]),
+                DatapackValue::Object(vec![(
+                    "id".into(),
+                    DatapackValue::Text("curios:charm".into())
+                )]),
+            ]))
+        );
+
+        // max_len is the compact JSON length, the same measure a default is
+        // checked with at registration. `{"label":"abcdefgh"}` is 19 bytes.
+        decl.fields = vec![DatapackField::required(
+            "display",
+            DatapackFieldKind::Object {
+                fields: vec![DatapackField::required(
+                    "label",
+                    DatapackFieldKind::Text { max_len: 64 },
+                )],
+                max_len: 8,
+            },
+        )];
+        assert_eq!(
+            decl.decode_entry(r#"{"display":{"label":"abcdefgh"}}"#)
+                .unwrap_err(),
+            DatapackDecodeError::TooLong {
+                field: "display".into()
+            }
+        );
+    }
+
+    #[test]
+    fn existing_kinds_and_values_keep_their_wire_tags() {
+        use crate::wire::{Reader, Writer};
+        for kind in [
+            DatapackFieldKind::Bool,
+            DatapackFieldKind::Int { min: 0, max: 1 },
+            DatapackFieldKind::Float {
+                min: 0.0,
+                max: 1.0,
+            },
+            DatapackFieldKind::Text { max_len: 4 },
+            DatapackFieldKind::Identifier,
+            DatapackFieldKind::Reference {
+                registry: "example:spell".into(),
+            },
+        ] {
+            let mut out = Writer::new();
+            out.put(&kind);
+            assert_eq!(out.error(), None);
+            assert_eq!(Reader::decode::<DatapackFieldKind>(out.bytes()), Ok(kind));
+        }
+        for value in [
+            DatapackValue::Bool(true),
+            DatapackValue::Int(7),
+            DatapackValue::Float(0.5),
+            DatapackValue::Text("example:fire".into()),
+        ] {
+            let mut out = Writer::new();
+            out.put(&value);
+            assert_eq!(out.error(), None);
+            assert_eq!(Reader::decode::<DatapackValue>(out.bytes()), Ok(value));
+        }
     }
 }
