@@ -1,10 +1,12 @@
 //! Typed reads of data maps (NeoForge's `DataMapType` and `IWithData.getData`): the value the
 //! server's data packs and mods' files gave a registry entry, after every pack was applied.
 use crate::{
-    Backend, BiomeKey, BlockEntityTypeKey, BlockKey, DataMapType, EffectKey, EnchantmentKey,
-    EntityTypeKey, FluidKey, Host, ItemKey, NoBackend, ProfessionKey,
+    AttachmentError, AttachmentType, Backend, BiomeKey, BlockEntityTypeKey, BlockKey, DataMapType,
+    EffectKey, EnchantmentKey, EntityTypeKey, FluidKey, Holder, Host, ItemKey, NoBackend,
+    ProfessionKey, ServerHost,
 };
 use horizon_core::nbt::Tag;
+use std::collections::BTreeMap;
 
 /// A data map a mod registers and reads, typed (NeoForge's `DataMapType<R, T>`): its id, the
 /// registry its entries are in (through [`DataMap::Entry`]), and how a value decodes.
@@ -241,6 +243,96 @@ pub fn data_map_entries(
     backend.data_map_entries(registry, map)
 }
 
+/// Why a data map could not be projected into a client-safe value.
+// no wire: a server-side read and attachment write failure, never sent to a client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DataMapProjectionError {
+    /// The map could not be read on this server.
+    Read(DataMapError),
+    /// One entry's value did not decode into the map's typed value.
+    Malformed {
+        /// The full id of the offending entry.
+        entry: String,
+    },
+    /// The attachment was not declared with `sync: true`.
+    NotSync,
+    /// Writing or queuing the attachment sync failed.
+    Attachment(AttachmentError),
+}
+
+impl From<DataMapError> for DataMapProjectionError {
+    fn from(error: DataMapError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<AttachmentError> for DataMapProjectionError {
+    fn from(error: AttachmentError) -> Self {
+        Self::Attachment(error)
+    }
+}
+
+/// Decode every entry of `map` into an ordered, client-safe projection. A
+/// malformed value fails the whole projection rather than being skipped.
+pub fn project_data_map<M: DataMap>(
+    host: &dyn Host,
+    map: &M,
+) -> Result<BTreeMap<String, M::Value>, DataMapProjectionError> {
+    let entries = data_map_entries(host, &map.ty().registry, map.id())?;
+    let mut projected = BTreeMap::new();
+    for (entry, value) in entries {
+        let decoded = map
+            .decode(&value)
+            .ok_or_else(|| DataMapProjectionError::Malformed {
+                entry: entry.clone(),
+            })?;
+        projected.insert(entry, decoded);
+    }
+    Ok(projected)
+}
+
+/// A server-side declaration that projects one data map into a synced attachment.
+///
+/// Data maps stay server-only. A mod relying on a small client-side view reads
+/// the map after its data loads, stores the decoded entries in this attachment
+/// and lets the normal attachment sync send only that view to the clients that
+/// see `holder`; no whole data pack crosses the wire.
+// no wire: a mod-local map and a host-local attachment key, neither sent as a value.
+pub struct DataMapProjection<M: DataMap>
+where
+    M::Value: 'static,
+{
+    map: M,
+    attachment: AttachmentType<BTreeMap<String, M::Value>>,
+}
+
+impl<M: DataMap> DataMapProjection<M>
+where
+    M::Value: Clone + Send + Sync + 'static,
+{
+    /// A projection of `map` into `attachment`, which must have `sync: true` and a codec.
+    pub fn new(map: M, attachment: AttachmentType<BTreeMap<String, M::Value>>) -> Self {
+        Self { map, attachment }
+    }
+
+    /// Read the map now, replace the projection at `holder` and queue its sync.
+    /// Call this from a server hook after the data load, not from a client.
+    pub fn sync(
+        &self,
+        host: &mut dyn ServerHost,
+        holder: Holder,
+    ) -> Result<(), DataMapProjectionError> {
+        if !self.attachment.sync {
+            return Err(DataMapProjectionError::NotSync);
+        }
+        let projected = project_data_map(&*host, &self.map)?;
+        self.attachment.set(host, holder, projected)?;
+        self.attachment.sync_data(host, holder)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +365,10 @@ mod tests {
                 ("minecraft:block", "test:hardness") => {
                     Ok(vec![("test:stone".into(), Tag::Long(3))])
                 }
+                ("minecraft:item", "test:emc") => Ok(vec![
+                    ("test:coal".into(), Tag::Int(10)),
+                    ("test:stick".into(), Tag::String("ten".into())),
+                ]),
                 _ => Err(DataMapError::UnknownType),
             }
         }
@@ -356,6 +452,28 @@ mod tests {
         assert_eq!(
             BlockKey(0).data(&Bare, &Hardness),
             Err(DataMapError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn a_projection_decodes_every_entry_and_refuses_a_malformed_one() {
+        assert_eq!(
+            project_data_map(&Maps, &Hardness),
+            Ok(BTreeMap::from([("test:stone".into(), 3)]))
+        );
+        assert_eq!(
+            project_data_map(&Maps, &Emc),
+            Err(DataMapProjectionError::Malformed {
+                entry: "test:stick".into()
+            })
+        );
+        assert_eq!(
+            project_data_map(&Maps, &Unregistered),
+            Err(DataMapProjectionError::Read(DataMapError::UnknownType))
+        );
+        assert_eq!(
+            project_data_map(&Bare, &Hardness),
+            Err(DataMapProjectionError::Read(DataMapError::Unavailable))
         );
     }
 
