@@ -350,19 +350,26 @@ pub enum EquipmentSlotGroup {
 pub struct NamedSlotGroup(String);
 
 impl NamedSlotGroup {
-    /// A named group from `name`. A name is nonempty, at most 256 characters,
-    /// and uses lowercase letters, digits and `_ . / - :` only: the same
-    /// characters a resource location uses. The text is kept as it arrived.
+    /// A named group from `name`, either a bare path (`pocket`) or a
+    /// `namespace:path` pair (`curios:ring`) with one colon and both parts
+    /// nonempty. A name is at most 256 characters and uses lowercase letters,
+    /// digits and `_ . / - :` only. The text is kept as it arrived.
     pub fn new(name: impl Into<String>) -> Result<Self, &'static str> {
         let name = name.into();
-        if name.is_empty()
-            || name.len() > 256
+        let parts = name.split(':').collect::<Vec<_>>();
+        let structure = match parts.as_slice() {
+            [path] => !path.is_empty(),
+            [namespace, path] => !namespace.is_empty() && !path.is_empty(),
+            _ => false,
+        };
+        if name.len() > 256
+            || !structure
             || !name
                 .bytes()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_.-/:".contains(&c))
         {
             return Err(
-                "a slot group name must be 1..=256 lowercase resource-location characters",
+                "a slot group name must be a path or namespace:path of 1..=256 lowercase resource-location characters",
             );
         }
         Ok(Self(name))
@@ -896,8 +903,32 @@ mod tests {
         for name in ["pocket", "curios:ring", "mod:accessory/slot"] {
             assert_eq!(NamedSlotGroup::new(name).unwrap().as_str(), name);
         }
-        for bad in ["", "Upper", "two words", "a!", &"x".repeat(257)] {
+        for bad in [
+            "",
+            "Upper",
+            "two words",
+            "a!",
+            "a:b:c",
+            "a:",
+            ":b",
+            &"x".repeat(257),
+        ] {
             assert!(NamedSlotGroup::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn named_group_wire_roundtrips_and_refuses_invalid_text() {
+        use crate::wire::{Reader, Wire, Writer};
+        let group = NamedSlotGroup::new("curios:ring").unwrap();
+        let mut out = Writer::new();
+        out.put(&group);
+        assert_eq!(Reader::decode::<NamedSlotGroup>(out.bytes()).unwrap(), group);
+
+        for bad in ["a:b:c", "a:", ":b", "Upper"] {
+            let mut out = Writer::new();
+            out.put_str(bad);
+            assert!(Reader::decode::<NamedSlotGroup>(out.bytes()).is_err(), "{bad:?}");
         }
     }
 

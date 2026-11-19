@@ -908,9 +908,12 @@ handle, an entity the client doesn't track and a level it doesn't show:
   The live map behind `attribute_value` takes the same write, so the reads agree with `/attribute`, and the entity's
   save keeps it. A lower max health cuts a mob's health (`LivingEntity.onAttributeUpdated`).
 - `item_attribute_modifier` (`ItemAttributeModifierEvent`) edits what one stack grants: `ItemAttributeModifiers`
-  holds `ItemAttributeModifier` entries (the attribute's id, an `AttributeModifier`, an `EquipmentSlotGroup`) and
-  edits them as NeoForge's event does: `add` (`addModifier`, refused when the attribute has that id already),
-  `replace`, `remove`, `retain` (`removeIf`), `remove_all_for` and `clear`. Every reader of a stack's modifiers asks
+  holds `ItemAttributeModifier` entries (the attribute's id, an `AttributeModifier`, an `EquipmentSlotGroup`, and
+  optionally a `named_slot` for a mod-defined group) and edits them as NeoForge's event does: `add` (`addModifier`,
+  refused when the attribute has that id already), `replace`, `remove`, `retain` (`removeIf`), `remove_all_for`
+  and `clear`. A mod's own slot group uses a `NamedSlotGroup` name through `add_named`/`replace_named` or
+  `ItemAttributeModifier::named`; its name travels as text and the game matches it against the slot a mod reports.
+  The vanilla `EquipmentSlotGroup` enum and its wire layout stay as they are. Every reader of a stack's modifiers asks
   through one place (`horizon_client::item_attributes`):
   - the equipment of a player, a mob, an armor stand and the dragon, when it changes;
   - mobs' gear knockback resistance and their pickup choices;
