@@ -9,8 +9,14 @@ pub trait Hooks {
     /// `enchantments`: what is left is what fights, mining, fishing, tridents,
     /// crossbows, armor, loot and every other enchantment effect use. Tooltips,
     /// the anvil, the grindstone, the enchanting table, saves and the network
-    /// keep the stack's own component. Asked on every such read, often many
-    /// times a tick, on the server and on a client (its tooltip modifiers).
+    /// keep the stack's own component. `owner` is the entity wearing or
+    /// holding the stack where the caller knows one, `None` on ordinary stack
+    /// reads; `mod_slot` is the caller's own place name for it (`curios:ring`),
+    /// `None` on a vanilla slot. A mod can use both to give a worn item a
+    /// per-wearer level (Fortune or Looting on a curio), and a mod that knows
+    /// the wearer can call `item::enchantments::native_get_enchantment_level`
+    /// with them directly. Asked on every such read, often many times a tick,
+    /// on the server and on a client (its tooltip modifiers).
     #[hook(
         side = "both",
         contract = "listen",

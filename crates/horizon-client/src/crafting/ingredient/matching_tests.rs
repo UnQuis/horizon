@@ -27,7 +27,7 @@ fn install() {
         assert!(crate::native_stack_hooks::install(
             crate::native_stack_hooks::StackHooks {
                 ingredient_test: matching,
-                enchantments: |_, _, _| {},
+                enchantments: |_, _, _, _, _| {},
                 attributes: |_, _| {}
             }
         ));

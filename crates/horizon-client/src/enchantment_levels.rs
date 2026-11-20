@@ -40,7 +40,9 @@ pub fn get_enchantment_level(
         }
     }
     let mut enchantments = mod_api::__private::game::item_enchantments(entries);
-    crate::native_stack_hooks::enchantments(stack, target.as_ref(), &mut enchantments);
+    // An ordinary stack read has no wearer: a mod that knows one calls
+    // `native_get_enchantment_level` with its own owner and place directly.
+    crate::native_stack_hooks::enchantments(stack, target.as_ref(), None, None, &mut enchantments);
     let (mut entries, changed) = mod_api::__private::game::item_enchantments_entries(enchantments);
     let levels = changed.then(|| {
         kept.extend(entries.iter().map(|(id, level)| (text(own, id), *level)));

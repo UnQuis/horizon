@@ -457,12 +457,14 @@ pub(crate) fn install_stack_hooks() {
                 );
             }
         },
-        enchantments: |stack, target, value| {
+        enchantments: |stack, target, owner, mod_slot, value| {
             if !mod_api::__private::listened(mod_api::HookId::GetEnchantmentLevel) {
                 return;
             }
             if let Ok(stack) = stack.try_into_api() {
-                mod_api::item::enchantments::native_get_enchantment_level(&stack, target, value);
+                mod_api::item::enchantments::native_get_enchantment_level(
+                    &stack, target, owner, mod_slot, value,
+                );
             }
         },
         attributes: |stack, value| {
