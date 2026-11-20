@@ -1,4 +1,5 @@
-//! The target of `get_enchantment_level` (`GetEnchantmentLevelEvent`).
+//! The targets of `get_enchantment_level` and `get_enchantment_level_for`
+//! (`GetEnchantmentLevelEvent` and `GetEnchantmentLevelForEvent`).
 use crate::item::item_stack::ItemStack;
 #[allow(unused_imports)]
 use crate::*;
@@ -12,27 +13,21 @@ use crate::*;
 /// the anvil, the grindstone, the enchanting table, saves and the network
 /// keep the stack's own component. Asked on every such read, often many
 /// times a tick, on the server and on a client (its tooltip modifiers).
-///
-/// The compatibility entry point: a stack read with no known wearer. It asks
-/// the hook with `owner` and `mod_slot` unset, exactly as it did before those
-/// fields existed. A mod that knows the wearer calls
-/// [`native_get_enchantment_level_for`] instead.
 #[inline(never)]
 pub fn native_get_enchantment_level(
     stack: &ItemStack,
     target: Option<&Identifier>,
     enchantments: &mut ItemEnchantments,
 ) {
-    native_get_enchantment_level_for(stack, target, None, None, enchantments);
+    crate::dispatch_get_enchantment_level(stack, target, enchantments);
 }
 
-/// The wearer-aware entry point: the same hook with `owner`, the entity
-/// wearing or holding `stack`, and `mod_slot`, the caller's own place name
-/// (`curios:ring`), set by the caller. Both are `None` for an ordinary stack
-/// read such as a tooltip or a save; this function itself does not discover
-/// a wearer. A mod must call it from the moment it knows one to give a worn
-/// item a per-wearer level (Fortune or Looting on a curio). `None` for either
-/// is accepted and leaves the event's field empty.
+/// `GetEnchantmentLevelForEvent`: the same read with the wearer `owner` and
+/// the caller's `mod_slot` (`curios:ring`) named. Both are optional: `None`
+/// for a caller that only has a stack. The game never calls this on its own;
+/// a mod calls it from the moment it knows the wearer to apply a per-wearer
+/// level. The original three-argument entry point above is unchanged and
+/// keeps asking `get_enchantment_level` alone.
 #[inline(never)]
 pub fn native_get_enchantment_level_for(
     stack: &ItemStack,
@@ -41,5 +36,5 @@ pub fn native_get_enchantment_level_for(
     mod_slot: Option<&str>,
     enchantments: &mut ItemEnchantments,
 ) {
-    crate::dispatch_get_enchantment_level(stack, target, owner, mod_slot, enchantments);
+    crate::dispatch_get_enchantment_level_for(stack, target, owner, mod_slot, enchantments);
 }
