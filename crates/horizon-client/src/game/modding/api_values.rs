@@ -462,7 +462,7 @@ pub(crate) fn install_stack_hooks() {
                 return;
             }
             if let Ok(stack) = stack.try_into_api() {
-                mod_api::item::enchantments::native_get_enchantment_level(
+                mod_api::item::enchantments::native_get_enchantment_level_for(
                     &stack, target, owner, mod_slot, value,
                 );
             }
