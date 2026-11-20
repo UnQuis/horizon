@@ -5,7 +5,8 @@ pub trait Hooks {
     /// before the mod writes its stack. `holder` is the entity, `slot` the
     /// bare slot id (`ring`), `index` the slot's index and `cosmetic` whether
     /// it is a cosmetic copy. `old` and `new` are the stacks before and after
-    /// and `source` says why (`equip`, `unequip`, `reload`, `death`). Set
+    /// and `source` is the caller's own hint about why (`equip`, `unequip`,
+    /// `reload`, `death` are the usual names; any string is accepted). Set
     /// `cancel` to refuse the change; listeners run by `#[listener(priority)]`.
     /// The mod calls `item::mod_slots::native_mod_slot_will_change` with its
     /// host from its own transaction; the game does not know these slots.

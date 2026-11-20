@@ -40,8 +40,8 @@ impl Game<'_> {
         slot: &str,
         index: usize,
         cosmetic: bool,
-        old: Option<ItemStack>,
-        new: Option<ItemStack>,
+        old: Option<mod_api::ItemStack>,
+        new: Option<mod_api::ItemStack>,
         source: &str,
     ) -> bool {
         let mut cancel = false;
@@ -65,8 +65,8 @@ impl Game<'_> {
         slot: &str,
         index: usize,
         cosmetic: bool,
-        old: Option<ItemStack>,
-        new: Option<ItemStack>,
+        old: Option<mod_api::ItemStack>,
+        new: Option<mod_api::ItemStack>,
         source: &str,
     ) {
         mod_api::item::mod_slots::native_mod_slot_changed(
