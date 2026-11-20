@@ -503,6 +503,10 @@ impl ItemAttributeModifiers {
     }
     /// Adds `modifier` on `attribute` in a mod-defined slot group, unless
     /// `attribute` already has a modifier with its id. Whether it was added.
+    /// The name is written into the stack's `attribute_modifiers` component
+    /// unchanged; the game keeps it through reads and matches it against the
+    /// slot a mod reports. With no mod listening to `item_attribute_modifier`
+    /// nothing is copied back.
     pub fn add_named(
         &mut self,
         attribute: Identifier,
@@ -919,7 +923,7 @@ mod tests {
 
     #[test]
     fn named_group_wire_roundtrips_and_refuses_invalid_text() {
-        use crate::wire::{Reader, Wire, Writer};
+        use crate::wire::{Reader, Writer};
         let group = NamedSlotGroup::new("curios:ring").unwrap();
         let mut out = Writer::new();
         out.put(&group);
