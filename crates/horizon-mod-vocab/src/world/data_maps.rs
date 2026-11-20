@@ -301,6 +301,7 @@ pub fn project_data_map<M: DataMap>(
 /// and lets the normal attachment sync send only that view to the clients that
 /// see `holder`; no whole data pack crosses the wire.
 // no wire: a mod-local map and a host-local attachment key, neither sent as a value.
+// exhaustive: its fields are private, so mods can only construct it with `new`.
 pub struct DataMapProjection<M: DataMap>
 where
     M::Value: 'static,
