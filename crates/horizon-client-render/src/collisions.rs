@@ -43,6 +43,11 @@ pub fn load<'r>(root: &Path, registry: &'r BlockRegistry) -> Result<BlockCollisi
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PowderSnowSubject<'a> {
     pub main_hand: Option<CollisionItem<'a>>,
+    /// The real entity id when the caller knows one. The collision context's
+    /// `EntityIdentity` is opaque (and zero for a player), so a mod that needs
+    /// to look up its own state per entity uses this instead. `None` keeps the
+    /// vanilla answer without asking mods.
+    pub entity_id: Option<u32>,
     pub fall_distance: f64,
     /// `FallingBlockEntity`.
     pub falling_block: bool,
@@ -53,6 +58,20 @@ pub struct PowderSnowSubject<'a> {
     /// A strider: lava sources hold it up (`canStandOnFluid`), on its
     /// `getLiquidCollisionShape`.
     pub lava_walker: bool,
+}
+
+/// Hook point for native mods: whether `entity` can walk on the powder snow at
+/// `pos`. `can_walk` comes in as vanilla's answer (the walkable-type tag or
+/// leather boots) and what a listener leaves in it is used. The same decision
+/// point runs on the server and on a client predicting its own movement; only
+/// the server's answer changes gameplay. With no listener nothing is dispatched,
+/// so the answer is vanilla's.
+#[inline(never)]
+pub fn native_powder_snow_walkable(entity: u32, pos: BlockPos, can_walk: &mut bool) {
+    if !mod_api::__private::listened(mod_api::HookId::PowderSnowWalkable) {
+        return;
+    }
+    mod_api::dispatch_powder_snow_walkable(entity, pos, can_walk);
 }
 /// `Strider.getLiquidCollisionShape`: `Block.column(16.0, 0.0, 8.0)`.
 fn strider_liquid_shape() -> VoxelShape {
@@ -655,6 +674,13 @@ impl PowderSnowWorld for SceneCollisions<'_, '_> {
     }
     fn feet_are_leather_boots(&mut self, _: EntityIdentity) -> io::Result<bool> {
         Ok(self.subject.is_some_and(|s| s.leather_boots))
+    }
+    fn powder_snow_mod_walkable(&mut self, pos: BlockPos, can_walk: bool) -> io::Result<bool> {
+        let mut answer = can_walk;
+        if let Some(entity) = self.subject.and_then(|s| s.entity_id) {
+            native_powder_snow_walkable(entity, pos, &mut answer);
+        }
+        Ok(answer)
     }
 }
 

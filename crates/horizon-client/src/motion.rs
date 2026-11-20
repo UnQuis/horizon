@@ -676,6 +676,7 @@ impl PlayerMotion {
     /// What powder snow's contextual collision asks of the player.
     pub fn powder_snow_subject(&self) -> crate::collisions::PowderSnowSubject<'static> {
         crate::collisions::PowderSnowSubject {
+            entity_id: Some(self.entity_id as u32),
             fall_distance: self.fall_distance,
             leather_boots: self.leather_boots,
             ..Default::default()

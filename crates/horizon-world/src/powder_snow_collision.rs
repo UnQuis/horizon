@@ -87,3 +87,87 @@ pub fn powder_snow_collision_shape<W: PowderSnowWorld>(
     }
     Ok(VoxelShape::empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct World {
+        override_answer: Option<bool>,
+        asked: Vec<BlockPos>,
+    }
+    impl PowderSnowWorld for World {
+        type Error = std::convert::Infallible;
+        fn powder_snow_entity(&mut self, _: EntityIdentity) -> Result<PowderSnowEntity, Self::Error> {
+            Ok(PowderSnowEntity {
+                fall_distance: 0.0,
+                falling_block: false,
+            })
+        }
+        fn powder_snow_walkable_tag(&mut self, _: EntityIdentity) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+        fn feet_are_leather_boots(&mut self, _: EntityIdentity) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+        fn powder_snow_mod_walkable(
+            &mut self,
+            pos: BlockPos,
+            can_walk: bool,
+        ) -> Result<bool, Self::Error> {
+            self.asked.push(pos);
+            Ok(self.override_answer.unwrap_or(can_walk))
+        }
+    }
+
+    /// The mod point is asked with the block's own position, and its pass-through
+    /// default leaves vanilla's answer alone.
+    #[test]
+    fn mod_walkable_is_asked_once_with_the_snow_position() {
+        let at = BlockPos::new(3, 64, 5);
+        let mut world = World {
+            override_answer: None,
+            asked: Vec::new(),
+        };
+        assert!(world.powder_snow_mod_walkable(at, true).unwrap());
+        assert!(!world.powder_snow_mod_walkable(at, false).unwrap());
+        assert_eq!(world.asked, vec![at, at]);
+
+        let mut overridden = World {
+            override_answer: Some(true),
+            asked: Vec::new(),
+        };
+        assert!(overridden.powder_snow_mod_walkable(at, false).unwrap());
+    }
+
+    /// An implementation that does not override the method keeps vanilla's answer.
+    #[test]
+    fn a_world_without_a_mod_point_keeps_vanilla() {
+        struct Plain;
+        impl PowderSnowWorld for Plain {
+            type Error = std::convert::Infallible;
+            fn powder_snow_entity(
+                &mut self,
+                _: EntityIdentity,
+            ) -> Result<PowderSnowEntity, Self::Error> {
+                unreachable!()
+            }
+            fn powder_snow_walkable_tag(
+                &mut self,
+                _: EntityIdentity,
+            ) -> Result<bool, Self::Error> {
+                unreachable!()
+            }
+            fn feet_are_leather_boots(&mut self, _: EntityIdentity) -> Result<bool, Self::Error> {
+                unreachable!()
+            }
+        }
+        let mut plain = Plain;
+        assert!(plain
+            .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), true)
+            .unwrap());
+        assert!(!plain
+            .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), false)
+            .unwrap());
+    }
+}

@@ -198,6 +198,7 @@ impl<'w, 'r> BlockSpace<'w, 'r> {
             world: self.world,
             binding: self.binding,
             subject: Some(crate::collisions::PowderSnowSubject {
+                entity_id: Some(m.id),
                 fall_distance: m.fall_distance,
                 leather_boots: m
                     .extra

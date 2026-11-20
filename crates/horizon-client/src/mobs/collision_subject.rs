@@ -2,6 +2,7 @@ impl super::Mob {
     pub(super) fn collision_subject(&self) -> crate::collisions::PowderSnowSubject<'_> {
         use horizon_world::collision_context::CollisionItem;
         crate::collisions::PowderSnowSubject {
+            entity_id: Some(self.id),
             fall_distance: self.fall_distance,
             walkable_type: self.kind.flags.powder_snow_walkable,
             leather_boots: self

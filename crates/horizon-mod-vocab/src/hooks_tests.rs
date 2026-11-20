@@ -885,3 +885,36 @@ fn passages_take_a_server_host(server: &mut dyn ServerHost, level: LevelRef, pas
     let id: Result<PassageId, PassageRegistrationError> = level.register_passage(server, passage);
     let _: bool = level.remove_passage(server, id.unwrap());
 }
+
+#[test]
+fn powder_snow_walkable_lets_a_listener_change_the_vanilla_answer() {
+    use horizon_core::position::BlockPos;
+
+    struct Walkable;
+    #[mod_api::__subscriptions]
+    impl Hooks for Walkable {
+        fn powder_snow_walkable(
+            &self,
+            _: &dyn Host,
+            event: &mut PowderSnowWalkableEvent<'_>,
+        ) {
+            assert_eq!(event.entity, 42);
+            assert_eq!(event.pos, BlockPos::new(1, 64, 2));
+            event.can_walk = true;
+        }
+    }
+
+    testing::with_dispatch(
+        vec![ModEntry::new("snow_walkable", Box::new(Walkable))].into(),
+        || {
+            let mut can_walk = false;
+            dispatch_powder_snow_walkable(
+                &FakeHost::new(),
+                42,
+                BlockPos::new(1, 64, 2),
+                &mut can_walk,
+            );
+            assert!(can_walk);
+        },
+    );
+}

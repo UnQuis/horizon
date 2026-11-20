@@ -2231,12 +2231,11 @@ impl ArmorStand {
         if self.marker {
             return None;
         }
-        scene.subject =
-            self.feet_are_leather_boots()
-                .then_some(crate::collisions::PowderSnowSubject {
-                    leather_boots: true,
-                    ..Default::default()
-                });
+        scene.subject = Some(crate::collisions::PowderSnowSubject {
+            entity_id: Some(self.id),
+            leather_boots: self.feet_are_leather_boots(),
+            ..Default::default()
+        });
         let v = self.velocity;
         let mut wanted = Vec3::new(
             if v.x.abs() < 0.003 { 0.0 } else { v.x },
@@ -2372,12 +2371,11 @@ impl ArmorStand {
         context: &horizon_world::native_load_context::LoopContext,
     ) {
         let mut scene = SceneCollisions {
-            subject: self.feet_are_leather_boots().then_some(
-                crate::collisions::PowderSnowSubject {
-                    leather_boots: true,
-                    ..Default::default()
-                },
-            ),
+            subject: Some(crate::collisions::PowderSnowSubject {
+                entity_id: Some(self.id),
+                leather_boots: self.feet_are_leather_boots(),
+                ..Default::default()
+            }),
             ..scene
         };
         // The lid's `Entity.move(mover, delta)` goes through the
