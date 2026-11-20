@@ -893,11 +893,7 @@ fn powder_snow_walkable_lets_a_listener_change_the_vanilla_answer() {
     struct Walkable;
     #[mod_api::__subscriptions]
     impl Hooks for Walkable {
-        fn powder_snow_walkable(
-            &self,
-            _: &dyn Host,
-            event: &mut PowderSnowWalkableEvent<'_>,
-        ) {
+        fn powder_snow_walkable(&self, event: &mut PowderSnowWalkableEvent) {
             assert_eq!(event.entity, 42);
             assert_eq!(event.pos, BlockPos::new(1, 64, 2));
             event.can_walk = true;
@@ -908,12 +904,7 @@ fn powder_snow_walkable_lets_a_listener_change_the_vanilla_answer() {
         vec![ModEntry::new("snow_walkable", Box::new(Walkable))].into(),
         || {
             let mut can_walk = false;
-            dispatch_powder_snow_walkable(
-                &FakeHost::new(),
-                42,
-                BlockPos::new(1, 64, 2),
-                &mut can_walk,
-            );
+            dispatch_powder_snow_walkable(42, BlockPos::new(1, 64, 2), &mut can_walk);
             assert!(can_walk);
         },
     );

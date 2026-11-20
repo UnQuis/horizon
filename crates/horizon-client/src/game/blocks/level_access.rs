@@ -965,7 +965,7 @@ impl LevelAccess for GameLevel<'_> {
             world: &*self.world,
             binding: self.collision,
             subject: player.map(|player| horizon_client::collisions::PowderSnowSubject {
-                entity_id: Some(player.entity_id as u32),
+                entity_id: Some(player.entity_id),
                 fall_distance: player.fall_distance,
                 leather_boots: player.leather_boots,
                 ..Default::default()

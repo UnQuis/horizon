@@ -98,7 +98,10 @@ mod tests {
     }
     impl PowderSnowWorld for World {
         type Error = std::convert::Infallible;
-        fn powder_snow_entity(&mut self, _: EntityIdentity) -> Result<PowderSnowEntity, Self::Error> {
+        fn powder_snow_entity(
+            &mut self,
+            _: EntityIdentity,
+        ) -> Result<PowderSnowEntity, Self::Error> {
             Ok(PowderSnowEntity {
                 fall_distance: 0.0,
                 falling_block: false,
@@ -152,10 +155,7 @@ mod tests {
             ) -> Result<PowderSnowEntity, Self::Error> {
                 unreachable!()
             }
-            fn powder_snow_walkable_tag(
-                &mut self,
-                _: EntityIdentity,
-            ) -> Result<bool, Self::Error> {
+            fn powder_snow_walkable_tag(&mut self, _: EntityIdentity) -> Result<bool, Self::Error> {
                 unreachable!()
             }
             fn feet_are_leather_boots(&mut self, _: EntityIdentity) -> Result<bool, Self::Error> {
@@ -163,11 +163,15 @@ mod tests {
             }
         }
         let mut plain = Plain;
-        assert!(plain
-            .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), true)
-            .unwrap());
-        assert!(!plain
-            .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), false)
-            .unwrap());
+        assert!(
+            plain
+                .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), true)
+                .unwrap()
+        );
+        assert!(
+            !plain
+                .powder_snow_mod_walkable(BlockPos::new(0, 0, 0), false)
+                .unwrap()
+        );
     }
 }
