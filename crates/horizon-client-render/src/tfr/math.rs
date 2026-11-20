@@ -14,8 +14,9 @@
 //!   (no translation parallax): `sky = current_vp * reference_vp_inv`.
 //! - Geometry reprojection keeps world points fixed:
 //!   `geometry = current_vp * T(reference_camera - current_camera) * reference_vp_inv`.
-//! - A reprojected sample is invalid when `w <= W_EPSILON`, or when target UV/depth
-//!   leave `[0, 1]` beyond `BOUNDS_EPSILON`.
+//! - A reprojected sample is invalid when `w <= W_EPSILON` or its projection/depth is
+//!   non-finite. The target UV may leave `[0, 1]`: the forward vector is still kept so a
+//!   compose pass can walk from a destination sample back to a source inside the reference.
 
 use glam::{DMat4, DVec3, Mat4, Vec2, Vec3};
 
@@ -205,11 +206,11 @@ pub fn reproject_sample(
     let uv = ndc_to_uv(ndc.truncate());
     let target_depth = clip_z_to_depth(ndc.z);
     let motion = uv - source_uv;
-    let valid = ndc.x.is_finite()
-        && ndc.y.is_finite()
+    // A target outside the viewport still carries a usable forward vector: compose uses it to
+    // step from a destination pixel back to a source that is inside the reference image.
+    let valid = uv.x.is_finite()
+        && uv.y.is_finite()
         && ndc.z.is_finite()
-        && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&uv.x)
-        && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&uv.y)
         && (-BOUNDS_EPSILON..=1.0 + BOUNDS_EPSILON).contains(&target_depth);
     ReprojectedSample {
         uv,
@@ -408,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_when_w_non_positive_or_out_of_bounds() {
+    fn invalid_when_w_non_positive_and_valid_when_target_leaves_viewport() {
         let zero_w = reproject_sample(
             Vec2::new(0.5, 0.5),
             0.4,
@@ -424,10 +425,27 @@ mod tests {
 
         let vp = rotation_vp(0.0, 0.0);
         let matrices = reprojection_matrices(vp, vp, DVec3::ZERO, DVec3::ZERO);
-        // Force out-of-bounds by using an off-screen source UV in a static frame: reconstructed
-        // target stays off-screen and should be invalid by bounds tolerance.
+        // An off-screen target still carries a forward vector compose can follow back to an
+        // in-view source; it is valid as long as the projection and depth are finite.
         let oob = reproject_sample(Vec2::new(1.1, 0.5), 0.2, matrices);
-        assert!(!oob.valid, "{oob:?}");
+        assert!(oob.valid, "{oob:?}");
+        assert!(oob.uv.x > 1.0, "{oob:?}");
+    }
+
+    #[test]
+    fn forward_motion_survives_when_target_leaves_viewport() {
+        // Identity projection with a +0.2 NDC x shift: a source at 0.95 lands at 1.05.
+        // Compose needs that forward vector to find the source for a trailing-edge pixel.
+        let shifted = ReprojectionMatrices {
+            geometry: Mat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.2, 0.0, 0.0, 1.0,
+            ]),
+            sky: Mat4::IDENTITY,
+        };
+        let sample = reproject_sample(Vec2::new(0.95, 0.5), 0.4, shifted);
+        assert!(sample.valid, "{sample:?}");
+        assert!(sample.uv.x > 1.0, "{sample:?}");
+        assert!((sample.motion.x - 0.1).abs() < 1.0e-4, "{sample:?}");
     }
 
     #[test]

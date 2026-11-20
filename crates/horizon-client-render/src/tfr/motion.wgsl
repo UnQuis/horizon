@@ -72,8 +72,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ndc = clip.xyz / clip.w;
         let target_uv = ndc_to_uv(ndc.xy);
         let target_depth = ndc.z;
-        let valid = in_bounds(target_uv.x, b_eps)
-            && in_bounds(target_uv.y, b_eps)
+        // Keep the forward vector even when its target leaves the viewport: the compose pass
+        // walks motion from a destination sample towards its source, so a trailing-edge pixel
+        // needs the vector stored at that pixel to find a source still inside the reference.
+        // Only a non-finite projection or an invalid depth makes the sample unusable.
+        let valid = target_uv.x > -1.0e6 && target_uv.x < 1.0e6
+            && target_uv.y > -1.0e6 && target_uv.y < 1.0e6
             && in_bounds(target_depth, b_eps);
         if (valid) {
             out = vec4<f32>(target_uv - uv, 1.0, out.w);

@@ -1213,17 +1213,33 @@ impl Graphics {
                 "frameGeneration" => g.frame_generation = FrameGeneration::parse(value),
                 "tfr" => g.tfr = flag(g.tfr),
                 "tfrReprojectionStrength" => {
-                    g.tfr_reprojection_strength =
-                        value.parse::<f32>().unwrap_or(g.tfr_reprojection_strength)
+                    g.tfr_reprojection_strength = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_reprojection_strength)
                 }
                 "tfrHistoryStability" => {
-                    g.tfr_history_stability =
-                        value.parse::<f32>().unwrap_or(g.tfr_history_stability)
+                    g.tfr_history_stability = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_history_stability)
                 }
                 "tfrCutDistance" => {
-                    g.tfr_cut_distance = value.parse::<f32>().unwrap_or(g.tfr_cut_distance)
+                    g.tfr_cut_distance = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_cut_distance)
                 }
-                "tfrCutAngle" => g.tfr_cut_angle = value.parse::<f32>().unwrap_or(g.tfr_cut_angle),
+                "tfrCutAngle" => {
+                    g.tfr_cut_angle = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_cut_angle)
+                }
                 "hdr" => g.hdr = HdrMode::parse(value, g.hdr),
                 "hdrLook" => look = HdrLook::parse(value),
                 "hdrLighting" => lighting = Some(flag(lighting.unwrap_or(true))),
@@ -1431,6 +1447,30 @@ pub use preset::apply_preset;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-edited file with NaN/infinite TFR values keeps the current setting instead of
+    /// storing a non-finite float that would break the UI slider and the config sanitizer.
+    #[test]
+    fn non_finite_tfr_settings_keep_the_current_value() {
+        for key in [
+            "tfrReprojectionStrength",
+            "tfrHistoryStability",
+            "tfrCutDistance",
+            "tfrCutAngle",
+        ] {
+            for value in ["NaN", "inf", "-inf"] {
+                let file = format!("{key}:{value}\n");
+                let g = Graphics::parse(&file);
+                let v = match key {
+                    "tfrReprojectionStrength" => g.tfr_reprojection_strength,
+                    "tfrHistoryStability" => g.tfr_history_stability,
+                    "tfrCutDistance" => g.tfr_cut_distance,
+                    _ => g.tfr_cut_angle,
+                };
+                assert!(v.is_finite(), "{file}");
+            }
+        }
+    }
 
     /// UI Brightness is saved in nits, 0 for Auto. An older file's share of Paper White reads
     /// as Auto at 100% or with Paper White on Auto, else as that share of it to the nearest step.

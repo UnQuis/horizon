@@ -7540,6 +7540,7 @@ impl Renderer {
         let tfr_wants_simple = self.tfr_cfg.enabled
             && !frame.title
             && self.tfr_world.is_known()
+            && self.output.frame.format == wgpu::TextureFormat::Rgba16Float
             && self.world_post.scale == 1.0
             && self.world_post.upscale <= 1.0
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
