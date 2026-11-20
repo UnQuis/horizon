@@ -7,8 +7,9 @@ pub trait Hooks {
     /// either, and what is left is what the game applies to the stack and to the XP the orb keeps.
     /// Contract version `2` makes those two fields writeable: they arrive as copies of the incoming
     /// values and the dispatch writes them back after the listeners, so assigning to a field is
-    /// enough. A mod written for `1` still sees values it does not change. With no listener the
-    /// values are vanilla's, bit for bit. Server-side.
+    /// enough. The two fields are independent: a listener that zeroes `repair` still leaves
+    /// `experience` to be spent. A mod written for `1` still sees values it does not change.
+    /// With no listener the values are vanilla's, bit for bit. Server-side.
     #[hook(
         side = "server",
         contract = "listen",
