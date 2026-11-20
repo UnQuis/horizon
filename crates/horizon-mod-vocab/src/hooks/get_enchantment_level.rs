@@ -25,7 +25,7 @@ pub trait Hooks {
         side = "both",
         contract = "listen",
         neoforge = "GetEnchantmentLevelEvent",
-        target = "mod_api::item::enchantments::native_get_enchantment_level_for"
+        target = "horizon_client::game::native_hooks::enchantments::Game<'_>::native_get_enchantment_level"
     )]
     fn get_enchantment_level();
 }
