@@ -19,3 +19,17 @@ impl Game<'_> {
         self.fire_get_enchantment_level_for(stack, target, owner, mod_slot, enchantments);
     }
 }
+
+/// The host helper a mod calls from its own equip moment.
+impl Game<'_> {
+    pub(in crate::game) fn enchantment_level_for(
+        &self,
+        owner: EntityRef,
+        mod_slot: Option<&str>,
+        stack: &ItemStack,
+        target: Option<&Identifier>,
+        enchantments: &mut ItemEnchantments,
+    ) {
+        self.fire_get_enchantment_level_for(stack, target, owner, mod_slot, enchantments);
+    }
+}
