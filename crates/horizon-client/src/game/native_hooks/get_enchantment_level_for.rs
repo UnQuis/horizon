@@ -30,6 +30,6 @@ impl Game<'_> {
         target: Option<&Identifier>,
         enchantments: &mut ItemEnchantments,
     ) {
-        self.fire_get_enchantment_level_for(stack, target, Some(owner), mod_slot, enchantments);
+        self.native_get_enchantment_level_for(stack, target, Some(owner), mod_slot, enchantments);
     }
 }
