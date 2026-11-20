@@ -33,7 +33,7 @@ what the package says it was made for, so it needs a rebuild and a new release f
 Older mod formats used `horizon_revision` in a hand-written `horizon-mixin.toml` and `horizon` in
 `horizon-native.json`, with `native-build --ignore-pins` for a local rebuild on a different commit. Those files and
 that flag are retired: a flat project declares its pin only in `[native] horizon` of `horizon-mod.toml`
-([the package](../02-the-package.md), [source revisions](../../../../mod-api/native-mod-source-revisions.md)). Convert
+([the package](02-the-package.md), [source revisions](../../../../mod-api/native-mod-source-revisions.md)). Convert
 an old mod to that layout before repinning; keeping a retired manifest alongside the new one does not choose the
 commit.
 
