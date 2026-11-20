@@ -3,7 +3,7 @@ struct OwnerProbe(Arc<Mutex<Vec<(bool, Option<String>)>>>);
 
 #[mod_api::__subscriptions]
 impl Hooks for OwnerProbe {
-    fn get_enchantment_level_for(&self, event: &mut GetEnchantmentLevelForEvent<'_>) {
+    fn get_enchantment_level_for(&self, _: &dyn Host, event: &mut GetEnchantmentLevelForEvent<'_>) {
         self.0
             .lock()
             .unwrap()
@@ -21,13 +21,14 @@ fn enchantment_level_owner_and_place_reach_the_hook() {
     };
     let mut enchantments = ItemEnchantments;
     dispatch_get_enchantment_level_for(
+        &TestHost,
         &stack,
         None,
         Some(EntityRef),
         Some("curios:ring"),
         &mut enchantments,
     );
-    dispatch_get_enchantment_level_for(&stack, None, None, None, &mut enchantments);
+    dispatch_get_enchantment_level_for(&TestHost, &stack, None, None, None, &mut enchantments);
     assert_eq!(
         *heard.lock().unwrap(),
         [(true, Some("curios:ring".to_owned())), (false, None)]

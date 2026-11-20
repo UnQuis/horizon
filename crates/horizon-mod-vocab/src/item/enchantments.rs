@@ -30,11 +30,12 @@ pub fn native_get_enchantment_level(
 /// keeps asking `get_enchantment_level` alone.
 #[inline(never)]
 pub fn native_get_enchantment_level_for(
+    host: &dyn Host,
     stack: &ItemStack,
     target: Option<&Identifier>,
     owner: Option<EntityRef>,
     mod_slot: Option<&str>,
     enchantments: &mut ItemEnchantments,
 ) {
-    crate::dispatch_get_enchantment_level_for(stack, target, owner, mod_slot, enchantments);
+    crate::dispatch_get_enchantment_level_for(host, stack, target, owner, mod_slot, enchantments);
 }
