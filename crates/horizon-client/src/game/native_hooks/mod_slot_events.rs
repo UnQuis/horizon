@@ -14,9 +14,7 @@ impl Game<'_> {
         source: &str,
         cancel: &mut bool,
     ) {
-        mod_api::item::mod_slots::native_mod_slot_will_change(
-            self, holder, slot, index, cosmetic, old, new, source, cancel,
-        );
+        self.fire_mod_slot_will_change(holder, slot, index, cosmetic, old, new, source, cancel);
     }
 
     #[inline(never)]
@@ -30,9 +28,7 @@ impl Game<'_> {
         new: Option<&ItemStack>,
         source: &str,
     ) {
-        mod_api::item::mod_slots::native_mod_slot_changed(
-            self, holder, slot, index, cosmetic, old, new, source,
-        );
+        self.fire_mod_slot_changed(holder, slot, index, cosmetic, old, new, source);
     }
 }
 
