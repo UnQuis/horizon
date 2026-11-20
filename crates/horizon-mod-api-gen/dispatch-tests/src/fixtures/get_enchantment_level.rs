@@ -27,7 +27,7 @@ fn ordinary_stack_reads_still_reach_the_original_hook() {
     };
     let mut enchantments = ItemEnchantments;
     dispatch_get_enchantment_level(&stack, None, &mut enchantments);
-    dispatch_get_enchantment_level(&stack, Some(Identifier), &mut enchantments);
+    dispatch_get_enchantment_level(&stack, Some(&Identifier), &mut enchantments);
     assert_eq!(*heard.lock().unwrap(), [(1, false), (1, true)]);
     install(Vec::<ModEntry>::new().into());
 }
