@@ -15,13 +15,6 @@ impl Game<'_> {
         mod_slot: Option<&str>,
         enchantments: &mut ItemEnchantments,
     ) {
-        mod_api::item::enchantments::native_get_enchantment_level_for(
-            self,
-            stack,
-            target,
-            owner,
-            mod_slot,
-            enchantments,
-        );
+        self.fire_get_enchantment_level_for(stack, target, owner, mod_slot, enchantments);
     }
 }
