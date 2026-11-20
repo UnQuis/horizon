@@ -23,6 +23,18 @@ pub trait PowderSnowWorld {
     /// Invoke only for a living entity; item identity follows ItemStack.is,
     /// including its empty-stack normalization.
     fn feet_are_leather_boots(&mut self, entity: EntityIdentity) -> Result<bool, Self::Error>;
+    /// A mod's answer on whether the entity can walk on the powder snow at
+    /// `pos`, with vanilla's `can_walk` as the default. The implementation that
+    /// can reach native mods asks them here; without a listener it returns the
+    /// value it was given. The default keeps a mod-free world bit-for-bit the same.
+    fn powder_snow_mod_walkable(
+        &mut self,
+        pos: BlockPos,
+        can_walk: bool,
+    ) -> Result<bool, Self::Error> {
+        let _ = pos;
+        Ok(can_walk)
+    }
 }
 
 pub fn can_walk_on_powder_snow<W: PowderSnowWorld>(
@@ -64,8 +76,11 @@ pub fn powder_snow_collision_shape<W: PowderSnowWorld>(
             .clone());
     }
     if snapshot.falling_block
-        || (can_walk_on_powder_snow(world, entity, context.living_entity().is_some())?
-            && context.is_above(&VoxelShape::block(), position, false)
+        || ({
+            let vanilla =
+                can_walk_on_powder_snow(world, entity, context.living_entity().is_some())?;
+            world.powder_snow_mod_walkable(position, vanilla)?
+        } && context.is_above(&VoxelShape::block(), position, false)
             && !context.is_descending())
     {
         return Ok(VoxelShape::block());
