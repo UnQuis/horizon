@@ -126,7 +126,7 @@ mod tests {
     /// The mod point is asked with the block's own position, and its pass-through
     /// default leaves vanilla's answer alone.
     #[test]
-    fn mod_walkable_is_asked_once_with_the_snow_position() {
+    fn mod_walkable_passes_through_and_overrides_at_the_snow_position() {
         let at = BlockPos::new(3, 64, 5);
         let mut world = World {
             override_answer: None,
