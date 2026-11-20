@@ -892,8 +892,8 @@ fn player_item_mend_lets_a_listener_change_repair_and_experience() {
     #[mod_api::__subscriptions]
     impl Hooks for Bonus {
         fn player_item_mend(&self, _: &mut dyn ServerHost, event: &mut PlayerItemMendEvent<'_>) {
-            *event.repair += 3;
-            *event.experience += 2;
+            event.repair += 3;
+            event.experience += 2;
         }
     }
 
