@@ -1,5 +1,5 @@
 use super::*;
-use crate::game::modding::api_values::TryIntoApi;
+use crate::game::api_values::TryIntoApi;
 
 /// The hook points. Each only forwards to the mod API.
 impl Game<'_> {
