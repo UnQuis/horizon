@@ -35,5 +35,16 @@ pub fn native_mod_slot_changed(
     new: Option<&ItemStack>,
     source: &str,
 ) {
-    crate::dispatch_mod_slot_changed(host, holder, slot, index, cosmetic, old, new, source);
+    crate::dispatch_mod_slot_changed(
+        host,
+        crate::__private::ModSlotChangedCall {
+            holder,
+            slot,
+            index,
+            cosmetic,
+            old,
+            new,
+            source,
+        },
+    );
 }

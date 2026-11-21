@@ -5,30 +5,17 @@ impl Game<'_> {
     #[inline(never)]
     pub(in crate::game) fn native_mod_slot_will_change(
         &self,
-        holder: EntityRef,
-        slot: &str,
-        index: usize,
-        cosmetic: bool,
-        old: Option<&ItemStack>,
-        new: Option<&ItemStack>,
-        source: &str,
-        cancel: &mut bool,
+        call: mod_api::__private::ModSlotWillChangeCall<'_>,
     ) {
-        self.fire_mod_slot_will_change(holder, slot, index, cosmetic, old, new, source, cancel);
+        self.fire_mod_slot_will_change(call);
     }
 
     #[inline(never)]
     pub(in crate::game) fn native_mod_slot_changed(
         &self,
-        holder: EntityRef,
-        slot: &str,
-        index: usize,
-        cosmetic: bool,
-        old: Option<&ItemStack>,
-        new: Option<&ItemStack>,
-        source: &str,
+        call: mod_api::__private::ModSlotChangedCall<'_>,
     ) {
-        self.fire_mod_slot_changed(holder, slot, index, cosmetic, old, new, source);
+        self.fire_mod_slot_changed(call);
     }
 }
 
@@ -45,17 +32,16 @@ impl Game<'_> {
         source: &str,
     ) -> bool {
         let mut cancel = false;
-        mod_api::item::mod_slots::native_mod_slot_will_change(
-            self,
+        self.native_mod_slot_will_change(mod_api::__private::ModSlotWillChangeCall {
             holder,
             slot,
             index,
             cosmetic,
-            old.as_ref(),
-            new.as_ref(),
+            old: old.as_ref(),
+            new: new.as_ref(),
             source,
-            &mut cancel,
-        );
+            cancel: &mut cancel,
+        });
         !cancel
     }
 
@@ -69,15 +55,14 @@ impl Game<'_> {
         new: Option<mod_api::ItemStack>,
         source: &str,
     ) {
-        mod_api::item::mod_slots::native_mod_slot_changed(
-            self,
+        self.native_mod_slot_changed(mod_api::__private::ModSlotChangedCall {
             holder,
             slot,
             index,
             cosmetic,
-            old.as_ref(),
-            new.as_ref(),
+            old: old.as_ref(),
+            new: new.as_ref(),
             source,
-        );
+        });
     }
 }

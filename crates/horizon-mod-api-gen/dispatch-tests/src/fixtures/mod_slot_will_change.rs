@@ -24,14 +24,16 @@ fn pre_change_listener_can_cancel_and_sees_the_fields() {
     let mut cancel = false;
     dispatch_mod_slot_will_change(
         &TestHost,
-        EntityRef,
-        "ring",
-        2,
-        false,
-        None,
-        Some(&stack),
-        "equip",
-        &mut cancel,
+        mod_api::__private::ModSlotWillChangeCall {
+            holder: EntityRef,
+            slot: "ring",
+            index: 2,
+            cosmetic: false,
+            old: None,
+            new: Some(&stack),
+            source: "equip",
+            cancel: &mut cancel,
+        },
     );
     assert!(cancel);
     assert_eq!(*heard.lock().unwrap(), ["ring".to_owned()]);

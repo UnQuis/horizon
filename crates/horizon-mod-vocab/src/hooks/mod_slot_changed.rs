@@ -16,5 +16,13 @@ pub trait Hooks {
         neoforge = "none (Curios' SlotChangeEvent)",
         target = "horizon_client::game::native_hooks::mod_slot_events::Game<'_>::native_mod_slot_changed"
     )]
-    fn mod_slot_changed();
+    fn mod_slot_changed(
+        holder: EntityRef,
+        slot: &str,
+        index: usize,
+        cosmetic: bool,
+        old: Option<&ItemStack>,
+        new: Option<&ItemStack>,
+        source: &str,
+    );
 }

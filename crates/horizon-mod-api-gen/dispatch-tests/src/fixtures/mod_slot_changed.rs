@@ -21,13 +21,15 @@ fn committed_listener_sees_the_slot_and_source() {
     };
     dispatch_mod_slot_changed(
         &TestHost,
-        EntityRef,
-        "ring",
-        2,
-        true,
-        None,
-        Some(&stack),
-        "equip",
+        mod_api::__private::ModSlotChangedCall {
+            holder: EntityRef,
+            slot: "ring",
+            index: 2,
+            cosmetic: true,
+            old: None,
+            new: Some(&stack),
+            source: "equip",
+        },
     );
     assert_eq!(
         *heard.lock().unwrap(),
