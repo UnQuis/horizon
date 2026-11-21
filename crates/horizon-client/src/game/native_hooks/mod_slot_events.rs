@@ -1,4 +1,5 @@
 use super::*;
+use mod_api::TryIntoApi;
 
 /// The hook points. Each only forwards to the mod API.
 impl Game<'_> {
@@ -27,10 +28,16 @@ impl Game<'_> {
         slot: &str,
         index: usize,
         cosmetic: bool,
-        old: Option<mod_api::ItemStack>,
-        new: Option<mod_api::ItemStack>,
+        old: Option<ItemStack>,
+        new: Option<ItemStack>,
         source: &str,
     ) -> bool {
+        let (Ok(old), Ok(new)) = (
+            old.map(|s| s.try_into_api()).transpose(),
+            new.map(|s| s.try_into_api()).transpose(),
+        ) else {
+            return false;
+        };
         let mut cancel = false;
         self.native_mod_slot_will_change(mod_api::__private::ModSlotWillChangeCall {
             holder,
@@ -51,10 +58,16 @@ impl Game<'_> {
         slot: &str,
         index: usize,
         cosmetic: bool,
-        old: Option<mod_api::ItemStack>,
-        new: Option<mod_api::ItemStack>,
+        old: Option<ItemStack>,
+        new: Option<ItemStack>,
         source: &str,
     ) {
+        let (Ok(old), Ok(new)) = (
+            old.map(|s| s.try_into_api()).transpose(),
+            new.map(|s| s.try_into_api()).transpose(),
+        ) else {
+            return;
+        };
         self.native_mod_slot_changed(mod_api::__private::ModSlotChangedCall {
             holder,
             slot,
