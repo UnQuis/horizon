@@ -67,7 +67,7 @@ pub struct PowderSnowSubject<'a> {
 /// the server's answer changes gameplay. With no listener nothing is dispatched,
 /// so the answer is vanilla's.
 #[inline(never)]
-pub fn native_powder_snow_walkable(entity: u32, pos: BlockPos, can_walk: &mut bool) {
+pub fn native_powder_snow_walkable(entity: u32, pos: &BlockPos, can_walk: &mut bool) {
     if !mod_api::__private::listened(mod_api::HookId::PowderSnowWalkable) {
         return;
     }
@@ -678,7 +678,7 @@ impl PowderSnowWorld for SceneCollisions<'_, '_> {
     fn powder_snow_mod_walkable(&mut self, pos: BlockPos, can_walk: bool) -> io::Result<bool> {
         let mut answer = can_walk;
         if let Some(entity) = self.subject.and_then(|s| s.entity_id) {
-            native_powder_snow_walkable(entity, pos, &mut answer);
+            native_powder_snow_walkable(entity, &pos, &mut answer);
         }
         Ok(answer)
     }
