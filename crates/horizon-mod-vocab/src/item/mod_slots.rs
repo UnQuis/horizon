@@ -19,7 +19,17 @@ pub fn native_mod_slot_will_change(
     cancel: &mut bool,
 ) {
     crate::dispatch_mod_slot_will_change(
-        host, holder, slot, index, cosmetic, old, new, source, cancel,
+        host,
+        crate::__private::ModSlotWillChangeCall {
+            holder,
+            slot,
+            index,
+            cosmetic,
+            old,
+            new,
+            source,
+            cancel,
+        },
     );
 }
 

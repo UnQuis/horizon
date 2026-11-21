@@ -24,7 +24,7 @@ fn pre_change_listener_can_cancel_and_sees_the_fields() {
     let mut cancel = false;
     dispatch_mod_slot_will_change(
         &TestHost,
-        mod_api::__private::ModSlotWillChangeCall {
+        calls::ModSlotWillChangeCall {
             holder: EntityRef,
             slot: "ring",
             index: 2,

@@ -21,7 +21,7 @@ fn committed_listener_sees_the_slot_and_source() {
     };
     dispatch_mod_slot_changed(
         &TestHost,
-        mod_api::__private::ModSlotChangedCall {
+        calls::ModSlotChangedCall {
             holder: EntityRef,
             slot: "ring",
             index: 2,
