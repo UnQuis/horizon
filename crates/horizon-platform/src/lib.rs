@@ -39,6 +39,11 @@ pub mod world {
 pub mod protocol {
     pub use horizon_protocol::crypto::offline_uuid;
     pub use horizon_protocol::server_redirect;
+    /// What a server that logs players in on behalf of another (`horizon-server`'s `[proxy]`) speaks: the
+    /// codecs, packets, ids, connection framing, encryption and the account-service hash.
+    pub use horizon_protocol::{
+        Error, PROTOCOL_VERSION, buf, connection, crypto, ids, packets, rsa,
+    };
 }
 
 /// The preparer: the game's files from the player's own Minecraft install.
@@ -123,3 +128,5 @@ pub mod mod_links {
 
 /// Establish the executable stack policy before starting the game or supervisor.
 pub use horizon_guest_stack::prepare_main as prepare_main_stack;
+/// Run an executable's whole `main` on a main thread stack the guest fits on.
+pub use horizon_guest_stack::run_main;

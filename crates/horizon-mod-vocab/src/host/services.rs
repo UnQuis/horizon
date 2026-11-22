@@ -24,6 +24,11 @@ pub trait ServicesServerHost {
     #[access(WorldOnly)]
     #[service]
     fn players(&self) -> &dyn Players;
+    /// The profiles service.
+    /// Not on wasm: a frame resource; its methods are the imports.
+    #[access(WorldOnly)]
+    #[service]
+    fn profiles(&mut self) -> &mut dyn Profiles;
     /// The runtime_levels service.
     /// Not on wasm: a frame resource; its methods are the imports.
     #[access(WorldOnly)]
@@ -245,6 +250,44 @@ pub trait Players {
         )
     }
 }
+/// The profiles service, reached through its host: the game's own Minecraft profile resolver,
+/// the one behind dynamic player heads and `/fetchprofile`. Unlike `host.profile_by_uuid` and
+/// `host.profile_by_name`, which answer from the server's online players and user cache without
+/// asking Mojang, these lookups ask the session server and can resolve an account the server has
+/// never seen, whatever its online mode.
+pub trait Profiles {
+    /// Side: server.
+    /// Resolve a Minecraft account name (`Notch`) through the game's profile resolver: the
+    /// session server's profile, with the signed `textures` property a skin mod replaces a
+    /// player's skin with. The resolver caches answers and paces a mod's new lookups at 60 a
+    /// minute, so it stays within Mojang's rate limit; the game's own lookups are not paced. It
+    /// reaches Mojang's services whatever the server's online mode, and a name that is not a
+    /// valid player name is [`ProfileResolution::Done`] with `None` without a lookup.
+    ///
+    /// The lookup runs in the background: the first call answers
+    /// [`ProfileResolution::Pending`], and a later call (poll it from `server_tick`) the answer,
+    /// which is also cached for the game's own uses. `Pending` can also mean the per-minute
+    /// budget is refilling; poll again later.
+    fn resolve_name(&mut self, name: &str) -> ProfileResolution {
+        crate::world::phase::unprovided(
+            "Profiles::resolve_name",
+            "resolve_name",
+            crate::world::phase::LoadAccess::WorldOnly,
+        )
+    }
+    /// Side: server.
+    /// Resolve an account's UUID through the game's profile resolver, as `resolve_name` does
+    /// by name. The profile's name is the account's current one, and new lookups share the same
+    /// per-minute budget.
+    fn resolve_id(&mut self, id: u128) -> ProfileResolution {
+        crate::world::phase::unprovided(
+            "Profiles::resolve_id",
+            "resolve_id",
+            crate::world::phase::LoadAccess::WorldOnly,
+        )
+    }
+}
+
 /// The runtime_levels service, reached through its host.
 /// Success from `open` or `unload` admits a queued request, not its completion.
 /// Apply failures are logged with the requesting mod and level id. A failed open
@@ -311,6 +354,15 @@ pub trait RuntimeLevels {
         crate::world::phase::unprovided(
             "RuntimeLevels::is_open",
             "is_open",
+            crate::world::phase::LoadAccess::WorldOnly,
+        )
+    }
+    /// Side: server.
+    /// Regenerate the Overworld, the Nether and the End with `seed`, once this server tick's levels have ticked: their chunk files, entities, structure references, raids, the dragon fight and the world spawn are replaced by a fresh world's; game rules, the clock, the weather, the scoreboard, the world border settings and the players' files are kept. The request is checked now and again when it is applied. Refused with [`LevelResetError::PlayersInside`] while a player or an arrival not yet landed is in one of the three levels (the mod moves its players out first, for example into a runtime level it opened: `entity_teleport_to_level`), with [`LevelResetError::NoHoldingLevel`] when the mod has no runtime level open, and with [`LevelResetError::NotPermitted`] unless the mod's manifest declares `[native] level_reset`. Maps are kept. `levels_reset` fires once the old terrain is gone and not when a removal failed; the levels open again from the new seed when somebody next enters them.
+    fn reset_vanilla(&mut self, seed: i64) -> Result<(), LevelResetError> {
+        crate::world::phase::unprovided(
+            "RuntimeLevels::reset_vanilla",
+            "reset_vanilla",
             crate::world::phase::LoadAccess::WorldOnly,
         )
     }

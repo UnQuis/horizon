@@ -742,6 +742,15 @@ fn setup(s: &Settings, out: &EffectiveOutput) -> Setup {
 /// What the HDR page says while HDR output is held back on this window's graphics driver
 /// (`EffectiveOutput::held`): picking a mode tries again (`H::cycle`).
 const HDR_HELD: &str = "HDR output stopped the game the last time it started with this graphics driver. Choose a mode to try again.";
+/// The same, held by a graphics device loss (`gfx::safe_start`).
+fn hdr_held(s: &Settings) -> &'static str {
+    match s.horizon.safe_start {
+        Some(_) => {
+            "An earlier start lost the graphics device, so HDR stays off. Choose a mode to try again."
+        }
+        None => HDR_HELD,
+    }
+}
 
 /// The description beside `item` where it depends on [`setup`]; `text` otherwise.
 fn description(
@@ -751,7 +760,7 @@ fn description(
     text: &'static str,
 ) -> &'static str {
     match (item, setup(s, out)) {
-        (Item::Horizon(H::Hdr), _) if out.held => HDR_HELD,
+        (Item::Horizon(H::Hdr), _) if out.held => hdr_held(s),
         (Item::Horizon(H::HdrCalibrate), Setup::Unknown) => {
             "Your display didn't say how bright it gets: calibrate to set it up."
         }
@@ -1197,6 +1206,7 @@ impl H {
             // Any choice tries HDR output again on a driver a start failed on.
             H::Hdr => {
                 g.hdr_failed_start = None;
+                g.safe_start = None;
                 g.hdr = step(&HdrMode::ALL, g.hdr, back);
                 if g.hdr == HdrMode::On && !out.hdr_offered() {
                     g.hdr = step(&HdrMode::ALL, g.hdr, back);
@@ -1205,7 +1215,11 @@ impl H {
             H::HdrLook => g.hdr_look = step(&HdrLook::ALL, g.hdr_look, back),
             H::BatteryMode => g.battery = !g.battery,
             H::ShadowCache => g.shadow_cache = !g.shadow_cache,
-            H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
+            H::GraphicsApi => {
+                g.api = step(GraphicsApi::choices(), g.api, back);
+                g.watchdog_api = None;
+                g.watchdog_driver = None;
+            }
             H::TranslucentBatching => g.translucent_batching = !g.translucent_batching,
             H::Pacing => {
                 g.pacing = match g.pacing {
@@ -1225,7 +1239,7 @@ impl H {
     }
 }
 fn max_workers() -> u32 {
-    std::thread::available_parallelism().map_or(8, |n| n.get() as u32)
+    horizon_threads::available_parallelism().map_or(8, |n| n.get() as u32)
 }
 
 impl Item {
@@ -1275,7 +1289,7 @@ impl Item {
                 | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.requests_hdr(s.horizon.hdr) => Some(if out.held {
-                HDR_HELD
+                hdr_held(s)
             } else {
                 "Turn HDR on to use it."
             }),

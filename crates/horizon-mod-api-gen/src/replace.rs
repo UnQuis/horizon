@@ -839,18 +839,8 @@ fn inventory(
     }
 }
 
-/// Marked lower-crate functions and their source locations. Within one generation
-/// ([`source::with_walk_cache`]) the tree is read once.
+/// Marked lower-crate functions and their source locations.
 pub(crate) fn marked(root: &Path) -> Result<Vec<(String, String)>, String> {
-    if let Some(found) = source::recalled_marked(root) {
-        return Ok(found);
-    }
-    let found = marked_in(root)?;
-    source::remember_marked(root, &found);
-    Ok(found)
-}
-
-fn marked_in(root: &Path) -> Result<Vec<(String, String)>, String> {
     fn scan(module: &str, items: &[Item], out: &mut Vec<(String, String)>) -> Result<(), String> {
         for item in items {
             match item {
@@ -950,19 +940,11 @@ fn marked_in(root: &Path) -> Result<Vec<(String, String)>, String> {
                 continue;
             }
             // What a file marks follows from its text and module path alone.
-            let paths = crate::incremental::cached(
-                "marked",
-                &crate::incremental::digest(&[file.module.as_bytes(), text.as_bytes()]),
-                || {
-                    let parsed = syn::parse_file(&text)
-                        .map_err(|e| format!("{}: {e}", file.path.display()))?;
-                    let mut found = Vec::new();
-                    scan(&file.module, &parsed.items, &mut found)?;
-                    Ok(found.into_iter().map(|(_, path)| path).collect::<Vec<_>>())
-                },
-                |paths| serde_json::to_string(paths).unwrap_or_default(),
-                |text| serde_json::from_str::<Vec<String>>(text).ok(),
-            )?;
+            let parsed =
+                syn::parse_file(&text).map_err(|e| format!("{}: {e}", file.path.display()))?;
+            let mut found = Vec::new();
+            scan(&file.module, &parsed.items, &mut found)?;
+            let paths: Vec<String> = found.into_iter().map(|(_, path)| path).collect();
             // Every entry's label is its path in the same words.
             out.extend(paths.into_iter().map(|path| {
                 (
@@ -1227,6 +1209,53 @@ fn built_on(package: &Path, game: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// `lock` with `added` in the dependency list of the package `name`, kept in the lock file's
+/// sorted order; none when the lock file has no entry for it.
+fn locked_with(lock: &str, name: &str, added: &[&str]) -> Option<String> {
+    let header = format!("[[package]]\nname = \"{name}\"\n");
+    let start = lock.find(&header)?;
+    let end = lock[start + header.len()..]
+        .find("\n\n")
+        .map_or(lock.len(), |at| start + header.len() + at);
+    let entry = &lock[start..end];
+    let mut lines: Vec<String> = entry.lines().map(str::to_owned).collect();
+    let mut dependencies: Vec<String> = Vec::new();
+    let open = lines.iter().position(|line| line == "dependencies = [");
+    if let Some(open) = open {
+        let close = open + lines[open..].iter().position(|line| line == "]")?;
+        dependencies = lines.drain(open + 1..close).collect();
+    }
+    for name in added {
+        let quoted = format!(" \"{name}\",");
+        if !dependencies.contains(&quoted) {
+            dependencies.push(quoted);
+        }
+    }
+    dependencies.sort();
+    let open = match open {
+        Some(open) => open,
+        None => {
+            // `dependencies` follows `version` and `source`, before `checksum`.
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with("checksum"))
+                .unwrap_or(lines.len());
+            lines.insert(at, "dependencies = [".to_owned());
+            lines.insert(at + 1, "]".to_owned());
+            at
+        }
+    };
+    for (offset, dependency) in dependencies.into_iter().enumerate() {
+        lines.insert(open + 1 + offset, dependency);
+    }
+    Some(format!(
+        "{}{}{}",
+        &lock[..start],
+        lines.join("\n"),
+        &lock[end..]
+    ))
+}
+
 /// Give the staged game crate a path dependency on each crate it arms, in its manifest and its
 /// lock entry: its source manifest needn't name a crate it reaches only through slots.
 fn arm_dependencies(root: &Path, game: &Path, armed: &[&Path]) -> Result<(), String> {
@@ -1284,7 +1313,7 @@ fn arm_dependencies(root: &Path, game: &Path, armed: &[&Path]) -> Result<(), Str
         .map_err(|e| format!("{}: {e}", lock_path.display()))?
         .replace("\r\n", "\n");
     let added: Vec<&str> = added.iter().map(String::as_str).collect();
-    let lock = crate::points::locked_with(&lock, &game_name, &added)
+    let lock = locked_with(&lock, &game_name, &added)
         .ok_or_else(|| format!("Cargo.lock has no entry for {game_name}"))?;
     let path = game.join("Cargo.toml");
     fs::write(&path, toml::to_string(&cargo).map_err(|e| e.to_string())?)
@@ -1381,12 +1410,14 @@ fn rewrite(
                 edits.push((open, open, format!("slot = {slot}, ")));
             }
             None => {
+                // A parameter of an uninhabited type (`Infallible`) makes the call unreachable,
+                // which the SDK build's `-D warnings` refuses.
                 let open = at(function.body.brace_token.span.open().end());
                 edits.push((
                     open,
                     open,
                     format!(
-                        " if let ::std::option::Option::Some(__fnr) = {call} {{ return __fnr({}); }}{rebind}",
+                        " if let ::std::option::Option::Some(__fnr) = {call} {{ #[allow(unreachable_code)] return __fnr({}); }}{rebind}",
                         arguments.join(", ")
                     ),
                 ));
@@ -1629,7 +1660,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "fn next(&mut self, __fnr_p1: (u32, u32), mut c: u8, __fnr_p3: bool) -> u32 { if let ::std::option::Option::Some(__fnr) = Self::__fnr_read_slot_0() { return __fnr(self, __fnr_p1, c, __fnr_p3); } let (a, b) = __fnr_p1;\n"
+                "fn next(&mut self, __fnr_p1: (u32, u32), mut c: u8, __fnr_p3: bool) -> u32 { if let ::std::option::Option::Some(__fnr) = Self::__fnr_read_slot_0() { #[allow(unreachable_code)] return __fnr(self, __fnr_p1, c, __fnr_p3); } let (a, b) = __fnr_p1;\n"
             ),
             "{out}"
         );
@@ -1802,7 +1833,7 @@ mod tests {
         assert!(out.contains("crate :: __REPLACE [7usize]"), "{out}");
         assert!(out.contains("crate :: __REPLACE [8usize]"), "{out}");
         assert!(
-            out.contains("{ if let ::std::option::Option::Some(__fnr) = __fnr_read_slot_8() { return __fnr(); } __fnr_read_slot_7().is_some() }"),
+            out.contains("{ if let ::std::option::Option::Some(__fnr) = __fnr_read_slot_8() { #[allow(unreachable_code)] return __fnr(); } __fnr_read_slot_7().is_some() }"),
             "{out}"
         );
         syn::parse_file(&out).unwrap();
@@ -1862,7 +1893,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            out.contains("{ if let ::std::option::Option::Some(__fnr) = Self::__fnr_read_slot_0() { return __fnr(self, mob); } true }"),
+            out.contains("{ if let ::std::option::Option::Some(__fnr) = Self::__fnr_read_slot_0() { #[allow(unreachable_code)] return __fnr(self, mob); } true }"),
             "{out}"
         );
         let staged = syn::parse_file(&out).unwrap();

@@ -16,8 +16,8 @@ use crate::manifest::{
 use crate::package::{MAX_TOTAL, MAX_WGSL};
 use crate::stages::{
     GROUP, KEPT_BINDING, MOTION_BINDING, PBR_NORMALS_BINDING, PBR_SPECULAR_BINDING,
-    RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_LOOKS_BINDING, RAY_SCENE_BINDING,
-    RAY_SPRITE_ARRAYS, RAY_SPRITES_BINDING, StageKind,
+    RAY_ENTITY_RETAINED_BINDING, RAY_ENTITY_STORE_BINDING, RAY_LIGHTS_BINDING, RAY_LOOKS_BINDING,
+    RAY_SCENE_BINDING, RAY_SPRITE_ARRAYS, RAY_SPRITES_BINDING, StageKind,
 };
 
 fn table(s: &Struct, offsets: Option<&[usize]>) -> String {
@@ -99,10 +99,10 @@ the frame stores gamma (`[frame] blend`, below).
 ## Room to grow
 
 `Frame`, the stage inputs (`SkyInput`, `VertexInput`, `MaterialInput`, `DisplacementInput`, `WeatherInput`,
-`PostInput`, `TonemapInput`, `EntityInput`), `surface_at`'s `SurfaceData` and `trace`'s `RayHit` may gain fields in later
-releases. Read their fields and pass them along, but don't construct them: `horizon-shader check` refuses
-`PostInput(...)` and the like. `Surface` is yours to construct and keeps its one field; later material outputs come as
-helpers.
+`PostInput`, `TonemapInput`, `EntityInput`), `surface_at`'s `SurfaceData`, `trace`'s `RayHit` and `trace_step`'s
+`RayCandidate` may gain fields in later releases. Read their fields and pass them along, but don't construct them:
+`horizon-shader check` refuses `PostInput(...)` and the like. `Surface` is yours to construct and keeps its one field;
+later material outputs come as helpers.
 
 **New names reach a stage only if the pack asked for them.** A later release puts a new name before your files (a
 helper, a struct, a resource, a constant) only under a manifest key the pack sets, or in a stage added later, whose
@@ -168,11 +168,13 @@ scatters, a little denser in the middle tones. A post pass fogs what the stages 
 fn ray_tracing() -> String {
     let mut out = String::from(
         "### Ray tracing\n\n\
-         With `[ray_tracing]` in the manifest (it has no keys, and needs a `[[post]]` pass, a `[[before_world]]` pass or a\n\
-         `[material]` stage) the post stage's prelude also has `RayHit` and the functions and constants below, so do the\n\
-         material, compute and `[[before_world]]` stages' where their files name one of the four trace functions, and the\n\
-         `Frame` of every stage of the pack has `has_ray_tracing` and `ray_distance`. A pack without the key has none of\n\
-         them, and a material, compute or `[[before_world]]` stage that names no trace function is built as without it.\n\n\
+         With `[ray_tracing]` in the manifest (it needs a `[[post]]` pass, a `[[before_world]]` pass, a `[material]` or an\n\
+         `[entity]` stage; its keys, `lights` and `step`, are below), post passes get `RayHit` and the functions and\n\
+         constants below. So do the material, entity, compute and `[[before_world]]` stages whose files name one of the four\n\
+         trace functions (or, with `lights = true`, a light one, with `step = true` one of the step's). Every stage of the\n\
+         pack has `frame.has_ray_tracing` and `frame.ray_distance`. A pack without the key has none of these. A material,\n\
+         entity, compute or `[[before_world]]` stage that names no trace function (nor, with those keys, a light or a step\n\
+         name) is built as without it.\n\n\
          The game traces for the pack picked when it starts: only then, and only for a pack with `[ray_tracing]`, does it\n\
          ask the GPU for hardware ray queries, where the GPU and graphics API have them. In a game started without them a\n\
          pack picked while it runs traces from the next start, and the shader pack screen says so. `HORIZON_RAY_TRACING=1`\n\
@@ -201,8 +203,67 @@ fn ray_tracing() -> String {
          - `fn hit_normal_map(hit: RayHit) -> vec4<f32>`, `fn hit_specular_map(hit: RayHit) -> vec4<f32>`: the resource\n  \
          packs' LabPBR maps at the hit, its sprite's texel at `hit.uv` at full size, as `block_normal_map_level(uv, 0.0)`\n  \
          and `block_specular_map_level(uv, 0.0)` read a drawn surface's; their defaults without maps, and on a miss.\n\
-         - In the post, compute and `[[before_world]]` stages, `fn block_pbr_maps() -> bool`: whether the resource packs\n  \
-         ship LabPBR maps, as the material stage's.\n\n\
+         - In the post, entity, compute and `[[before_world]]` stages, `fn block_pbr_maps() -> bool`: whether the resource packs\n  \
+         ship LabPBR maps, as the material stage's.\n\
+         - The light sources, only with `lights = true` under `[ray_tracing]` (off by default: without it these five names\n  \
+         are free for the pack's own), and only in a stage whose files name one of them outside a comment, which alone\n  \
+         binds them. `struct RayLight`: `position: vec3<f32>`, the centre of its block, camera-relative from the player's\n  \
+         camera (`frame.camera_position`) in every pass, as `trace`'s `origin` and `view_position` are (the water mirror\n  \
+         is drawn by Horizon's own terrain shader, and the shadow map with the vertex stage, which can't reach the light\n  \
+         functions: no pass reads them from another camera); `level: f32`,\n  \
+         vanilla's light level of the block, 1 to 15 (a terrain hit's `RayHit.emission` times 15); `color: vec3<f32>`,\n  \
+         its `[[lights]]` colour decoded to linear as `block_light_color`'s is, white for a block the pack gives none;\n  \
+         `material: u32`, its `[[materials]]` id, the one `RayHit.material` reports on the first face of its model whose\n  \
+         sprite has one, 0 where none does; it is taken from one fixed model of the block state, so where a resource pack\n  \
+         gives the state weighted models with different materials it can differ from the `RayHit.material` of that\n  \
+         block. `fn ray_light_count() -> u32` and `fn ray_light(i: u32) -> RayLight`: the blocks that give off light\n  \
+         in the sections the grid or 15 blocks around it touch (so up to a section past where their light reaches it),\n  \
+         the nearest the camera first, at most 1024; `ray_light` gives level 0 past the count.\n  \
+         Fluids are left out: lava is not listed, so lava lakes don't light through `ray_lights_near` (they would fill\n  \
+         every cell nearby and push the torches out; a ray meets the lava's surface anyway, with its `emission`).\n  \
+         `fn ray_lights_near(position: vec3<f32>) -> vec2<u32>`: the sources whose light reaches some part of the cell of\n  \
+         a camera-relative point, as the first and the count of the indices `fn ray_light_at(i: u32) -> u32` reads;\n  \
+         none outside the grid. `ray_light_at` gives `0xffffffffu`, which `ray_light` reads as level 0, for an `i` past\n  \
+         its cell's count. Both are candidate sets, not a verdict: a source listed may not reach the point itself, so\n  \
+         the pack's own falloff (and a trace) decides what each gives. A cell's order is its strength at the cell's\n  \
+         nearest point, not at the point: a pass that tests only its first few shows the cells' edges. The list is\n  \
+         the data, and the grid a convenience built from it with fixed choices (8-block cells, 16 a side around the\n  \
+         camera, at most 24 a cell, ranked by vanilla's falloff, level minus distance, at the cell's nearest point): a\n  \
+         pack that wants others reads the list and builds its own grid into a kept buffer in a compute or\n  \
+         `[[before_world]]` pass. Both are rebuilt off the render thread when the camera crosses a 16-block step, and\n  \
+         at most every 100 ms when a source block changes, and reach the passes a frame or two later; their positions\n  \
+         stay relative to the current camera meanwhile. The list only says where sources are: trace towards one (`trace_any`) to know whether\n  \
+         its light gets through. A full glowing cube (glowstone, a sea lantern) is in the scene itself, so a ray aimed\n  \
+         at its centre is stopped by the source: end the ray where it enters the source's block (as\n  \
+         `packs/traced_lights` does), or take a hit within the block as the source.\n\
+         - The candidate step, only with `step = true` under `[ray_tracing]` (off by default: without it its names are free\n  \
+         for the pack's own), and only in a stage whose files name one of them outside a comment: `trace_step`,\n  \
+         `RayCandidate`, the six `candidate_` functions, `RAY_PASS`, `RAY_STOP`, `RAY_END`. Such a stage defines its own\n  \
+         state type, `struct RayState` (or an `alias`; any type, a spectral pack's array of bands too), and its own step,\n  \
+         `fn ray_step(c: RayCandidate, state: ptr<function, RayState>) -> u32`. `fn trace_step(origin: vec3<f32>,\n  \
+         direction: vec3<f32>, max_distance: f32, layers: u32, state: ptr<function, RayState>) -> RayHit` makes one ray\n  \
+         query over `layers`, as `trace_layers` does, and calls `ray_step` with `state` for every surface the ray crosses,\n  \
+         clear texels and all. The step returns what to do with it, bits to OR together: `RAY_PASS` (0) goes on past it,\n  \
+         `RAY_STOP` (1) keeps it as the nearest hit so far, which shortens the ray to it, `RAY_END` (2) ends the query now,\n  \
+         the hit being the nearest kept by then. The result is that nearest candidate, as `trace_layers` gives a hit;\n  \
+         `distance` is negative where a step kept none. `struct RayCandidate`: `distance: f32`, along the ray in blocks, and `layer: u32`, `RAY_SOLID`,\n  \
+         `RAY_TRANSLUCENT` or `RAY_ENTITY`; its other fields are Horizon's. Functions read the rest, paid for only where\n  \
+         called, each the `RayHit` field of its name as if the candidate were the hit: `fn candidate_albedo(c:\n  \
+         RayCandidate) -> vec4<f32>`, `candidate_tint` (a `vec4<f32>`; calling it binds the scene's looks, as reading\n  \
+         `RayHit.tint` does), `candidate_material`, `candidate_tags` and `candidate_fluid` (each a `u32`). And `fn\n  \
+         candidate_stops(c: RayCandidate) -> bool`: whether the candidate stops a ray of `trace_layers`, by the rule below.\n  \
+         So `trace_layers` is `trace_step` with a step that returns `RAY_STOP` where `candidate_stops` is true, and\n  \
+         `trace_any_layers` the same with `RAY_STOP | RAY_END`. Candidates come in no set order, not nearest first: one\n  \
+         beyond the hit kept in the end may have been stepped before a nearer one was kept, so a step that adds or\n  \
+         multiplies keeps none (everything out to `max_distance` counts) or records each contribution's `c.distance` and\n  \
+         drops those past the result's `distance`. A stage has one `ray_step` and one `RayState`, shared by every\n  \
+         `trace_step` call in it. A surface may reach the step more than once in one query: the graphics APIs allow it unless the\n  \
+         scene's geometry forbids it, which Horizon's doesn't yet. A step that only keeps, ends, or takes a minimum or a\n  \
+         maximum is unaffected; one that multiplies (light through glass) can count a pane more than once. Without the scene\n  \
+         there is no candidate: every ray misses and `state` stays as passed. The check refuses a stage without `RayState` or\n  \
+         with another `ray_step`, a `ray_step` that reaches a trace function (`trace_step` too), and a pack that\n  \
+         constructs a `RayCandidate`.\n\
+         \n\
          A ray starts at `origin` itself, so move a point off its own surface before tracing from it. What stops it is what\n\
          the surface's own pass draws. In the solid layer it passes through the clear texels of a cut-out texture (leaves,\n\
          plants), as terrain's alpha test does: a texel stops it from alpha 0.5 up. In the translucent layer every texel\n\
@@ -225,14 +286,19 @@ fn ray_tracing() -> String {
          pixel. But a post pass knows only the solid terrain's surface (`surface_at` isn't `present` behind water,\n\
          glass or entities) and has no albedo, so direct light that must be right there is traced in `material`. With\n\
          `[material] reads`, a pack can also trace in a compute or `[[before_world]]` pass and apply the result in\n\
-         `material`.\n\n",
+         `material`.\n\n\
+         In the entity stage `entity` traces as `material` does, in the world's colour pass only (the shadow map's\n\
+         entities don't run the stage). A ray it casts with `RAY_ENTITY` in its layers can hit the entity it starts on:\n\
+         move its origin off the surface, as from terrain.\n\n",
     );
     out += &shaded_table(&RAY_HIT);
     out += &format!(
         "Bindings {RAY_SCENE_BINDING} to {} of group {GROUP} hold the scene while the game traces ({RAY_ENTITY_STORE_BINDING} to\n\
-         {RAY_ENTITY_RETAINED_BINDING} the entity layer, for a pack that names it), and in a post, compute or `[[before_world]]` pass bindings\n\
-         {PBR_NORMALS_BINDING} and {PBR_SPECULAR_BINDING} the LabPBR maps (the material stage has them there already).\n\
-         Binding {RAY_LOOKS_BINDING} holds terrain hit looks for a stage that reads `RayHit.tint`, `shade` or `ao` from its entry point.\n\
+         {RAY_ENTITY_RETAINED_BINDING} the entity layer, for a pack that names it, {RAY_LIGHTS_BINDING} the light sources, for a pass that\n\
+         names them under `lights = true`), and in a post, compute or `[[before_world]]` pass bindings\n\
+         {PBR_NORMALS_BINDING} and {PBR_SPECULAR_BINDING} the LabPBR maps (the material and entity stages have them there already).\n\
+         Binding {RAY_LOOKS_BINDING} holds terrain hit looks for a stage that reads `RayHit.tint`, `shade` or `ao` from its entry point,\n\
+         or calls `candidate_tint` from it.\n\
          These bindings are Horizon's, as their `horizon_` names say, and change with the renderer.\n\n",
         RAY_SPRITES_BINDING + RAY_SPRITE_ARRAYS - 1
     );
@@ -508,7 +574,23 @@ pub fn markdown() -> String {
         if kind == StageKind::Post {
             out += "- `fn depth_at(uv: vec2<f32>) -> f32`: the world's depth at `uv`.\n\
                     - `fn view_position(uv: vec2<f32>, depth: f32) -> vec3<f32>`: the camera-relative position, in blocks, of\n  \
-                    the point at `uv` and `depth`.\n\
+                    the point at `uv` and `depth`. With view bob or nausea spin active, the ray through this point need not\n  \
+                    pass through `(0, 0, 0)`. Get its direction from two positions at the same `uv` and different depths;\n  \
+                    for example, `normalize(view_position(uv, depth_far) - view_position(uv, depth_near))`, where\n  \
+                    `depth_far < depth_near` because depth is reversed.\n\
+\n  \
+                    For a perspective projection's finite optical origin, column 2 of `frame.projection_inverse` gives\n  \
+                    that origin as a homogeneous view-space point. Transform it to camera-relative world axes:\n\
+\n  \
+                    ```wgsl\n  \
+                    let optical_h = frame.projection_inverse[2];\n  \
+                    if optical_h.w != 0.0 {\n    \
+                        let optical_view = optical_h.xyz / optical_h.w;\n    \
+                        let optical_origin = (frame.view_inverse * vec4<f32>(optical_view, 0.0)).xyz;\n  \
+                    }\n  \
+                    ```\n\
+\n  \
+                    An orthographic projection has no finite optical origin (`optical_h.w == 0.0`); do not divide by zero.\n\
                     - `fn surface_at(texel: vec2<i32>) -> SurfaceData`: the solid terrain's surface at a pixel, as the \
                     material stage's `set_surface` left it: `present` (false where the sky, an entity, water, glass or a \
                     particle shows instead), `normal` (world axes), `smoothness` and `data`.\n";

@@ -10,6 +10,7 @@ players. Native and wasm mods use the same calls.
 | `host.commands()` | `run_command(line)` runs through the console command path with permission level 4. `feedback(text)` answers the command source. |
 | `host.messages()` | `broadcast(text)` fires the broadcast hook and writes to the server log. `text_allowed(text)` checks the server chat filter. |
 | `host.players()` | `server_players()` returns `Vec<PlayerRef>` in connection order. `acting_player()` returns the optional player whose state is active in the hook. `player_by_name(name)` finds a connected real player by case-insensitive account name, not nickname. |
+| `host.profiles()` | `resolve_name(name)` and `resolve_id(uuid)` ask the game's Minecraft profile resolver, the one behind dynamic player heads and `/fetchprofile`, for an account's profile. The first call answers `ProfileResolution::Pending`; poll it from `server_tick` for `Done(Some(profile))`, or `Done(None)` when there is no such account or the lookup failed (for example, a rate-limited lookup). `Done(None)` does not prove the account is missing. The resolver caches answers, paces a mod's new lookups at 60 a minute, and reaches Mojang's services whatever the server's online mode. |
 | `host.levels()` | `list_levels()` returns loaded server levels in vanilla dimension order, or an empty list before a server world opens. |
 
 Player and level lookup services accept `&dyn ServerHost` and do not mutate the
@@ -55,7 +56,58 @@ current dimension, even when another dimension is ticking. On a client they
 identify the local player's level. Unknown, disconnected, replaced or stale handles
 return `None`.
 
-Game profiles (server only): `host.profile_by_uuid(uuid)` and `host.profile_by_name(name)` (any case) return the `GameProfile` the server knows: an online player's, with its properties, else the name from the user cache (`usercache.json`, on a dedicated server), without properties. Neither asks Mojang, and `None` means neither the server nor its cache knows the player. To change a skin, `player.set_profile_property(host, "textures", value, signature)` sets the `textures` property (Mojang's base64 value and its signature). Other players see it once `player.refresh(host)` sends the player to them again; the player's own client keeps its current skin until they change level or join again. A property set this way is published and returned by the two lookups; `player.profile(host)` keeps returning the properties the player logged in with.
+## Profiles and skins
+
+Two server-side lookups answer different questions.
+
+`host.profile_by_uuid(uuid)` and `host.profile_by_name(name)` (any case) return the `GameProfile`
+the server already knows: an online player's, with its properties, else the name from the user
+cache (`usercache.json`, on a dedicated server), without properties. Neither asks Mojang, and
+`None` means neither the server nor its cache knows the player. `player.profile(host)` returns a
+connected or acting player's login profile, including the signed `textures` property.
+
+`host.profiles().resolve_name("Notch")` (or `resolve_id(uuid)`) asks the game's own Minecraft
+profile resolver, the one behind dynamic player heads and `/fetchprofile`, for an account's current
+session-server profile. This is the asynchronous Mojang lookup, and it works whatever the server's
+online mode. The first call answers `ProfileResolution::Pending` while the background lookup runs;
+poll it from a command or `server_tick` until `ProfileResolution::Done(Some(profile))` with the
+account's UUID, current name and properties, or `ProfileResolution::Done(None)` when there is no
+such account or the lookup failed (for example, Mojang rate-limited it). `Done(None)` does not
+prove the account is missing; retry later when the distinction matters. Calls through
+`host.profiles()` are paced at 60 new lookups a minute; `/fetchprofile` and the game's own skin
+lookups take the game path and are not paced. `Pending` can also mean that budget is refilling;
+poll again later. The resolver caches answers and uses the TLS stack the game already links, so a
+mod needs no HTTP client of its own. Keep the result in your own state; do not block a login hook
+on it.
+
+To change a skin, `player.set_profile_property(host, "textures", value, signature)` sets the
+`textures` property (Mojang's base64 value and its signature). Other players see it once
+`player.refresh(host)` sends the player to them again; the player's own client keeps its current
+skin until they change level or join again. A property set this way is published and returned by
+`profile_by_uuid` and `profile_by_name`; `player.profile(host)` keeps returning the properties the
+player logged in with. The `player_login_profile` hook below does this before the login success
+instead, so the player's own client gets the skin at once and no refresh is needed.
+
+## A player's profile at login
+
+`player_login_profile` runs once for each accepted login, after the name,
+whitelist, ban and server-full checks and before the login success is sent, with
+the UUID and name the login authenticated and the profile's `properties`. A skin
+or identity mod replaces the `textures` property there; the login success and the
+player list then carry the changed profile. It has no `Host` (it runs on the
+connection thread), so answer from the arguments and your mod's own state alone,
+and keep the list inside the profile's limits: at most 16 properties, names of 64
+UTF-16 units, values of 32767 and signatures of 1024. A list past a limit is
+refused and the login's own properties are sent. `player_login` follows later and
+can still refuse the player.
+
+`entity.set_swimming(host, swimming)` (`entity_set_swimming`) sets the swimming flag of a server player or a guest, the one the next water update reads, as Paper's `Entity#setSwimming` does. It returns `false` for a mob, which keeps its own swim, and for a stale handle.
+
+`entity.detonate(host)` (`entity_detonate`) explodes an entity now: a primed TNT explodes where it stands with its power, as `PrimedTnt.explode` does, and a creeper is lit and explodes at once, as `Creeper.explodeCreeper` does. The entity is gone after its explosion. It returns `false`, changing nothing, for a stale handle, a kind that does not explode, or when the explosion itself fails.
+
+`entity.set_fall_distance(host, distance)` (`entity_set_fall_distance`) sets the blocks a server player, a guest or a mob has fallen, as Paper's `Entity#setFallDistance` does, so the next landing hurts by that much. It returns `false` for another kind, a client, a stale handle or a value that is not finite; `entity_reset_fall_distance` is the zero.
+
+`entity.set_fuse(host, ticks)` (`entity_set_fuse`) sets the ticks left before a primed TNT explodes, as vanilla's `PrimedTnt.setFuse` and Paper's `TNTPrimed#setFuseTicks` do. A fuse of `0` or less explodes it on its next tick. It returns `false`, changing nothing, for a negative count, a stale handle or an entity that is not primed TNT (a creeper's fuse is its swell, not this).
 
 ## Messages and visibility
 
@@ -90,6 +142,23 @@ across a leave and rejoin. The `player_tab_list_name_format` hook still has the 
 and chat, name tags and commands keep the real name. The call returns `false` for a stale
 handle, an unavailable server list or a player who is not online.
 
+To hide one entity, a player included, from one player's client only, call
+`entity.set_visible_to(host, viewer, false)` (Paper's `Player.hideEntity`): the entity tracker
+stops pairing it with that client and removes it from it on the next pass, while everyone else
+still sees it. `true` shows it again and `entity.visible_to(host, viewer)` reads the
+state. A mod uses it for a per-player hologram, a vanish that only some players honour, or a
+helper entity only its owner should see. It is kept by the entity's UUID until shown again or
+the viewer leaves; a rejoin starts with nothing hidden. A hidden player stays in the viewer's
+Tab list (`hide` lists them out too), and chat is not filtered. The calls return whether
+anything changed, and refuse with `EntityVisibilityRefusal`: `Client`, `Stale`, `NoConnection` for a
+fake viewer and `StaleEntity` for an entity handle that names nothing or the viewer's own player.
+
+To show an entity to one player only, spawn it with `player.spawn_viewer_entity(host, kind, pos)`.
+Its `AddEntity` goes to that client alone; the level does not hold it, and the other players do not
+see it. Move it with `player.move_viewer_entity(host, id, pos)` and remove it with
+`player.remove_viewer_entity(host, id)`. It has the type's default metadata only, and it is gone
+when the viewer leaves, so a mod that wants it kept re-spawns it on the next join.
+
 The reads `player.latency(host)`, `player.hidden(host)` and `player.nickname(host)`
 return what the calls above set. Latency is the Tab list ping in milliseconds
 (`Option<i32>`, `0` until the first keep-alive answer). `hidden` is the level
@@ -97,6 +166,18 @@ return what the calls above set. Latency is the Tab list ping in milliseconds
 in place of the player's name, `None` when there is none (`Option<Option<String>>`).
 An outer `None` means a stale or unavailable player for all three, a client or an
 unjoinable world for `hidden`, and no server list for `nickname`.
+
+## The server list
+
+Changing what the server list shows (a MOTD with colours or a random line, an icon, fake counts, a hidden player list):
+the `server_list_ping` hook is heard once for each status request, on the game thread, before the answer goes out.
+`protocol` and `virtual_host` (the host the client typed, without its port) are read-only; `motd` (`Text`),
+`favicon` (`Option<Vec<u8>>`, PNG bytes), `online`, `max_players`, `sample` (`Vec<(String, u128)>`, a name and the UUID
+the list shows) and `hide_players` start as vanilla's answer. `hide_players` leaves out the whole players part;
+`cancel` closes the connection without an answer. At most 64 sample entries are kept, and an icon that is not a PNG
+is dropped. An answer longer than a client reads (32767 characters) is replaced by the plain one, and so is any answer
+the mods do not finish within half a second. With no listener the request is not put to the game thread at all.
+The legacy ping of pre-1.7 clients is not asked.
 
 ## Chat lines and respawn
 
@@ -141,6 +222,8 @@ Reads accept `Host`; writes accept `ServerHost`.
 A second disconnect on a guest already leaving is a no-op and keeps the first reason.
 
 Vetoing a player's movement: the `player_move` hook hears each validated movement report whose position or rotation differs from the player's last reported location, after the server's own checks and before the report is committed, with the exact `from`, `to` and both rotations. The last reported location is kept on the player's connection, apart from the accepted position: it is the position given to the listener before it runs, and the destination of every server-side teleport (a join, a teleport in the level, a level change, a respawn, the resend of an unconfirmed teleport and the correction after a veto); `from` is that location. Set `cancel` and the report is not applied; the client is sent back to the accepted position and rotation. The veto adds no anticheat violation of its own, but the report was already seen by the server's own checks and by the anticheat's record of the client's ticks before the hook, so what a violation of those would have done still happens. The engine applies no threshold, so a mod that wants to ignore small moves compares the two positions itself (`(to - from).length() < 1.0 / 16.0` skips anything under 1/16 of a block). A held report is ruled on in the same tick; that player's later packets (further reports, the end of the client tick, pongs) wait in order behind it, then go on in that tick, so each later report is heard from the one before. A report is out of time at its 21st tick, counting the tick it was held at as the first: it is dropped with the correction, never committed, even when a ruling arrives after that; a disconnect, teleport or level change drops it cleanly. Not heard: the first tick in a level (the tick after a join or a level change; the second is heard), a player riding something (`vehicle_moved` hears the vehicle), any teleport (its confirmation is validated and committed without the hook, at the teleport's target, and so is the veto's own correction; a report that arrives while a teleport is unconfirmed is not heard either) and a passage crossing (its caller reads the position at once, so the report is committed in place). The first report after a teleport that passed validation is heard, with the teleport's destination as its `from`. With no listener nothing is held or copied; with one, the cost is a held report for each moving player a tick. A fault or an epoch timeout in a wasm listener answers nothing: it is not a veto and the report is committed, like every cancellable hook; the fault is logged, counted against the mod and stops the mod's group for the session. A native listener that never returns is out of scope: it blocks the game thread like any native code, and the 20-tick deadline covers only a report held pending across ticks.
+
+Reading every movement packet (an anticheat): `player_move` hears only a report whose position or rotation differs from the last reported one, so a stand-still or ground-flag packet never reaches it. The `player_move_packet(player, to, to_rotation, on_ground, has_position, has_rotation)` hook is heard once for every validated movement packet of a guest, also one that changes nothing, with the packet's own on-ground flag as the client sent it and whether the packet carried a position and a rotation (a status-only packet carries neither, and `to` and `to_rotation` then repeat the player's own). It is heard with the player's state swapped in, before `player_move` hears the same packet, and cannot cancel; a veto stays `player_move`'s. A guest is heard at most 8 packets a tick (`MOVE_PACKET_BUDGET`); the ones over it wait, in order, for the next ticks, at most 256 of them (the oldest are dropped past that), so one client cannot make the listeners run for its whole backlog at once. Not heard: the first tick in a level, a teleport's confirmation and a passage crossing. With no listener nothing is queued.
 
 ## Text conversions
 
@@ -244,3 +327,11 @@ a client. `player.set_statistics(host, json)` replaces all of them with a JSON o
 changing nothing, for text that is not an object or for a stale, unavailable or dead player. A statistic the text lacks
 goes back to 0, scoreboard criteria follow the changed values, and the client sees them on its next request. Server only;
 `player_stat_award` is not heard.
+
+Measuring a client's transaction round trip (a lag-compensating anticheat): send the player a `ping` with `player_send_packet` and hear the answer in `player_pong(player, name, id)`, which carries the number the ping had; the time between the two is finer than the keep-alive average `player_latency` reads. The engine's own pings (a recording's end-of-tick ping, whose id is the server tick) are answered here too, so pick ids that tell apart from small tick numbers. The hook is heard only for a pong that answers a ping the server sent on that connection, once per ping (an unsolicited or repeated pong, or an answer to a ping older than 30 seconds, is dropped), in order with the guest's other packets, with their state swapped in, and cannot cancel; with no listener nothing is queued.
+
+## Entity broadcast range
+
+`ConfigServerHost::entity_range_percent()` (server side) returns the entity broadcast range the server hosts with,
+in percent of vanilla's (`entity-broadcast-range-percentage` of server.properties). It is `100` when no server is
+hosting a world, which is vanilla's default. Read only.

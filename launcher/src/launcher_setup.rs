@@ -66,13 +66,7 @@ impl Launcher {
             });
         }
         let installed = backend::installed();
-        if settings
-            .selected
-            .as_ref()
-            .is_none_or(|s| !installed.contains(s))
-        {
-            settings.selected = installed.first().cloned();
-        }
+        settings.keep_installed_selection(&installed);
         // Pin the window's chrome (macOS title bar) to the choice before the theme reads
         // `window.appearance()`, so both draw the same look.
         titlebar::apply_appearance(window, settings.appearance);
@@ -94,9 +88,7 @@ impl Launcher {
             settings_query_focused: false,
             whats_new_open: None,
             settings_marked: 0,
-            credit_asked: false,
             version_menu: false,
-            credit_picture: None,
             sheet_size: None,
             mods_sticky: sticky::Sticky::default(),
             long_list: cull::Cull::default(),
@@ -130,6 +122,9 @@ impl Launcher {
             disk: Vec::new(),
             storage_report: None,
             storage_pending: false,
+            storage_tried: 0,
+            storage_trims: Default::default(),
+            storage_trimming: None,
             storage_confirm: None,
             storage_error: None,
             storage_revoke: None,
@@ -142,6 +137,7 @@ impl Launcher {
             importing_build: false,
             import_error: None,
             native_step: None,
+            native_stopping: false,
             native_prepare_first: None,
             native_progress: None,
             first_build: None,
@@ -202,6 +198,7 @@ impl Launcher {
             prepare_log: VecDeque::new(),
             log_revision: 0,
             prepare_error: None,
+            prepare_fix: None,
             client: None,
             client_error: None,
             client_started: None,

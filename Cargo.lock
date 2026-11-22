@@ -512,7 +512,6 @@ dependencies = [
  "dunce",
  "horizon-addresses",
  "horizon-mod-package",
- "horizon-mod-point-emit",
  "horizon-mod-source",
  "horizon-mod-surface",
  "horizon-mod-vocab",
@@ -1983,6 +1982,7 @@ dependencies = [
  "pollster",
  "rayon",
  "rustix 1.1.5",
+ "same-file",
  "serde",
  "serde_json",
  "sha1",
@@ -2115,7 +2115,6 @@ dependencies = [
 name = "horizon-engine-slots"
 version = "0.1.0"
 dependencies = [
- "horizon-mod-api-gen",
  "horizon-mod-vocab",
 ]
 
@@ -2399,14 +2398,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "horizon-mod-point-emit"
-version = "0.1.0"
-dependencies = [
- "horizon-mod-package",
- "serde",
-]
-
-[[package]]
 name = "horizon-mod-point-shape"
 version = "0.1.0"
 dependencies = [
@@ -2420,16 +2411,6 @@ dependencies = [
 [[package]]
 name = "horizon-mod-points"
 version = "0.1.0"
-dependencies = [
- "horizon-engine-slots",
- "horizon-mod-api",
- "horizon-mod-api-gen",
- "horizon-mod-api-macros",
- "horizon-mod-point-shape",
- "quote",
- "serde_json",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "horizon-mod-render"
@@ -2499,15 +2480,12 @@ version = "0.1.0"
 dependencies = [
  "horizon-client-core",
  "horizon-core",
- "horizon-engine-slots",
  "horizon-guest-stack",
  "horizon-java-properties",
  "horizon-mod-api",
  "horizon-mod-api-gen",
  "horizon-mod-api-macros",
  "horizon-mod-package",
- "horizon-mod-point-emit",
- "horizon-mod-points",
  "horizon-mod-runtime",
  "horizon-threads",
  "horizon-world",
@@ -2520,6 +2498,7 @@ dependencies = [
  "wasmparser 0.261.0",
  "wasmtime",
  "wat",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2541,7 +2520,6 @@ name = "horizon-modding-examples"
 version = "0.0.0"
 dependencies = [
  "horizon-mod-api",
- "horizon-mod-points",
 ]
 
 [[package]]

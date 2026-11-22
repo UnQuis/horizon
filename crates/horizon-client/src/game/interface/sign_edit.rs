@@ -555,10 +555,13 @@ impl Game<'_> {
     /// the block, then the editor, on its client, and the guest may write on it.
     pub(super) fn lan_open_sign_editor(&mut self, conn: u32, edit: SignEditor) {
         let pos = [edit.pos.0, edit.pos.1, edit.pos.2];
-        let state = self.world.block(pos[0], pos[1], pos[2]).0 as i32;
         if let Some(host) = self.lan.as_mut() {
-            host.hub
-                .send_to(conn, &C::BlockUpdate(play::BlockUpdate { pos, state }));
+            if !host.hub.terrain_metadata_visible(conn, &self.world, pos) {
+                // The reservation `open_text_edit` made must not outlive the denied editor.
+                self.world.block_entities.set_sign_editor(edit.pos, None);
+                return;
+            }
+            host.hub.send_block_correction(conn, &self.world, pos);
             host.hub.send_to(
                 conn,
                 &C::OpenSignEditor(play::OpenSignEditor {
@@ -1017,9 +1020,16 @@ impl Game<'_> {
         horizon_client::widgets::narratable(|| {
             horizon_client::widgets::Narratable::button(done_label(), [bx, by, 200.0, 20.0], true)
         });
+        // AbstractButton.renderDefaultSprite: the highlighted sprite while hovered.
+        let (mx, my) = self.cursor;
+        let hovered = mx >= bx && mx < bx + 200.0 && my >= by && my < by + 20.0;
         batch.sprite_scaled(
             atlas,
-            "gui/sprites/widget/button",
+            if hovered {
+                "gui/sprites/widget/button_highlighted"
+            } else {
+                "gui/sprites/widget/button"
+            },
             bx,
             by,
             200.0,
