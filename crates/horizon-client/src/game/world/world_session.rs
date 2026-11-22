@@ -129,6 +129,7 @@ impl Game<'_> {
             return Ok(());
         }
         world_loading::world_data_used();
+        self.tfr_world_changed(self.dim, "world open");
         if self.defer_world_entry(PendingWorldEntry::Local {
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
@@ -215,6 +216,7 @@ impl Game<'_> {
     /// then `finish_open_world`).
     #[cfg(test)]
     pub(super) fn load_world(&mut self, request: world_loading::WorldRequest) -> Result<()> {
+        self.tfr_world_changed(self.dim, "world load");
         let prepared = self.prepare_world_and_rules(request)?;
         self.finish_open_world(prepared)
     }
@@ -293,6 +295,8 @@ impl Game<'_> {
     }
 
     pub(super) fn close_world(&mut self) -> Result<()> {
+        // TFR history is world/view-state specific; never carry it across worlds/dimensions.
+        self.tfr_world_changed(self.dim, "world closed");
         self.destroying.clear();
         // Pause-menu and death-screen exits use the normal world-close action.
         // A standalone replay owns a synthetic remote session, so it must go

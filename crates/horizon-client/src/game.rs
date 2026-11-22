@@ -171,6 +171,7 @@ use horizon_client::{
     world::World,
 };
 use horizon_client::{fast_hash::FxHashMap, held::Source};
+use horizon_client_render::tfr::core::{WorldEpoch, dimension_id};
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
     geometry::{Aabb, Direction},
@@ -1151,6 +1152,9 @@ struct Game<'a> {
     /// What `window_resize` last reported: the physical size and the GUI settings behind the scaled size.
     resize_state: Option<ResizeState>,
     renderer: Option<Renderer>,
+    /// TFR world identity: advanced on world load/reload/dimension travel and applied to the
+    /// renderer before each frame, so reprojection history never crosses world instances.
+    tfr_world: WorldEpoch,
     /// Avoid an endless rebuild loop if the new device is lost as well.
     last_device_recovery: Option<Instant>,
     /// CPU geometry storage retained across frames, including empty/title frames.
@@ -2047,6 +2051,28 @@ struct Game<'a> {
     wasm_dispatch_failures: std::rc::Rc<std::cell::Cell<u64>>,
 }
 use horizon_gameplay::dim::Dim;
+
+impl Game<'_> {
+    /// Apply the current TFR world identity to the renderer, including a fresh renderer after a
+    /// device change. Called every frame; a changed key invalidates history in the renderer.
+    fn apply_tfr_world(&mut self) {
+        let key = self.tfr_world.key();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_tfr_world(key);
+        }
+    }
+
+    /// A world opened, reloaded, closed or entered from another dimension: advance the epoch and
+    /// keep the explicit invalidation (history must never survive such a change).
+    pub(super) fn tfr_world_changed(&mut self, dim: Dim, reason: &'static str) {
+        self.tfr_world.observe(dimension_id(dim.id()));
+        self.tfr_world.reload();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.invalidate_tfr(reason);
+        }
+        self.apply_tfr_world();
+    }
+}
 /// `Inventory.add` on a player's 36 slots (hotbar first) and off hand,
 /// `max` the stack's own maximum: onto equal stacks first
 /// (`getSlotWithRemainingSpace`: the selected slot, the off hand, then the
@@ -8755,6 +8781,9 @@ impl Game<'_> {
                 use horizon_client::client_perf::request::GpuSwitch;
                 let capture_gpu = self.profile.gpu();
                 let recording = capture_gpu != GpuSwitch::Off;
+                // Applied every frame so a recreated renderer (device change, settings, split)
+                // also gets the current world identity before its first TFR decision.
+                renderer.set_tfr_world(self.tfr_world.key());
                 renderer.set_pass_timing(debug_passes || self.gpu_passes || recording);
                 renderer.set_keep_timed_frames(recording);
                 renderer.set_pass_detail(self.gpu_pass_detail || capture_gpu == GpuSwitch::Detail);
@@ -10549,6 +10578,7 @@ impl<'a> Game<'a> {
             window: None,
             resize_state: None,
             renderer: None,
+            tfr_world: WorldEpoch::unknown(),
             last_device_recovery: None,
             entity_vertices: Vec::new(),
             dynamic_lights: Vec::new(),

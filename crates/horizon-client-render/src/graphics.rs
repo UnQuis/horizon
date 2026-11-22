@@ -785,6 +785,27 @@ impl Graphics {
     pub fn lod_distance_on(&self, info: &wgpu::AdapterInfo) -> u32 {
         lod_distance_capped(self.lod_distance, info)
     }
+
+    /// TFR configuration snapshot (sanitized). TFR has priority over frame generation.
+    pub fn tfr_config(&self) -> crate::tfr::config::TfrConfig {
+        crate::tfr::config::TfrConfig {
+            enabled: self.tfr,
+            reprojection_strength: self.tfr_reprojection_strength,
+            history_stability: self.tfr_history_stability,
+            cut_distance: self.tfr_cut_distance,
+            cut_angle_deg: self.tfr_cut_angle,
+        }
+        .sanitized()
+    }
+
+    /// Effective frame generation mode (TFR disables frame generation).
+    pub fn frame_generation_effective(&self) -> FrameGeneration {
+        if self.tfr {
+            FrameGeneration::Off
+        } else {
+            self.frame_generation
+        }
+    }
     /// Whether the selected packs leave vanilla's block models in place.
     /// Horizon's occlusion assumptions (entity and leaf culling) hold only
     /// for those: a pack can replace an opaque cube's model or a leaf's.
@@ -963,6 +984,16 @@ pub struct Graphics {
     /// not `shaderPack`, which versions before the clean-room rewrite saved and which stays
     /// ignored.
     pub shader_pack: String,
+    /// Temporal Frame Reprojection (clean-room, off by default): alternates real/synthetic frames.
+    pub tfr: bool,
+    /// TFR reprojection strength `[0.0, 1.0]`.
+    pub tfr_reprojection_strength: f32,
+    /// TFR history stability `[0.0, 0.35]`.
+    pub tfr_history_stability: f32,
+    /// TFR camera cut distance threshold in world units `[0.25, 16.0]`.
+    pub tfr_cut_distance: f32,
+    /// TFR camera cut angle threshold in degrees `[5.0, 90.0]`.
+    pub tfr_cut_angle: f32,
 }
 impl Default for Graphics {
     fn default() -> Self {
@@ -1022,6 +1053,11 @@ impl Default for Graphics {
             api: GraphicsApi::Auto,
             translucent_batching: true,
             shader_pack: String::new(),
+            tfr: false,
+            tfr_reprojection_strength: 1.0,
+            tfr_history_stability: 0.06,
+            tfr_cut_distance: 9.25,
+            tfr_cut_angle: 14.0,
         }
     }
 }
@@ -1182,6 +1218,35 @@ impl Graphics {
                         .unwrap_or(1)
                 }
                 "frameGeneration" => g.frame_generation = FrameGeneration::parse(value),
+                "tfr" => g.tfr = flag(g.tfr),
+                "tfrReprojectionStrength" => {
+                    g.tfr_reprojection_strength = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_reprojection_strength)
+                }
+                "tfrHistoryStability" => {
+                    g.tfr_history_stability = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_history_stability)
+                }
+                "tfrCutDistance" => {
+                    g.tfr_cut_distance = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_cut_distance)
+                }
+                "tfrCutAngle" => {
+                    g.tfr_cut_angle = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(g.tfr_cut_angle)
+                }
                 "hdr" => g.hdr = HdrMode::parse(value, g.hdr),
                 "hdrLook" => look = HdrLook::parse(value),
                 "hdrLighting" => lighting = Some(flag(lighting.unwrap_or(true))),
@@ -1221,6 +1286,13 @@ impl Graphics {
             }
             _ => 0,
         });
+        g.tfr_reprojection_strength = g.tfr_reprojection_strength.clamp(0.0, 1.0);
+        g.tfr_history_stability = g.tfr_history_stability.clamp(0.0, 0.35);
+        g.tfr_cut_distance = g.tfr_cut_distance.clamp(0.25, 16.0);
+        g.tfr_cut_angle = g.tfr_cut_angle.clamp(5.0, 90.0);
+        if g.tfr {
+            g.frame_generation = FrameGeneration::Off;
+        }
         g.hdr_look = look.unwrap_or(match lighting {
             Some(false) => HdrLook::Vanilla,
             _ => HdrLook::Horizon,
@@ -1293,6 +1365,15 @@ impl Graphics {
             bool_text(self.translucent_batching),
             self.gpu_culling.key(),
             self.parallel_tick.name(),
+        );
+        // TFR settings (appended to keep format stable for older readers of fixed prefix where possible).
+        text += &format!(
+            "tfr:{}\ntfrReprojectionStrength:{}\ntfrHistoryStability:{}\ntfrCutDistance:{}\ntfrCutAngle:{}\n",
+            bool_text(self.tfr),
+            self.tfr_reprojection_strength,
+            self.tfr_history_stability,
+            self.tfr_cut_distance,
+            self.tfr_cut_angle,
         );
         if let Some(driver) = &self.hdr_failed_start {
             text += &format!("hdrFailedStart:{driver}\n");
@@ -1380,6 +1461,30 @@ pub use preset::apply_preset;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-edited file with NaN/infinite TFR values keeps the current setting instead of
+    /// storing a non-finite float that would break the UI slider and the config sanitizer.
+    #[test]
+    fn non_finite_tfr_settings_keep_the_current_value() {
+        for key in [
+            "tfrReprojectionStrength",
+            "tfrHistoryStability",
+            "tfrCutDistance",
+            "tfrCutAngle",
+        ] {
+            for value in ["NaN", "inf", "-inf"] {
+                let file = format!("{key}:{value}\n");
+                let g = Graphics::parse(&file);
+                let v = match key {
+                    "tfrReprojectionStrength" => g.tfr_reprojection_strength,
+                    "tfrHistoryStability" => g.tfr_history_stability,
+                    "tfrCutDistance" => g.tfr_cut_distance,
+                    _ => g.tfr_cut_angle,
+                };
+                assert!(v.is_finite(), "{file}");
+            }
+        }
+    }
 
     /// UI Brightness is saved in nits, 0 for Auto. An older file's share of Paper White reads
     /// as Auto at 100% or with Paper White on Auto, else as that share of it to the nearest step.
@@ -1663,6 +1768,11 @@ mod tests {
             present_mode: PresentMode::Mailbox,
             pacing: Pacing::Precise,
             workers: 6,
+            tfr: false,
+            tfr_reprojection_strength: 1.0,
+            tfr_history_stability: 0.06,
+            tfr_cut_distance: 9.25,
+            tfr_cut_angle: 14.0,
             parallel_tick: ParallelTickMode::Auto,
             overlay: Overlay::Graph,
             resolution_scale: 75,

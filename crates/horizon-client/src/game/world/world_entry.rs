@@ -729,6 +729,8 @@ impl Game<'_> {
         stack: &functions::PackStack,
         root: &std::path::Path,
     ) -> Result<PreparedWorldReload> {
+        // TFR history is bound to the world instance: a reload makes it stale.
+        self.tfr_world_changed(self.dim, "world reload");
         let (tables, health, datapack_registries) = self.stage_world_tables(stack, true, root)?;
         let items = tables
             .as_ref()

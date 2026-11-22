@@ -1193,6 +1193,7 @@ impl Game<'_> {
             }
             let mut trip = self.server_trips.remove(k);
             if trip.placed {
+                self.tfr_world_changed(trip.dim, "dimension changed");
                 self.tell_mods_changed_dimension(trip.conn, trip.left, trip.dim);
                 continue;
             }
@@ -1240,6 +1241,7 @@ impl Game<'_> {
                             host.hub.guests[i].position == [at.x, at.y, at.z]
                         }) =>
                     {
+                        self.tfr_world_changed(trip.dim, "dimension changed");
                         self.tell_mods_changed_dimension(trip.conn, trip.left, trip.dim);
                         // PlayerRespawnPositionEvent: the column is the point.
                         let pitch = self.lan.as_ref().map_or(0.0, |h| h.hub.guests[i].pitch);
