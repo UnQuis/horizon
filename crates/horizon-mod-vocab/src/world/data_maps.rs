@@ -1,11 +1,11 @@
 //! Typed reads of data maps (NeoForge's `DataMapType` and `IWithData.getData`): the value the
 //! server's data packs and mods' files gave a registry entry, after every pack was applied.
 use crate::{
-    AttachmentError, AttachmentType, Backend, BiomeKey, BlockEntityTypeKey, BlockKey, DataMapType,
+    AttachmentCodec, AttachmentError, AttachmentType, Backend, BiomeKey, BlockEntityTypeKey, BlockKey, DataMapType,
     EffectKey, EnchantmentKey, EntityTypeKey, FluidKey, Holder, Host, ItemKey, NoBackend,
     ProfessionKey, ServerHost,
 };
-use horizon_core::nbt::Tag;
+use horizon_core::nbt::{Limits, NamedTag, Tag};
 use std::collections::BTreeMap;
 
 /// A data map a mod registers and reads, typed (NeoForge's `DataMapType<R, T>`): its id, the
@@ -257,6 +257,13 @@ pub enum DataMapProjectionError {
     },
     /// The attachment was not declared with `sync: true`.
     NotSync,
+    /// The projection's encoded form is too large to send safely.
+    TooLarge {
+        /// The encoded size in bytes.
+        bytes: usize,
+        /// The largest size this projection allows.
+        limit: usize,
+    },
     /// Writing or queuing the attachment sync failed.
     Attachment(AttachmentError),
 }
@@ -294,6 +301,20 @@ pub fn project_data_map<M: DataMap>(
     Ok(projected)
 }
 
+/// The bytes an attachment value takes when the engine encodes its sync
+/// message. A value too large for the connection is never written, so other
+/// pending changes for the holder still reach clients.
+fn encoded_projection_len<T>(codec: &AttachmentCodec<T>, value: &T) -> Result<usize, AttachmentError> {
+    let compound = (codec.encode)(value)?;
+    let named = NamedTag {
+        name: "".into(),
+        tag: Tag::Compound(compound),
+    };
+    horizon_core::nbt::write_named(&named, Limits::network())
+        .map(|bytes| bytes.len())
+        .map_err(|_| AttachmentError::Encode)
+}
+
 /// A server-side declaration that projects one data map into a synced attachment.
 ///
 /// Data maps stay server-only. A mod relying on a small client-side view reads
@@ -308,21 +329,44 @@ where
 {
     map: M,
     attachment: AttachmentType<BTreeMap<String, M::Value>>,
+    max_bytes: usize,
 }
 
 impl<M: DataMap> DataMapProjection<M>
 where
     M::Value: Clone + Send + Sync + 'static,
 {
+    /// The largest encoded projection sent by default. An attachment sync that
+    /// cannot be written leaves every other pending change for that holder
+    /// unsent, so keep this well below a payload frame.
+    pub const DEFAULT_MAX_BYTES: usize = 256 * 1024;
+
     /// A projection of `map` into `attachment`, which must have `sync: true` and a codec.
     pub fn new(map: M, attachment: AttachmentType<BTreeMap<String, M::Value>>) -> Self {
-        Self { map, attachment }
+        Self::with_limit(map, attachment, Self::DEFAULT_MAX_BYTES)
+    }
+
+    /// The same projection with an explicit encoded-size limit.
+    pub fn with_limit(
+        map: M,
+        attachment: AttachmentType<BTreeMap<String, M::Value>>,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            map,
+            attachment,
+            max_bytes,
+        }
     }
 
     /// Read the map now, replace the projection at `holder` and queue its sync.
     /// `set` already queues the sync of a `sync: true` attachment, so this does
     /// not send a second notification. Call this from a server hook after the
     /// data load, not from a client.
+    ///
+    /// The encoded size is checked before the write: an oversized projection is
+    /// refused without touching the holder's attachment, so unrelated pending
+    /// sync changes are still sent.
     pub fn sync(
         &self,
         host: &mut dyn ServerHost,
@@ -332,6 +376,18 @@ where
             return Err(DataMapProjectionError::NotSync);
         }
         let projected = project_data_map(&*host, &self.map)?;
+        let codec = self
+            .attachment
+            .codec
+            .as_ref()
+            .ok_or(AttachmentError::InvalidSyncPolicy)?;
+        let bytes = encoded_projection_len(codec, &projected)?;
+        if bytes > self.max_bytes {
+            return Err(DataMapProjectionError::TooLarge {
+                bytes,
+                limit: self.max_bytes,
+            });
+        }
         self.attachment.set(host, holder, projected)?;
         Ok(())
     }
@@ -504,6 +560,24 @@ mod tests {
             DataMapProjection::new(Hardness, non_sync).sync(&mut host, Holder::Level),
             Err(DataMapProjectionError::NotSync)
         );
+    }
+
+    #[test]
+    fn a_projection_size_is_measured_before_the_attachment_is_written() {
+        let codec = AttachmentCodec::<BTreeMap<String, i64>> {
+            encode: |value| {
+                let mut compound = crate::Compound::new();
+                for (name, amount) in value {
+                    compound.insert(name.as_str().into(), Tag::Int(*amount as i32));
+                }
+                Ok(compound)
+            },
+            decode: |_| Ok(BTreeMap::new()),
+        };
+        let value = BTreeMap::from([("test:stone".to_owned(), 3_i64)]);
+        let bytes = encoded_projection_len(&codec, &value).expect("value encodes");
+        assert!(bytes > 0);
+        assert!(bytes <= DataMapProjection::<Hardness>::DEFAULT_MAX_BYTES);
     }
 
     #[test]
