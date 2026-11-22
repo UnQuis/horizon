@@ -90,17 +90,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // If invalid on first iteration, try dst-uv motion once as a hint; otherwise stop.
     // After search, require motion at final src to be valid (no cycling/guessing).
     var src = clamp_uv(uv);
+    // Keep the unclamped candidate: clamping hides a pan-revealed strip and would stretch the
+    // border texel instead of using the hole fill. Clamp only coordinates used for sampling.
+    var src_raw = uv;
     var valid = false;
     for (var i: i32 = 0; i < 3; i = i + 1) {
         let m = textureSampleLevel(motion_tex, motion_sampler, src, 0.0);
         if (m.z > 0.5) {
-            src = clamp_uv(uv - m.xy * strength);
+            src_raw = uv - m.xy * strength;
+            src = clamp_uv(src_raw);
             valid = true;
         } else {
             if (i == 0) {
                 let mc = textureSampleLevel(motion_tex, motion_sampler, uv, 0.0);
                 if (mc.z > 0.5) {
-                    src = clamp_uv(uv - mc.xy * strength);
+                    src_raw = uv - mc.xy * strength;
+                    src = clamp_uv(src_raw);
                     valid = true;
                 }
             }
@@ -113,7 +118,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var color: vec4<f32>;
-    if (!valid || any(src < vec2<f32>(0.0)) || any(src > vec2<f32>(1.0))) {
+    if (!valid || any(src_raw < vec2<f32>(0.0)) || any(src_raw > vec2<f32>(1.0))) {
         color = deterministic_fill(uv);
     } else {
         let msrc = textureSampleLevel(motion_tex, motion_sampler, src, 0.0);
