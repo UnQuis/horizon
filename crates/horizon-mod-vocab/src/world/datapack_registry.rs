@@ -285,23 +285,26 @@ impl DatapackFieldKind {
                 values.len() <= *max_len as usize && values.iter().all(|value| element.accepts(value))
             }
             (Self::Object { fields, max_len }, DatapackValue::Object(values)) => {
-                values.len() <= fields.len()
-                    && values
-                        .iter()
-                        .all(|(name, _)| fields.iter().any(|field| { field.name == *name }))
-                    && fields.iter().all(|field| {
-                        values
-                            .iter()
-                            .find(|(name, _)| *name == field.name)
-                            .map(|(_, value)| field.kind.accepts(value))
-                            .unwrap_or_else(|| {
-                                field
-                                    .default
-                                    .as_ref()
-                                    .is_some_and(|default| field.kind.accepts(default))
-                            })
+                let mut seen = std::collections::BTreeSet::new();
+                if values.len() > fields.len()
+                    || !values.iter().all(|(name, _)| {
+                        fields.iter().any(|field| { field.name == *name }) && seen.insert(name.as_str())
                     })
-                    && object_json_len(values) <= *max_len as usize
+                {
+                    return false;
+                }
+                fields.iter().all(|field| {
+                    values
+                        .iter()
+                        .find(|(name, _)| *name == field.name)
+                        .map(|(_, value)| field.kind.accepts(value))
+                        .unwrap_or_else(|| {
+                            field
+                                .default
+                                .as_ref()
+                                .is_some_and(|default| field.kind.accepts(default))
+                        })
+                }) && object_json_len(values) <= *max_len as usize
             }
             _ => false,
         }
@@ -362,6 +365,64 @@ fn object_json_len(values: &[(String, DatapackValue)]) -> usize {
             text.len()
         })
         .unwrap_or(usize::MAX)
+}
+
+/// Canonicalize shorthand ids in every default of a schema, including fields
+/// nested in `List` and `Object` kinds. A top-level `stone` and a nested
+/// `stone` must be treated the same way.
+pub fn canonicalize_datapack_defaults(
+    fields: &mut [DatapackField],
+) -> Result<(), DatapackRegistrationError> {
+    for field in fields.iter_mut() {
+        let kind = field.kind.clone();
+        if let Some(value) = field.default.as_mut() {
+            canonicalize_value(&kind, value)?;
+        }
+        canonicalize_child_defaults(&mut field.kind)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_child_defaults(kind: &mut DatapackFieldKind) -> Result<(), DatapackRegistrationError> {
+    match kind {
+        DatapackFieldKind::List { element, .. } => canonicalize_child_defaults(element),
+        DatapackFieldKind::Object { fields, .. } => canonicalize_datapack_defaults(fields),
+        _ => Ok(()),
+    }
+}
+
+fn canonicalize_value(
+    kind: &DatapackFieldKind,
+    value: &mut DatapackValue,
+) -> Result<(), DatapackRegistrationError> {
+    match (kind, value) {
+        (
+            DatapackFieldKind::Identifier | DatapackFieldKind::Reference { .. },
+            DatapackValue::Text(id),
+        ) => {
+            *id = Identifier::parse(id)
+                .map_err(|_| DatapackRegistrationError::InvalidDefault)?
+                .to_string();
+            Ok(())
+        }
+        (DatapackFieldKind::List { element, .. }, DatapackValue::List(values)) => {
+            for value in values {
+                canonicalize_value(element, value)?;
+            }
+            Ok(())
+        }
+        (DatapackFieldKind::Object { fields, .. }, DatapackValue::Object(values)) => {
+            // Child schema defaults were already canonicalized by
+            // canonicalize_child_defaults on this kind.
+            for (name, value) in values {
+                if let Some(field) = fields.iter().find(|field| field.name == *name) {
+                    canonicalize_value(&field.kind, value)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Checks a schema at registration: field count and names, kinds and defaults.
@@ -1002,6 +1063,47 @@ mod tests {
                 field: "display".into()
             }
         );
+    }
+
+    #[test]
+    fn nested_id_defaults_canonicalize_and_duplicate_names_are_refused() {
+        let mut fields = vec![DatapackField::required(
+            "choice",
+            DatapackFieldKind::Object {
+                fields: vec![DatapackField::with_default(
+                    "id",
+                    DatapackFieldKind::Identifier,
+                    DatapackValue::Text("stone".into()),
+                )],
+                max_len: 256,
+            },
+        )];
+        canonicalize_datapack_defaults(&mut fields).expect("shorthand normalizes");
+        assert_eq!(check_schema(&fields), Ok(()));
+        let DatapackFieldKind::Object { fields: children, .. } = &fields[0].kind else {
+            panic!("object kind");
+        };
+        assert_eq!(
+            children[0].default,
+            Some(DatapackValue::Text("minecraft:stone".into()))
+        );
+
+        let object = DatapackFieldKind::Object {
+            fields: vec![
+                DatapackField::required("a", DatapackFieldKind::Bool),
+                DatapackField::with_default(
+                    "b",
+                    DatapackFieldKind::Bool,
+                    DatapackValue::Bool(false),
+                ),
+            ],
+            max_len: 256,
+        };
+        let duplicate = DatapackValue::Object(vec![
+            ("a".into(), DatapackValue::Bool(true)),
+            ("a".into(), DatapackValue::Text("bad".into())),
+        ]);
+        assert!(!object.accepts(&duplicate));
     }
 
     #[test]
