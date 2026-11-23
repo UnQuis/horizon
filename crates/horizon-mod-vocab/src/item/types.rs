@@ -340,10 +340,12 @@ pub enum EquipmentSlotGroup {
 
 /// A mod-defined equipment slot group's name, for example `curios:ring`.
 ///
-/// Use this when a modifier belongs to a slot Horizon does not name in
+/// Use this to record a modifier for a slot Horizon does not name in
 /// [`EquipmentSlotGroup`]. The name travels as text and is kept unchanged, so
-/// the game can match it against a mod's own slot; the vanilla enum and its
-/// wire layout are not extended.
+/// the stack's component stores and round-trips it. Equipment evaluators only
+/// match vanilla group names today, so a named group does **not** yet make its
+/// modifier apply; this is storage, not custom-slot behaviour. The vanilla enum
+/// and its wire layout are not extended.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, horizon_mod_api_macros::Wire)]
 #[wire(via = String)]
 #[non_exhaustive]
@@ -504,9 +506,9 @@ impl ItemAttributeModifiers {
     /// Adds `modifier` on `attribute` in a mod-defined slot group, unless
     /// `attribute` already has a modifier with its id. Whether it was added.
     /// The name is written into the stack's `attribute_modifiers` component
-    /// unchanged; the game keeps it through reads and matches it against the
-    /// slot a mod reports. With no mod listening to `item_attribute_modifier`
-    /// nothing is copied back.
+    /// unchanged and survives later reads. Equipment evaluators only match
+    /// vanilla group names, so the modifier is stored but does not yet apply.
+    /// With no mod listening to `item_attribute_modifier` nothing is copied back.
     pub fn add_named(
         &mut self,
         attribute: Identifier,

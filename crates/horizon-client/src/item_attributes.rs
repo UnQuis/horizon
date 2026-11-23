@@ -78,8 +78,10 @@ fn entry(row: &ModifierRow) -> Option<ItemAttributeModifier> {
     if let Some((_, group)) = SLOT_GROUPS.iter().find(|(name, _)| *name == row.slot) {
         return Some(ItemAttributeModifier::new(attribute, modifier, *group));
     }
-    // A name the vanilla groups do not use is a mod's slot group. Keep its
-    // text exactly: the game matches it against the slot a mod reports.
+    // A name the vanilla groups do not use is a mod's slot group. Keep its text
+    // exactly so it survives the round-trip; equipment evaluators do not apply
+    // named groups yet (they only match vanilla names), so this stores the
+    // modifier rather than making it take effect.
     NamedSlotGroup::new(row.slot.clone())
         .ok()
         .map(|group| ItemAttributeModifier::named(attribute, modifier, group))
