@@ -2339,11 +2339,27 @@ impl Game<'_> {
     ) {
         self.fire_player_item_frame_change(player, name, entity_id, action, item, rotation);
     }
-    /// Mending is about to repair a server player's item with experience from an
-    /// orb. `repair` is the durability vanilla would restore and `experience`
-    /// the orb's value; what a listener leaves in them is what the game applies.
-    /// Server-side.
+    /// Mending repaired a server player's item with experience from an orb.
+    /// `repair` is durability restored and `experience` is the orb's value.
+    /// Server-side. Kept with its original name, module path and `u32` signature
+    /// for source-level injections; listeners cannot change the values through
+    /// this form. The game uses [`Self::native_player_item_mend_editable`].
     pub(in crate::game) fn native_player_item_mend(
+        &mut self,
+        player: u128,
+        name: &str,
+        item: &str,
+        repair: u32,
+        experience: u32,
+    ) {
+        let mut repair = repair;
+        let mut experience = experience;
+        self.native_player_item_mend_editable(player, name, item, &mut repair, &mut experience);
+    }
+    /// The editable form of [`Self::native_player_item_mend`], used by the game
+    /// and named as the hook's target: what a listener leaves in `repair` and
+    /// `experience` is what the caller applies. Server-side.
+    pub(in crate::game) fn native_player_item_mend_editable(
         &mut self,
         player: u128,
         name: &str,

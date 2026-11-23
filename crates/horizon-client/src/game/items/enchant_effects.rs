@@ -1054,11 +1054,22 @@ impl Game<'_> {
                     .find(|p| p.uuid() == player)
                     .and_then(|p| self.player_name(p))
             {
-                self.native_player_item_mend(player, &name, &item, &mut repair, &mut experience);
+                self.native_player_item_mend_editable(
+                    player,
+                    &name,
+                    &item,
+                    &mut repair,
+                    &mut experience,
+                );
             }
             stack.damage = stack.damage.saturating_sub(repair);
             *self.player_slot_mut(slot) = Some(stack);
             let left = experience.saturating_sub(spent);
+            // A listener can refuse the repair without spending XP. Nothing
+            // changed, so trying the same stack again would loop forever.
+            if repair == 0 && left >= amount {
+                return left;
+            }
             if left == 0 {
                 return 0;
             }
