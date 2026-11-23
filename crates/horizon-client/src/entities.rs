@@ -1884,20 +1884,6 @@ pub struct StandStep {
 }
 #[cfg(test)]
 impl ArmorStand {
-    /// Keep an armor stand's powder-snow subject absent unless vanilla's
-    /// leather-boots answer or a listener needs it. An always-present subject
-    /// would turn `CollisionContext::position` into a living-entity context for
-    /// every contextual collision, not just powder snow.
-    fn powder_snow_subject(&self) -> Option<crate::collisions::PowderSnowSubject<'static>> {
-        let leather_boots = self.feet_are_leather_boots();
-        (leather_boots || mod_api::__private::listened(mod_api::HookId::PowderSnowWalkable))
-            .then_some(crate::collisions::PowderSnowSubject {
-                entity_id: Some(self.id),
-                leather_boots,
-                ..Default::default()
-            })
-    }
-
     /// A whole travel for the unit tests, with no bubble column.
     pub(crate) fn tick(
         &mut self,
@@ -1920,6 +1906,20 @@ impl ArmorStand {
     }
 }
 impl ArmorStand {
+    /// Keep an armor stand's powder-snow subject absent unless vanilla's
+    /// leather-boots answer or a listener needs it. An always-present subject
+    /// would turn `CollisionContext::position` into a living-entity context for
+    /// every contextual collision, not just powder snow.
+    fn powder_snow_subject(&self) -> Option<crate::collisions::PowderSnowSubject<'static>> {
+        let leather_boots = self.feet_are_leather_boots();
+        (leather_boots || mod_api::__private::listened(mod_api::HookId::PowderSnowWalkable))
+            .then_some(crate::collisions::PowderSnowSubject {
+                entity_id: Some(self.id),
+                leather_boots,
+                ..Default::default()
+            })
+    }
+
     pub const SLOTS: [&'static str; 6] = ["mainhand", "offhand", "feet", "legs", "chest", "head"];
     /// The `Pose` compound's keys.
     pub const POSE_KEYS: [&'static str; 6] =

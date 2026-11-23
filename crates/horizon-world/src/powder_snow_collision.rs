@@ -198,9 +198,10 @@ mod tests {
             override_answer: Some(true),
             asked: Vec::new(),
         };
-        assert_eq!(
-            powder_snow_collision_shape(&mut overridden, at, &context).unwrap(),
-            VoxelShape::block()
+        assert!(
+            powder_snow_collision_shape(&mut overridden, at, &context)
+                .unwrap()
+                .is_block()
         );
         assert_eq!(overridden.asked, vec![at]);
 
@@ -208,9 +209,10 @@ mod tests {
             override_answer: None,
             asked: Vec::new(),
         };
-        assert_eq!(
-            powder_snow_collision_shape(&mut vanilla, at, &context).unwrap(),
-            VoxelShape::empty()
+        assert!(
+            powder_snow_collision_shape(&mut vanilla, at, &context)
+                .unwrap()
+                .is_empty_identity()
         );
         // The mod point is still consulted once, with the snow position, and
         // passes vanilla's false answer through unchanged.
