@@ -1054,13 +1054,7 @@ impl Game<'_> {
                     .find(|p| p.uuid() == player)
                     .and_then(|p| self.player_name(p))
             {
-                self.native_player_item_mend_editable(
-                    player,
-                    &name,
-                    &item,
-                    &mut repair,
-                    &mut experience,
-                );
+                self.native_player_item_mend(player, &name, &item, &mut repair, &mut experience);
             }
             stack.damage = stack.damage.saturating_sub(repair);
             *self.player_slot_mut(slot) = Some(stack);

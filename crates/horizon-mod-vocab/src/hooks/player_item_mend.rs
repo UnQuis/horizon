@@ -14,7 +14,6 @@ pub trait Hooks {
         side = "server",
         contract = "listen",
         version = 2,
-        target = "horizon_client::game::native_hooks::Game<'_>::native_player_item_mend_editable",
         neoforge = "none (NeoForge has no such event)"
     )]
     fn player_item_mend();
