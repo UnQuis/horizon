@@ -174,4 +174,46 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// The override must be observed through the real collision-shape path,
+    /// not only by calling `powder_snow_mod_walkable` directly. The mock's
+    /// vanilla answer is false (no walkable tag, no leather boots).
+    #[test]
+    fn collision_shape_uses_the_mod_point_at_the_snow_position() {
+        use crate::collision_context::{CollisionEntity, CollisionItem, EntityContextKind};
+
+        let at = BlockPos::new(3, 64, 5);
+        let context = CollisionContext::for_entity(
+            CollisionEntity {
+                identity: EntityIdentity(1),
+                kind: EntityContextKind::Living,
+                y: 66.0,
+                descending: false,
+                main_hand: Some(CollisionItem::EMPTY),
+            },
+            false,
+        );
+
+        let mut overridden = World {
+            override_answer: Some(true),
+            asked: Vec::new(),
+        };
+        assert_eq!(
+            powder_snow_collision_shape(&mut overridden, at, &context).unwrap(),
+            VoxelShape::block()
+        );
+        assert_eq!(overridden.asked, vec![at]);
+
+        let mut vanilla = World {
+            override_answer: None,
+            asked: Vec::new(),
+        };
+        assert_eq!(
+            powder_snow_collision_shape(&mut vanilla, at, &context).unwrap(),
+            VoxelShape::empty()
+        );
+        // The mod point is still consulted once, with the snow position, and
+        // passes vanilla's false answer through unchanged.
+        assert_eq!(vanilla.asked, vec![at]);
+    }
 }

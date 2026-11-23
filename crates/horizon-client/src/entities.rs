@@ -1884,6 +1884,20 @@ pub struct StandStep {
 }
 #[cfg(test)]
 impl ArmorStand {
+    /// Keep an armor stand's powder-snow subject absent unless vanilla's
+    /// leather-boots answer or a listener needs it. An always-present subject
+    /// would turn `CollisionContext::position` into a living-entity context for
+    /// every contextual collision, not just powder snow.
+    fn powder_snow_subject(&self) -> Option<crate::collisions::PowderSnowSubject<'static>> {
+        let leather_boots = self.feet_are_leather_boots();
+        (leather_boots || mod_api::__private::listened(mod_api::HookId::PowderSnowWalkable))
+            .then_some(crate::collisions::PowderSnowSubject {
+                entity_id: Some(self.id),
+                leather_boots,
+                ..Default::default()
+            })
+    }
+
     /// A whole travel for the unit tests, with no bubble column.
     pub(crate) fn tick(
         &mut self,
@@ -2231,11 +2245,7 @@ impl ArmorStand {
         if self.marker {
             return None;
         }
-        scene.subject = Some(crate::collisions::PowderSnowSubject {
-            entity_id: Some(self.id),
-            leather_boots: self.feet_are_leather_boots(),
-            ..Default::default()
-        });
+        scene.subject = self.powder_snow_subject();
         let v = self.velocity;
         let mut wanted = Vec3::new(
             if v.x.abs() < 0.003 { 0.0 } else { v.x },
@@ -2371,11 +2381,7 @@ impl ArmorStand {
         context: &horizon_world::native_load_context::LoopContext,
     ) {
         let mut scene = SceneCollisions {
-            subject: Some(crate::collisions::PowderSnowSubject {
-                entity_id: Some(self.id),
-                leather_boots: self.feet_are_leather_boots(),
-                ..Default::default()
-            }),
+            subject: self.powder_snow_subject(),
             ..scene
         };
         // The lid's `Entity.move(mover, delta)` goes through the
