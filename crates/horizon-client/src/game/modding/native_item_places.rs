@@ -442,6 +442,62 @@ impl Game<'_> {
     }
     /// The equipment write `set_equipment` makes (arismoko/horizon#932), deferred: whether it
     /// landed. False where the entity is gone or a client's copy refuses.
+    /// Update the live stack at a worn or held place in place to `resource`'s components (keeping
+    /// its item and count), journaled in `tx`, without re-equipping it or replaying equip sounds,
+    /// game events or attribute updates.
+    pub(super) fn game_edit(
+        &mut self,
+        place: &ItemPlace,
+        resource: &ItemStack,
+        tx: &Transaction,
+    ) -> bool {
+        if !self.transaction_holds(tx) || !self.places_simulated() {
+            return false;
+        }
+        self.notice_menu_place_write(place);
+        if let ItemPlace::Equipment { entity, slot } = place {
+            let Some(epoch) = self.native_lifecycle.epoch() else {
+                return false;
+            };
+            let living = LivingRef::new(mod_api::EntityRef::new(epoch, *entity));
+            self.journal_equipment(*entity);
+            return self.edit_living_equipment_in_place(living, *slot, resource);
+        }
+        if matches!(
+            place,
+            ItemPlace::PlayerHand { .. } | ItemPlace::PlayerSlot { .. }
+        ) {
+            let Some(player) = self.place_player(place) else {
+                return false;
+            };
+            let mut edited = false;
+            self.native_as_player(player, |g| {
+                let Some((item, count)) = g
+                    .player_place(place)
+                    .as_deref()
+                    .and_then(Option::as_ref)
+                    .map(|old| (old.item.clone(), old.count))
+                else {
+                    return;
+                };
+                if item != resource.item || count == 0 {
+                    return;
+                }
+                let updated = ItemStack {
+                    count,
+                    ..resource.clone()
+                };
+                g.journal_player(player);
+                if let Some(slot) = g.player_place(place) {
+                    *slot = Some(updated);
+                    edited = true;
+                }
+            });
+            return edited;
+        }
+        false
+    }
+
     fn write_entity_equipment(
         &mut self,
         entity: u32,
@@ -538,6 +594,29 @@ pub(super) mod tests {
         );
         guest.placed = true;
         guest
+    }
+
+    /// The single-player owner is a guest of the server thread: outside their own turn (a
+    /// payload handler, a server tick) their places are their guest record's, though their
+    /// UUID is the acting fallback, not the host game's own inventory (#18472).
+    #[test]
+    #[ignore = "daily"]
+    fn the_owners_places_outside_their_turn_are_their_guest_records() {
+        with_game(|game| {
+            open_to_lan(game);
+            let owner = game.native_acting_id();
+            let mut player = guest(1);
+            player.uuid = owner;
+            player.inventory[3] = Some(ItemStack::new("minecraft:paper", 16));
+            game.lan.as_mut().unwrap().hub.guests.push(player);
+            game.inventory[3] = Some(ItemStack::new("minecraft:dirt", 1));
+            let slot = ItemPlace::PlayerSlot {
+                player: owner,
+                slot: 3,
+            };
+            let read = slot.stack(game).map(|stack| stack.item().id(&*game));
+            assert_eq!(read.as_deref(), Some("minecraft:paper"));
+        });
     }
 
     #[test]
@@ -663,6 +742,79 @@ pub(super) mod tests {
                 Ok(())
             );
             assert_eq!(inventory(game), before);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn editing_worn_equipment_updates_in_place_without_reequipping() {
+        use mod_api::{EquipmentSlot, HostTransaction, ItemPlace, Tag};
+        with_game(|game| {
+            let kind = game.res.mob_types().get("minecraft:zombie").unwrap().clone();
+            let mut mob = horizon_client::mobs::Mob::new(
+                9010,
+                kind,
+                horizon_core::geometry::Vec3::new(0.5, 64.0, 0.5),
+                0.0,
+            );
+            mob.first_tick = false;
+            assert!(mob.set_equipment_stack(
+                EquipmentSlot::Chest as usize,
+                Some(ItemStack::new("minecraft:diamond_chestplate", 1)),
+            ));
+            game.mobs.push(mob);
+            let place = ItemPlace::Equipment {
+                entity: 9010,
+                slot: EquipmentSlot::Chest,
+            };
+            let mut named = ItemStack::new("minecraft:diamond_chestplate", 1);
+            named.data_mut().custom_name = Some(Tag::String("patched".into()));
+            let source = named.try_into_api().unwrap();
+
+            // Editing components in place must not queue After::Equip or replay equip sounds.
+            game.audio.capture = Some(Vec::new());
+            let committed: Result<(), ()> = game.transaction(|host, tx| {
+                assert!(place.edit(host, tx, |stack| {
+                    stack.copy_component_from(&source, "minecraft:custom_name");
+                }));
+                Ok(())
+            });
+            assert_eq!(committed, Ok(()));
+            let worn = horizon_client::mobs::finalize::item_stack(
+                game.mobs.iter().find(|m| m.id == 9010).unwrap(),
+                EquipmentSlot::Chest as usize,
+            )
+            .unwrap();
+            assert_eq!(
+                worn.data().and_then(|d| d.custom_name.as_ref()),
+                Some(&Tag::String("patched".into()))
+            );
+            assert!(
+                game.audio.capture.as_ref().unwrap().is_empty(),
+                "editing worn equipment in place must not play an equip sound: {:?}",
+                game.audio.capture
+            );
+
+            // Aborting the transaction rolls back the in-place equipment edit.
+            let mut other = ItemStack::new("minecraft:diamond_chestplate", 1);
+            other.data_mut().custom_name = Some(Tag::String("rolled-back".into()));
+            let other_api = other.try_into_api().unwrap();
+            let aborted: Result<(), ()> = game.transaction(|host, tx| {
+                assert!(place.edit(host, tx, |stack| {
+                    stack.copy_component_from(&other_api, "minecraft:custom_name");
+                }));
+                Err(())
+            });
+            assert_eq!(aborted, Err(()));
+            let worn = horizon_client::mobs::finalize::item_stack(
+                game.mobs.iter().find(|m| m.id == 9010).unwrap(),
+                EquipmentSlot::Chest as usize,
+            )
+            .unwrap();
+            assert_eq!(
+                worn.data().and_then(|d| d.custom_name.as_ref()),
+                Some(&Tag::String("patched".into()))
+            );
         });
     }
 

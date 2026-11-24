@@ -19,6 +19,9 @@ component lines and advanced information. No attached part is needed for a
 global listener, so this is also how a mod edits vanilla or other mods' tooltips.
 The global event supplies the stack, display settings, player IDs, and the
 request's `advanced` and `creative` flags on native and wasm alike.
+Vanilla enchantment descriptions, including those on enchanted books, retain
+their root `TextContent::Translatable { key, .. }`. Match that key (for example,
+`enchantment.minecraft.sharpness`), not the displayed name, level, or color.
 
 ## Drawing a second world camera
 
@@ -31,7 +34,11 @@ views with distinct IDs are taken, with sides limited to 4096 pixels and the
 device limit, and 4 x 4096 x 4096 pixels in all. `push` refuses any other view
 with a `WorldViewRefusal` naming it and the reason, and logs each refusal once.
 Each view culls the world with its own frustum, and the player's view keeps its
-own culling. These callbacks have no Wire form.
+own culling. Entities and block entities are built for what the camera or any
+view sees; entity occlusion culling (the `entityCulling` setting) proves an entity
+hidden from the player's camera only, so it is off for a frame with views, and an
+entity behind a hill from the player still reaches a view that sees it. These
+callbacks have no Wire form.
 
 For a view seen in another view, such as a portal seen through a portal, push the
 outer view first and add `with_parent(outer_id)` to the inner one. Views nest up to
@@ -83,3 +90,23 @@ meshed so far and nothing where a section is not meshed yet.
 A new call replaces the current muffle; `ticks` of 0 ends it immediately. The effect belongs to the sound output, so every splitscreen player hears it. The call refuses an amount or strength outside 0 to 1, more than 64 exempt events, or an exempt event that is not a namespaced sound ID, without changing the output. Server code cannot call this client-only service.
 
 Play the accompanying sound through `ClientHost::play_local_sound` with a `SoundPlay`.
+
+## Showing another time or weather
+
+`sky_environment` lets a client mod show the local player another time of day or weather, for example noon
+while building, a clear sky for a recording, or night on a server where it is day. It is asked whenever the
+frame reads the sky, with the frame's `partial` tick and the values the frame would draw:
+
+| `SkyEnvironmentEvent` field | Meaning |
+| --- | --- |
+| `partial` | Ticks past the last tick, from 0 to 1 |
+| `day_time` | The level's time of day (or PvP & HUD's view time); write it to show another |
+| `rain` | The rain level from 0 to 1; write it to show more or less rain |
+| `thunder` | The thunder level from 0 to 1; write it to show more or less thunder |
+
+Only the picture follows: the sun, moon and stars, the sky's and fog's colour, the sky's light, clouds, and
+falling rain or snow. The level's own clock and weather, gameplay (crops, mobs, beds) and the server keep
+theirs, and nothing is sent. Rain and thunder count only in a dimension with weather. A level that is not finite
+keeps the level's value, and the others are clamped to 0..=1. The hook may run more than once a frame, so
+give the same answer each time. Only a client of a world (single player's included) asks it, never the game
+that ticks the world. NeoForge has no counterpart; Java mods change `ClientLevel` with a mixin.

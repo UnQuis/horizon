@@ -52,7 +52,9 @@ pub fn pool() -> &'static CompressionPool {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| horizon_threads::worker_count().div_ceil(2).max(1));
+            .unwrap_or_else(|| {
+                horizon_threads::sizing::for_pool(horizon_threads::sizing::Pool::SaveCompression)
+            });
         CompressionPool::new(workers)
     })
 }
@@ -235,4 +237,21 @@ pub fn compress_records(
     timestamp: u32,
 ) -> Vec<io::Result<Option<ChunkRecord>>> {
     compress_records_with_pool(records, timestamp, pool())
+}
+
+/// `Compression::selected()` is one setting for the whole test process. A
+/// test that reads it more than once (two compressions compared, or one
+/// compared with the codec it reports) holds this for reading; the test that
+/// switches it holds it for writing, so the codec never changes between the
+/// reads (#18772).
+#[cfg(test)]
+pub(super) static SELECTED_CODEC: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A read hold on [`SELECTED_CODEC`]: the selected codec stays as it is
+/// until the guard drops.
+#[cfg(test)]
+pub(super) fn holding_selected_codec() -> std::sync::RwLockReadGuard<'static, ()> {
+    SELECTED_CODEC
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

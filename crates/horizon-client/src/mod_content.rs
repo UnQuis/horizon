@@ -22,7 +22,7 @@ use horizon_core::{
 };
 use horizon_mod_package::content::{
     Block, BlockEntityType, BlockShapes, Content, CreativeTab, EntityType, FluidLook, MenuType,
-    MobEffect, Rarity, StateProperty, StateValues,
+    MobEffect, Rarity, StateProperty, StateValues, VanillaBlockShapes, VanillaShape,
 };
 use horizon_mod_package::manifest::{
     JarInputsError, JarRef, collect_jar_requirements, missing_jars,
@@ -569,6 +569,25 @@ fn shape_edges(shape: &VoxelShape) -> Vec<J> {
         .collect()
 }
 
+/// A shape's boxes as bits, the key one table encodes a shape once by.
+fn shape_key(shape: &VoxelShape) -> Vec<[u64; 6]> {
+    shape
+        .boxes()
+        .iter()
+        .map(|bounds| {
+            [
+                bounds.min(Axis::X),
+                bounds.min(Axis::Y),
+                bounds.min(Axis::Z),
+                bounds.max(Axis::X),
+                bounds.max(Axis::Y),
+                bounds.max(Axis::Z),
+            ]
+            .map(f64::to_bits)
+        })
+        .collect()
+}
+
 fn encode_shape(shape: &VoxelShape) -> Tag {
     let mut c = nbt::Compound::new();
     let (min, max) = shape.discrete_bounds();
@@ -675,6 +694,193 @@ fn resolve_shapes<'a>(
             Ok(shape)
         })
         .collect()
+}
+
+/// Each vanilla state's entity-context shapes from the mods, by `<channel>_<kind>` key
+/// (`collision_player`), as the collision table's context rows name them.
+type VanillaContexts = BTreeMap<u32, BTreeMap<String, VoxelShape>>;
+
+/// The entity-context shapes mods give vanilla blocks (`vanilla_block_shapes`), resolved
+/// against vanilla's own tables, and a warning for each claim left out. Mods come in id
+/// order, as their blocks do: the first to claim a block's class in a channel keeps it, and a
+/// later claim of the same block, class and channel is left out. A clip cuts each state's
+/// vanilla shape of its channel: the outline `gameplay-facts.json` holds, or the cached
+/// collision, which a state whose collision depends on more than the state (powder snow,
+/// scaffolding) does not have.
+fn vanilla_contexts(
+    base: &Path,
+    mods: &[&ContentMod],
+    facts: &J,
+    range: &dyn Fn(&str) -> Option<Range<u32>>,
+) -> Result<(VanillaContexts, Vec<String>)> {
+    use std::collections::btree_map::Entry;
+    let mut contexts = VanillaContexts::new();
+    let mut warnings = Vec::new();
+    let mut claims: BTreeMap<(&str, String), &str> = BTreeMap::new();
+    // (mod, block, its states, channel, context key, shape)
+    let mut wanted = Vec::new();
+    for m in mods {
+        for decl in &m.content.vanilla_shapes {
+            for block in &decl.blocks {
+                let states = range(block).ok_or_else(|| {
+                    format!("mod {}: vanilla block shapes: {block} is not a block", m.id)
+                })?;
+                for (channel, shapes) in [
+                    ("outline", &decl.outline_context_shapes),
+                    ("collision", &decl.collision_context_shapes),
+                ] {
+                    for (kind, shape) in shapes {
+                        let key = format!("{channel}_{}", kind.name());
+                        match claims.entry((block.as_str(), key.clone())) {
+                            Entry::Occupied(held) => warnings.push(format!(
+                                "mod {}: the {channel} of {block} for {} is mod {}'s; \
+                                 this declaration is left out",
+                                m.id,
+                                kind.name(),
+                                held.get()
+                            )),
+                            Entry::Vacant(free) => {
+                                free.insert(m.id.as_str());
+                                wanted.push((
+                                    m.id.as_str(),
+                                    block.as_str(),
+                                    states.clone(),
+                                    channel,
+                                    key,
+                                    shape,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok((contexts, warnings));
+    }
+    let Some(J::Arr(rows)) = facts.get("states") else {
+        return Err("facts.json: no states".into());
+    };
+    let properties = |id: u32| -> Option<&J> {
+        let J::Arr(row) = rows.get(id as usize)? else {
+            return None;
+        };
+        row.get(4)?.get("properties")
+    };
+    let clipped = |of: &str| -> BTreeSet<u32> {
+        wanted
+            .iter()
+            .filter(|w| w.3 == of && matches!(w.5, VanillaShape::Clip(_)))
+            .flat_map(|w| w.2.clone())
+            .collect()
+    };
+    let collisions = vanilla_collisions(base, &clipped("collision"))?;
+    let outlines = vanilla_outlines(base, &clipped("outline"))?;
+    for (mod_id, block, states, channel, key, shape) in wanted {
+        let resolved: Vec<VoxelShape> = match shape {
+            VanillaShape::Table(table) => {
+                let order: Vec<(u32, u32)> = (0..states.len() as u32).map(|s| (s, 0)).collect();
+                resolve_shapes(table, block, &states, &order, &[Vec::new()], properties)
+                    .map_err(|e| format!("mod {mod_id}: vanilla block shapes: {e}"))?
+            }
+            VanillaShape::Clip(b) => {
+                let clip = VoxelShape::from_box(Aabb::new(
+                    Vec3::new(b[0], b[1], b[2]),
+                    Vec3::new(b[3], b[4], b[5]),
+                ))?;
+                let mut out = Vec::with_capacity(states.len());
+                for state in states.clone() {
+                    let own = if channel == "collision" {
+                        collisions.get(&state).cloned().flatten().ok_or_else(|| {
+                            format!(
+                                "mod {mod_id}: vanilla block shapes: the collision of {block} \
+                                 depends on more than its state, so it cannot be clipped"
+                            )
+                        })?
+                    } else {
+                        outlines
+                            .get(&state)
+                            .cloned()
+                            .ok_or_else(|| format!("gameplay-facts.json: no state {state}"))?
+                    };
+                    out.push(own.join(&clip, ShapeOp::AND)?);
+                }
+                out
+            }
+        };
+        for (state, shape) in states.zip(resolved) {
+            contexts
+                .entry(state)
+                .or_default()
+                .insert(key.clone(), shape);
+        }
+    }
+    Ok((contexts, warnings))
+}
+
+/// Vanilla's cached collision of each of `states`; `None` for a state whose collision
+/// depends on more than the state.
+fn vanilla_collisions(
+    base: &Path,
+    states: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, Option<VoxelShape>>> {
+    use horizon_world::{
+        collision::CachedCollisionRegistry,
+        registry::{BlockStateId, BlockTableFile},
+    };
+    if states.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let registry = horizon_world::level::data::load_registry(base)?;
+    let file = BlockTableFile::open(&base.join("cached-collision.nbt"), &registry)?;
+    let cached = CachedCollisionRegistry::from_table(file.table("collision")?)?;
+    let mut out = BTreeMap::new();
+    for &state in states {
+        out.insert(state, cached.cached_shape(BlockStateId(state))?.cloned());
+    }
+    Ok(out)
+}
+
+/// Vanilla's outline (`getShape`) of each of `states`, from `gameplay-facts.json`: a full
+/// block where a row leaves it out, as the game reads it.
+fn vanilla_outlines(base: &Path, states: &BTreeSet<u32>) -> Result<BTreeMap<u32, VoxelShape>> {
+    #[derive(Deserialize)]
+    struct Row {
+        #[serde(default)]
+        outline: Option<Vec<[f64; 6]>>,
+    }
+    #[derive(Deserialize)]
+    struct Facts {
+        states: Vec<Row>,
+    }
+    if states.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let facts: Facts = serde_json::from_slice(&fs::read(base.join("gameplay-facts.json"))?)?;
+    let mut out = BTreeMap::new();
+    for &state in states {
+        let row = facts
+            .states
+            .get(state as usize)
+            .ok_or_else(|| format!("gameplay-facts.json: no state {state}"))?;
+        let shape = match &row.outline {
+            None => VoxelShape::block(),
+            Some(boxes) => {
+                let mut shape = VoxelShape::empty();
+                for b in boxes {
+                    let part = VoxelShape::from_box(Aabb::new(
+                        Vec3::new(b[0], b[1], b[2]),
+                        Vec3::new(b[3], b[4], b[5]),
+                    ))?;
+                    shape = shape.join_unoptimized(&part, ShapeOp::OR)?;
+                }
+                shape
+            }
+        };
+        out.insert(state, shape);
+    }
+    Ok(out)
 }
 
 /// A content farmland declaration names a block absent from the loaded registry.
@@ -792,6 +998,10 @@ struct Plan<'a> {
     block_entity_types: Vec<&'a BlockEntityType>,
     block_entity_factories: BTreeMap<&'a str, &'a str>,
     menu_types: Vec<&'a MenuType>,
+    /// The mods' entity-context shapes for vanilla states (`vanilla_block_shapes`).
+    vanilla_contexts: VanillaContexts,
+    /// The mods' vanilla block shapes left out, one line each.
+    warnings: Vec<String>,
     /// Vanilla's state count (the tables' length before).
     states: usize,
     /// Each vanilla block's default state.
@@ -908,6 +1118,39 @@ pub fn accept_declared(
         };
         if let Err(e) = result {
             errors.push(format!("native blocks and items of {id}: {e}"));
+        }
+    }
+    errors
+}
+
+/// Adds the vanilla block shapes mods declare in code (`vanilla_block_shapes`) to each
+/// declaring mod's content, checked as files are; a mod with no content yet gets content of
+/// its own. Returns the refusals, one per mod: that mod's code declarations are all left out.
+pub fn accept_vanilla_shapes(
+    mods: &mut Vec<ContentMod>,
+    shapes: &[(&str, VanillaBlockShapes)],
+) -> Vec<String> {
+    let mut by_mod: BTreeMap<&str, Vec<VanillaBlockShapes>> = BTreeMap::new();
+    for (id, shape) in shapes {
+        by_mod.entry(id).or_default().push(shape.clone());
+    }
+    let mut errors = Vec::new();
+    for (id, shapes) in by_mod {
+        let result = match mods.iter_mut().find(|m| m.id == id) {
+            Some(m) => m.content.declare_vanilla_shapes(&shapes),
+            None => {
+                let mut content = horizon_mod_package::Content::declared(id);
+                content.declare_vanilla_shapes(&shapes).map(|()| {
+                    mods.push(ContentMod {
+                        id: id.to_owned(),
+                        content,
+                        jars: Vec::new(),
+                    })
+                })
+            }
+        };
+        if let Err(e) = result {
+            errors.push(format!("vanilla block shapes of {id}: {e}"));
         }
     }
     errors
@@ -1502,6 +1745,7 @@ impl<'a> Plan<'a> {
                 }
             }
         }
+        let (vanilla_contexts, warnings) = vanilla_contexts(base, &sorted, &facts, &range)?;
         Ok(Plan {
             blocks,
             items,
@@ -1515,6 +1759,8 @@ impl<'a> Plan<'a> {
                 .collect(),
             block_entity_factories,
             menu_types: menu_types(mods),
+            vanilla_contexts,
+            warnings,
             states: names.len(),
             defaults,
             sounds,
@@ -1944,6 +2190,24 @@ impl<'a> Plan<'a> {
                 }
             }
             "worldgen/blocks/survival-rules.json" => self.names(doc, false),
+            "worldgen/blocks/placement-definitions.json" => {
+                // `SimpleBlockFeature.place` dispatches by block class to
+                // `DoublePlantBlock.placeAt` or `MossyCarpetBlock.placeAt`.
+                // Content blocks inherit that dispatch from their template.
+                for key in ["double_plants", "mossy_carpets"] {
+                    if let Some(J::Arr(names)) = doc.get_mut(key) {
+                        let vanilla_count = names.len();
+                        for b in &self.blocks {
+                            if names[..vanilla_count]
+                                .iter()
+                                .any(|name| name.as_str() == Some(b.decl.template.as_str()))
+                            {
+                                names.push(J::Str(b.decl.id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
             "worldgen/blocks/survival-extra-definitions.json" => {
                 if let Some(map) = doc.at("ignition_odds") {
                     self.names(map, false);
@@ -2084,22 +2348,7 @@ impl<'a> Plan<'a> {
             if let Some(shapes) = shapes {
                 let mut encoded = BTreeMap::new();
                 for (offset, shape) in shapes.iter().enumerate() {
-                    let key: Vec<_> = shape
-                        .boxes()
-                        .iter()
-                        .map(|bounds| {
-                            [
-                                bounds.min(Axis::X),
-                                bounds.min(Axis::Y),
-                                bounds.min(Axis::Z),
-                                bounds.max(Axis::X),
-                                bounds.max(Axis::Y),
-                                bounds.max(Axis::Z),
-                            ]
-                            .map(f64::to_bits)
-                        })
-                        .collect();
-                    let id = *encoded.entry(key).or_insert_with(|| {
+                    let id = *encoded.entry(shape_key(shape)).or_insert_with(|| {
                         entries.push(encode_shape(shape));
                         entries.len() as i32 - 1
                     });
@@ -2123,22 +2372,7 @@ impl<'a> Plan<'a> {
                 );
                 for (channel, variants) in &block.context_shapes {
                     let shape = &variants[offset];
-                    let key: Vec<_> = shape
-                        .boxes()
-                        .iter()
-                        .map(|bounds| {
-                            [
-                                bounds.min(Axis::X),
-                                bounds.min(Axis::Y),
-                                bounds.min(Axis::Z),
-                                bounds.max(Axis::X),
-                                bounds.max(Axis::Y),
-                                bounds.max(Axis::Z),
-                            ]
-                            .map(f64::to_bits)
-                        })
-                        .collect();
-                    let id = *encoded.entry(key).or_insert_with(|| {
+                    let id = *encoded.entry(shape_key(shape)).or_insert_with(|| {
                         entries.push(encode_shape(shape));
                         entries.len() as i32 - 1
                     });
@@ -2146,6 +2380,20 @@ impl<'a> Plan<'a> {
                 }
                 contexts.push(Tag::Compound(row));
             }
+        }
+        // Vanilla states the mods give entity-context shapes (`vanilla_block_shapes`).
+        let mut encoded = BTreeMap::new();
+        for (state, channels) in &self.vanilla_contexts {
+            let mut row = Compound::new();
+            row.insert("state".into(), Tag::Int(*state as i32));
+            for (channel, shape) in channels {
+                let id = *encoded.entry(shape_key(shape)).or_insert_with(|| {
+                    entries.push(encode_shape(shape));
+                    entries.len() as i32 - 1
+                });
+                row.insert(channel.as_str().into(), Tag::Int(id));
+            }
+            contexts.push(Tag::Compound(row));
         }
         if !contexts.is_empty() {
             root.insert("context_shapes".into(), Tag::List(contexts));
@@ -2292,7 +2540,7 @@ impl<'a> Plan<'a> {
 }
 
 /// The JSON and NBT tables rewritten for new blocks and items.
-const JSON_TABLES: [&str; 16] = [
+const JSON_TABLES: [&str; 17] = [
     "facts.json",
     "entity-types.json",
     "creative-inventory.json",
@@ -2309,6 +2557,7 @@ const JSON_TABLES: [&str; 16] = [
     "worldgen/blocks/structure-blocks.json",
     "worldgen/blocks/survival-rules.json",
     "worldgen/blocks/survival-extra-definitions.json",
+    "worldgen/blocks/placement-definitions.json",
 ];
 const NBT_TABLES: [&str; 6] = [
     "occlusion.nbt",
@@ -2332,10 +2581,12 @@ const TAG_BUNDLES: [&str; 2] = ["block-tags.json", "worldgen/block_tags.json"];
 const BIOME_TAGS: &str = "worldgen/biome_tags.json";
 /// Worldgen registries a content mod may add to, and the bundle the
 /// worldgen loader reads each from (id → the file's text): what structure
-/// mods hold, and a mod's own biomes (never vanilla's: `worldgen_entry`).
-/// Noise and density functions change the terrain and are not read from mods.
-const WORLDGEN_BUNDLES: [(&str, &str); 7] = [
+/// mods hold, and a mod's own biomes (never vanilla's: `worldgen_entry`) and
+/// the carvers they name. Noise and density functions change the terrain and
+/// are not read from mods.
+const WORLDGEN_BUNDLES: [(&str, &str); 8] = [
     ("biome", BIOMES),
+    ("carver", CARVERS),
     ("structure", "worldgen/structures.json"),
     ("structure_set", "worldgen/structure_sets.json"),
     ("template_pool", "worldgen/template_pools.json"),
@@ -2519,7 +2770,13 @@ fn place_in_biomes(
     let placed: BTreeSet<String> = bundle(placed, PLACED_FEATURES)?.into_keys().collect();
     let feature_tags = bundle(None, FEATURE_TAGS)?;
     let (entity_categories, entity_tags) = modifier_entities(base, overlay, tags)?;
-    let carver_ids = biomes::carver_ids(&base.join(CARVERS))?;
+    // The carvers bundle with the mods' own carvers, written before this
+    // (`WORLDGEN_BUNDLES`), so a modifier may add one of them.
+    let mut carvers = out_path(overlay, CARVERS);
+    if !carvers.exists() {
+        carvers = base.join(CARVERS);
+    }
+    let carver_ids = biomes::carver_ids(&carvers)?;
     let mut saved = SavedModifiers {
         carver_ids,
         carver_tags: modifier_tags(base, overlay, tags, "worldgen/carver")?,
@@ -2880,7 +3137,7 @@ fn link_file(
 mod root_lifetime;
 use root_lifetime::prune_roots;
 
-pub use root_lifetime::retain_root;
+pub use root_lifetime::{RootHold, retain_root};
 mod load_conditions;
 use load_conditions::{TagLayers, TagMerge, merge_tag, tag_list};
 pub use load_conditions::{build_with_conditions, resource_root_with_conditions};
@@ -3126,7 +3383,12 @@ fn load_layers<'a>(jar_store: &Path, mods: &'a [ContentMod]) -> Result<Vec<ModLa
                 if source.is_dir() {
                     crate::packs::Source::Dir(source)
                 } else {
-                    crate::packs::Source::Zip(source)
+                    // Exactly the entries the package's checks read.
+                    crate::packs::Source::Opened(
+                        horizon_assets::resource_source::ResourceSource::opened_archive(
+                            horizon_assets::zip::Zip::open_exact(&source)?,
+                        ),
+                    )
                 },
                 None,
             )?);
@@ -3196,10 +3458,10 @@ pub fn resolved_resources(
     }
     let mut assets_base = base_source.clone();
     if prepared != base {
+        // Held before the first read: a prune in another game can't retire it meanwhile.
+        let generated_source = root_lifetime::retained_source(&prepared);
         let generated: Vec<String> =
             serde_json::from_slice(&fs::read(prepared.join(GENERATED_FILES))?)?;
-        let generated_source = ResourceSource::directory(prepared.clone());
-        root_lifetime::retain_source(&prepared, &generated_source);
         let mut generated_assets = BTreeMap::new();
         for name in generated {
             if !horizon_assets::resource_source::stays_inside(&name) {
@@ -3304,6 +3566,7 @@ pub fn live_switch(content: &Content) -> std::result::Result<(), &'static str> {
         || !content.menu_types.is_empty()
         || !content.creative_tabs.is_empty()
         || !content.block_entity_types.is_empty()
+        || !content.vanilla_shapes.is_empty()
     {
         return Err("horizon.mods.switch.registries");
     }
@@ -3404,8 +3667,11 @@ fn stamp(
         }
         // What it declares, so blocks and items from code count too.
         parts.push(format!(
-            "{:?} {:?} {:?}",
-            m.content.blocks, m.content.items, m.content.block_entity_types
+            "{:?} {:?} {:?} {:?}",
+            m.content.blocks,
+            m.content.items,
+            m.content.block_entity_types,
+            m.content.vanilla_shapes
         ));
         let source = m.content.source();
         if m.content.files.is_empty() {

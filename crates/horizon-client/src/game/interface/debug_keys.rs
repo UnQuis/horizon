@@ -1053,9 +1053,15 @@ impl Game<'_> {
                 lerpf(m.previous_head_pitch, m.head_pitch),
                 lerpf(m.previous_head_yaw, m.head_yaw),
             );
-            g.hitbox(
+            // `EntityHitboxDebugRenderer.showHitboxes` draws the entity's AABB,
+            // not its dimensions: an open shulker's box grows past the 1x1x1
+            // that its width and height describe.
+            let b = m.bounds_at(Vec3::new(pos[0], pos[1], pos[2]));
+            let (min, max) = (b.min_position(), b.max_position());
+            g.entity_box(
+                [min.x, min.y, min.z],
+                [max.x, max.y, max.z],
                 pos,
-                (m.width(), m.height()),
                 m.eye_height() as f32,
                 true,
                 view,
@@ -1110,12 +1116,13 @@ impl Game<'_> {
         }
         for a in self.armor_stands.iter().filter(|a| !a.invisible) {
             // ArmorStand.getDimensions: a marker has none, a small one is
-            // half scale with its eyes at 0.9875.
-            let (size, eye) = match (a.marker, a.small) {
-                (true, _) => ((0.0, 0.0), 0.0),
-                (_, true) => ((0.25, 0.9875), 0.9875),
-                _ => ((0.5, 1.975), 1.7775),
-            };
+            // half scale with its eyes at 0.9875; both times its `minecraft:scale`.
+            let size = a.box_size();
+            let eye = match (a.marker, a.small) {
+                (true, _) => 0.0,
+                (_, true) => 0.9875,
+                _ => 1.7775,
+            } * a.scale;
             g.hitbox(
                 at(a.previous, a.position),
                 size,

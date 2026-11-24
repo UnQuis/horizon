@@ -101,6 +101,7 @@ pub mod spawner;
 pub mod spawning;
 pub mod spear_use;
 pub mod species;
+pub mod species_slots;
 pub mod strider;
 pub mod stuck;
 pub mod suffocation;
@@ -114,6 +115,7 @@ pub mod trial_spawner;
 pub mod turtle;
 pub mod undead;
 pub mod vex;
+pub mod village_index;
 pub mod villager;
 pub mod villager_brain;
 pub mod villager_hats;
@@ -280,6 +282,20 @@ impl MobType {
 
     pub fn layer(&self, key: &str) -> Option<&Arc<Part>> {
         self.layers.get(key)
+    }
+    /// `instanceof Enemy` for the type's mobs. The zombie horse, camel husk and zombie nautilus
+    /// are in the monster category but extend `Animal`/`AbstractNautilus`, and the sulfur cube
+    /// extends `AbstractCubeMob` without `Enemy`, as the slime and magma cube add it: none of
+    /// them implements `Enemy`.
+    pub fn is_enemy(&self) -> bool {
+        self.category == "monster"
+            && !matches!(
+                self.species,
+                Species::ZombieHorse
+                    | Species::CamelHusk
+                    | Species::ZombieNautilus
+                    | Species::SulfurCube
+            )
     }
 }
 /// Each type's default attribute values, parsed exactly (serde_json's
@@ -992,6 +1008,10 @@ pub struct Extra {
     pub immovable: bool,
     /// `Mannequin.DATA_DESCRIPTION`: the text under its name.
     pub description: MannequinDescription,
+    /// Runtime-only: `(world.revision, [x.to_bits(), y.to_bits(), z.to_bits()])` at which an
+    /// immovable, invulnerable mannequin was last verified stationary in an inert environment
+    /// (dry, unlit, not in powder snow).
+    pub static_env_stamp: Option<(u64, [u64; 3], [u32; 2])>,
     /// `LivingEntity`'s `minecraft:scale` (`getScale`), which scales its box
     /// (`getDimensions`), eye height and model (`LivingEntityRenderState.scale`):
     /// the local player's own, and on a server every living entity's from its
@@ -1636,13 +1656,21 @@ pub enum MannequinDescription {
     Custom(horizon_core::nbt::Tag),
 }
 impl MannequinDescription {
+    /// Cached default component (`entity.minecraft.mannequin.label`) to avoid per-tick allocations.
+    pub fn default_component() -> &'static horizon_core::nbt::Tag {
+        static DEFAULT: std::sync::OnceLock<horizon_core::nbt::Tag> = std::sync::OnceLock::new();
+        DEFAULT.get_or_init(|| {
+            horizon_core::nbt::Tag::compound([(
+                "translate",
+                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
+            )])
+        })
+    }
+
     /// `Mannequin.getDescription`: the component `DATA_DESCRIPTION` holds, none when hidden.
     pub fn component(&self) -> Option<horizon_core::nbt::Tag> {
         match self {
-            Self::Default => Some(horizon_core::nbt::Tag::compound([(
-                "translate",
-                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
-            )])),
+            Self::Default => Some(Self::default_component().clone()),
             Self::Hidden => None,
             Self::Custom(tag) => Some(tag.clone()),
         }
@@ -1651,7 +1679,7 @@ impl MannequinDescription {
     pub fn from_component(tag: Option<&horizon_core::nbt::Tag>) -> Self {
         match tag {
             None => Self::Hidden,
-            Some(tag) if Some(tag) == Self::Default.component().as_ref() => Self::Default,
+            Some(tag) if tag == Self::default_component() => Self::Default,
             Some(tag) => Self::Custom(tag.clone()),
         }
     }
@@ -2415,6 +2443,10 @@ pub enum MobEvent {
     VillagerOffers {
         mob: u32,
     },
+    /// `Villager.restock` / `catchUpDemand`: refresh the trading player.
+    VillagerRestocked {
+        mob: u32,
+    },
     /// Two villagers make a baby (`VillagerMakeLove.tryToGiveBirth`): the
     /// parent has eaten and, with a bed for the child, rests; the partner
     /// eats, and rests too if `child` holds the child's bed and type
@@ -2884,6 +2916,10 @@ impl PendingPushes {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty() && self.by_mob.is_empty()
     }
+    /// Whether any queued push targets mob `id`.
+    pub fn has_for(&self, id: u32) -> bool {
+        self.list.iter().any(|(target, _)| *target == id) || self.by_mob.contains_key(&id)
+    }
     pub fn push(&mut self, id: u32, v: Vec3) {
         if self.by_mob.is_empty() && self.list.len() < Self::LIST_MAX {
             self.list.push((id, v));
@@ -3118,6 +3154,8 @@ pub struct PlayerView {
     /// The Invisibility effect (`isInvisible`).
     pub invisible: bool,
     pub spectator: bool,
+    /// `Player.onClimbable`: a climbable block at its feet (`LivingEntity.isPushable` vetoes it).
+    pub on_climbable: bool,
     /// `PiglinAi.isWearingSafeArmor`: some golden armour.
     pub gold_armor: bool,
     /// `getLastHurtByMob` (within 100 ticks) and when.
@@ -3148,8 +3186,7 @@ pub struct PlayerView {
     pub passenger: bool,
     /// The vehicle entity id, including mounts without a `Vehicle` follow view.
     pub riding_vehicle: Option<u32>,
-    /// The boat or nautilus the player rides and steers
-    /// (`getControllingPassenger`).
+    /// The boat or nautilus the player rides and steers (`getControllingPassenger`).
     pub vehicle: Option<Vehicle>,
 }
 /// What a player rides, for the mobs that follow it (`FollowPlayerRiddenEntityGoal`).
@@ -3243,6 +3280,10 @@ pub struct MobWorld<'a> {
     /// keeps them (the mob ticks: a slot keeps its mob, and its species, all
     /// tick). Each zombie looking for a village read every slot.
     pub others_villagers: Option<&'a [u32]>,
+    /// The villagers' village sections of `others`, when the caller keeps them up to date.
+    pub village: Option<&'a village_index::VillageIndex>,
+    /// The slots of `others` by species, when the caller keeps them (the mob loops).
+    pub species_slots: Option<&'a species_slots::SpeciesSlots>,
     /// The slots of `others` that may stop a moving mob
     /// ([`Seen::may_block_mobs`]), when the caller keeps them; None: any.
     pub others_solid: Option<&'a [u32]>,
@@ -3783,15 +3824,9 @@ impl Mob {
     pub fn hostile(&self) -> bool {
         self.kind.category == "monster"
     }
-    /// `instanceof Enemy`. The zombie horse, camel husk and zombie nautilus are in
-    /// the monster category but extend `Animal`/`AbstractNautilus`, which do
-    /// not implement `Enemy`.
+    /// `instanceof Enemy`: its type's ([`MobType::is_enemy`]).
     pub fn is_enemy(&self) -> bool {
-        self.hostile()
-            && !matches!(
-                self.species(),
-                Species::ZombieHorse | Species::CamelHusk | Species::ZombieNautilus
-            )
+        self.kind.is_enemy()
     }
     #[inline]
     pub fn species(&self) -> Species {
@@ -4351,12 +4386,61 @@ impl Mob {
         self.prepare_tick();
         neutral_anger::tick_until_consumption(self, w, level, events)
     }
-    fn prepare_tick(&mut self) {
+    pub(crate) fn prepare_tick(&mut self) {
         self.track_section();
         // LivingEntity.tick: CombatTracker.recheckStatus.
         let alive = self.alive();
         self.combat.recheck(alive, self.age);
         self.extra.stuck.tick();
+    }
+
+    /// Whether this mob is a stationary, immovable, invulnerable mannequin whose tick has no
+    /// block-contact, damage, or finite-effect countdown side effects once verified for the
+    /// current `(world.revision, position)` stamp.
+    pub fn is_static_mannequin(&self) -> bool {
+        self.species() == Species::Mannequin
+            && self.extra.immovable
+            && self.invulnerable_flag
+            && !self.removed
+            && self.alive()
+            && !self.first_tick
+            && !self.effects_dirty
+            && self.extra.mount.is_none()
+            && self.rider.is_none()
+            && self.extra.rider.is_none()
+            && self.extra.leash.is_none()
+            && self.extra.leash_pending.is_none()
+            && self.fire_ticks == 0
+            && self.ticks_frozen == 0
+            && self.hurt_time == 0
+            && self.invulnerable == 0
+            && self.invulnerable_time == 0
+            && self.ai.last_hurt_by_player == 0
+            && self.impulse_grace_time == 0
+            && !self.ai.swinging
+            && self.velocity == Vec3::ZERO
+            && self.position == self.previous
+            && !self.fluids.in_water
+            && !self.fluids.in_lava
+            && !self.in_powder_snow
+            && self.air >= self.max_air_supply()
+            && self.outbox.is_empty()
+            && self.extra.effect_chains.is_empty()
+            && self.extra.effects.iter().all(|e| {
+                e.duration == -1
+                    && matches!(
+                        e.id,
+                        "minecraft:resistance"
+                            | "minecraft:fire_resistance"
+                            | "minecraft:water_breathing"
+                            | "minecraft:invisibility"
+                            | "minecraft:night_vision"
+                            | "minecraft:slow_falling"
+                            | "minecraft:glowing"
+                            | "minecraft:speed"
+                            | "minecraft:slowness"
+                    )
+            })
     }
     /// The section the mob is in, noted when it changes (`EntitySection` lists).
     fn track_section(&mut self) {
@@ -4725,6 +4809,7 @@ impl Mob {
         crate::hunger::native_living_heal(context, self.id, &mut amount, &mut cancel);
         if !cancel && self.health > 0.0 {
             self.health = (self.health + amount).clamp(0.0, self.attrs.max_health);
+            crate::hunger::native_living_heal_cause(context, self.id, "other", amount);
         }
     }
     /// `HealOrHarmMobEffect.applyInstantenousEffect`: a harming effect hurts a
@@ -6147,249 +6232,7 @@ mod magic_absorb_tests {
 }
 
 #[cfg(test)]
-mod armor_hurt_tests {
-    use super::sensor_scan_tests::kind;
-    use super::*;
-    use horizon_core::geometry::Vec3;
-
-    fn horse() -> Mob {
-        mob("minecraft:horse", Species::Horse)
-    }
-
-    fn mob(id: &str, species: Species) -> Mob {
-        let mut kind = kind();
-        let k = Arc::make_mut(&mut kind);
-        k.id = id.into();
-        k.species = species;
-        Mob::new(1, kind, Vec3::ZERO, 0.0)
-    }
-
-    #[test]
-    fn equipment_stacks_reads_full_offhand() {
-        let mut horse = horse();
-        let mut stack = crate::items::ItemStack::new("minecraft:shield", 3);
-        stack.damage = 17;
-        finalize::set_item_stack(&mut horse, finalize::OFFHAND, stack.clone());
-        assert_eq!(horse.equipment_stacks()[1], Some(stack));
-    }
-
-    #[test]
-    fn removing_body_equipment_keeps_the_whole_stack() {
-        let mut horse = horse();
-        let mut stack = crate::items::ItemStack::new("minecraft:red_carpet", 3);
-        stack.damage = 7;
-        stack.data_mut().custom_name = Some(horizon_core::nbt::Tag::String("kept".into()));
-        horse.extra.set_body_stack(Some(stack.clone()));
-        assert_eq!(horse.take_body_equipment(), Some(stack));
-        assert_eq!(horse.take_body_equipment(), None);
-    }
-
-    #[test]
-    fn replacing_armor_with_same_item_forgets_old_stack() {
-        let mut horse = horse();
-        let mut old = crate::items::ItemStack::new("minecraft:iron_helmet", 1);
-        old.damage = 8;
-        horse.set_equipment_stack(5, Some(old));
-        let mut replacement = crate::items::ItemStack::new("minecraft:iron_helmet", 2);
-        replacement.damage = 3;
-        finalize::set_item_stack(&mut horse, finalize::HEAD, replacement.clone());
-        assert_eq!(horse.equipment_stacks()[5], Some(replacement));
-    }
-
-    #[test]
-    fn saddle_stack_keeps_count() {
-        let mut horse = horse();
-        let stack = crate::items::ItemStack::new("minecraft:saddle", 3);
-        horse.set_saddle(Some(stack.clone()));
-        assert_eq!(horse.saddle_item(), Some(stack));
-    }
-
-    /// `Entity.hurt` on a client level does nothing: the horse a rider's
-    /// client drives takes no fall of its own, and the server's health stays
-    /// (#15294: the client's copy died and lay on the ground, still ridable).
-    #[test]
-    fn a_client_copy_takes_no_fall_damage() {
-        let context = crate::test_resources::server_loop_context();
-        let mut test_level = crate::health::TestLevel::new(0);
-        let level = &mut test_level.level();
-        let mut m = horse();
-        m.extra.client_side = true;
-        let health = m.health;
-        let mut events = Vec::new();
-        assert!(!m.damage(level, 20.0, Damage::of(DamageKind::Fall)));
-        m.cause_fall_damage_at(
-            context,
-            level,
-            30.0,
-            1.0,
-            &mut events,
-            None,
-            DamageKind::Fall,
-        );
-        assert_eq!(m.health, health);
-        assert_eq!(m.hurt_time, 0);
-        assert!(m.alive());
-        // The server's copy of the same fall is hurt.
-        let mut server = horse();
-        server.cause_fall_damage_at(
-            context,
-            level,
-            30.0,
-            1.0,
-            &mut events,
-            None,
-            DamageKind::Fall,
-        );
-        assert!(server.health < health);
-    }
-
-    /// `LivingEntity.hurtArmor` (`doHurtEquipment`): a hit that lands on a mob
-    /// wearing body armour leaves the piece owing a wear, which the host
-    /// applies with the item's own maximum and fire rules.
-    #[test]
-    fn a_hurt_horse_reports_the_body_armour_wear() {
-        let mut test_level = crate::health::TestLevel::new(0);
-        let level = &mut test_level.level();
-        let hit = Damage {
-            kind: DamageKind::MobAttack,
-            attacker: None,
-            from: None,
-            attacker_species: None,
-        };
-        let mut m = horse();
-        m.extra
-            .set_body(Some("minecraft:diamond_horse_armor".into()));
-        assert!(m.damage(level, 6.0, hit), "the hit landed");
-        let owed = m.outbox.iter().find_map(|e| match e {
-            MobEvent::ArmorHurt { amount, .. } => Some(*amount),
-            _ => None,
-        });
-        assert!(
-            owed.is_some_and(|amount| amount > 0.0),
-            "the worn armour owes a wear: {owed:?}"
-        );
-        // A horse with no body armour owes nothing.
-        let mut bare = horse();
-        assert!(bare.damage(level, 6.0, hit));
-        assert!(
-            !bare
-                .outbox
-                .iter()
-                .any(|e| matches!(e, MobEvent::ArmorHurt { .. }))
-        );
-    }
-
-    /// `Horse` is the only mob that overrides `LivingEntity.hurtArmor` (the
-    /// base one is empty, `LivingEntity.java:1887`), so a donkey wearing a body
-    /// item — `/item replace entity @e[type=minecraft:donkey,limit=1]
-    /// armor.body with minecraft:wolf_armor` — wears nothing.
-    #[test]
-    fn a_donkey_wearing_a_body_item_wears_nothing() {
-        let mut test_level = crate::health::TestLevel::new(0);
-        let level = &mut test_level.level();
-        let mut donkey = mob("minecraft:donkey", Species::Donkey);
-        donkey.extra.set_body(Some("minecraft:wolf_armor".into()));
-        assert!(
-            donkey.damage(level, 6.0, Damage::of(DamageKind::MobAttack)),
-            "the hit landed"
-        );
-        assert!(
-            !donkey
-                .outbox
-                .iter()
-                .any(|e| matches!(e, MobEvent::ArmorHurt { .. })),
-            "only a horse's own override wears its body piece"
-        );
-    }
-
-    /// Vanilla holds a head item and a body item at once on the mobs with a
-    /// body slot (`LivingEntity.setItemSlot` over `EntityEquipment`): the
-    /// packet keeps the helmet on 5 and the armour on 6, `/item` reads each
-    /// back, and the armour value is the body piece's.
-    #[test]
-    fn a_horse_holds_a_helmet_and_its_body_armour_at_once() {
-        use horizon_core::equipment_slot::EquipmentSlot;
-        let mut m = horse();
-        m.extra.set_slot_id(
-            horizon_items::equipment::HEAD,
-            Some("minecraft:iron_helmet".into()),
-        );
-        m.extra
-            .set_body(Some("minecraft:diamond_horse_armor".into()));
-        let gear = m.equipment_stacks();
-        assert_eq!(
-            gear[5].as_ref().map(|s| s.item.as_ref().to_owned()),
-            Some("minecraft:iron_helmet".to_owned())
-        );
-        assert_eq!(
-            gear[6].as_ref().map(|s| s.item.as_ref().to_owned()),
-            Some("minecraft:diamond_horse_armor".to_owned())
-        );
-        let slot = |s| m.item_by_slot(s).map(|i| i.item.as_ref().to_owned());
-        assert_eq!(
-            slot(EquipmentSlot::Head),
-            Some("minecraft:iron_helmet".to_owned())
-        );
-        assert_eq!(
-            slot(EquipmentSlot::Body),
-            Some("minecraft:diamond_horse_armor".to_owned())
-        );
-        // Death keeps both (`Mob.dropCustomDeathLoot` by slot).
-        let body = crate::mobs::drops::slot_item(&m, "body").unwrap();
-        let head = crate::mobs::drops::slot_item(&m, "head").unwrap();
-        assert_eq!(body.item, "minecraft:diamond_horse_armor");
-        assert_eq!(head.item, "minecraft:iron_helmet");
-    }
-
-    /// `getDamageAfterArmorAbsorb` asks `hurtArmor` only when the damage type
-    /// is not in `#bypasses_armor` (`LivingEntity.java:1907-1909`), so a horse
-    /// that falls keeps its body piece whole.
-    #[test]
-    fn a_fall_does_not_wear_the_body_piece() {
-        let mut test_level = crate::health::TestLevel::new(0);
-        let level = &mut test_level.level();
-        let mut m = horse();
-        m.extra
-            .set_body(Some("minecraft:diamond_horse_armor".into()));
-        assert!(
-            m.damage(level, 6.0, Damage::of(DamageKind::Fall)),
-            "the fall landed"
-        );
-        assert!(
-            !m.outbox
-                .iter()
-                .any(|e| matches!(e, MobEvent::ArmorHurt { .. })),
-            "a #bypasses_armor hit asks for no wear"
-        );
-    }
-
-    /// The wear is measured by the damage `hurtArmor` is handed, which is the
-    /// one the armour, toughness and enchantment reductions have not touched
-    /// yet: 8 raw damage is `8 / 4 = 2` durability even though plate leaves far
-    /// less than 8 through to the health.
-    #[test]
-    fn the_wear_is_the_damage_before_the_armour_reduction() {
-        let mut test_level = crate::health::TestLevel::new(0);
-        let level = &mut test_level.level();
-        let mut m = horse();
-        let k = Arc::make_mut(&mut m.kind);
-        k.armor = 20.0;
-        m.extra
-            .set_body(Some("minecraft:diamond_horse_armor".into()));
-        let before = m.health;
-        assert!(m.damage(level, 8.0, Damage::of(DamageKind::MobAttack)));
-        assert!(m.health < before, "the hit reached the health");
-        let owed = m.outbox.iter().find_map(|e| match e {
-            MobEvent::ArmorHurt { amount, .. } => Some(*amount),
-            _ => None,
-        });
-        assert_eq!(
-            owed,
-            Some(8.0),
-            "the pre-reduction damage, not the damage the health took"
-        );
-    }
-}
+mod armor_hurt_tests;
 
 #[cfg(test)]
 mod allay_damage_identity_tests {

@@ -9,15 +9,23 @@ pub mod allocator_stats;
 #[cfg(target_os = "windows")]
 pub mod boot_paint;
 pub mod callgrind;
+#[cfg(target_os = "macos")]
+pub mod file_acl;
+#[cfg(windows)]
+pub mod file_publish;
 pub mod heap_census;
 #[cfg(target_os = "linux")]
 pub mod heap_sample;
 pub mod jobs;
+#[cfg(windows)]
+pub mod process_job;
 pub mod process_memory;
 #[cfg(target_os = "linux")]
 pub mod profile;
 #[cfg(target_os = "linux")]
 pub mod sampler;
+pub mod server_core;
+pub mod sizing;
 pub mod stack_dump;
 /// Alt+Space and a bare Alt never open the window's system menu, as in GLFW.
 #[cfg(target_os = "windows")]
@@ -42,8 +50,16 @@ pub fn worker_count() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
         parse_worker_count(std::env::var("HORIZON_WORKER_THREADS").ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .unwrap_or_else(|| available_parallelism().map_or(1, |n| n.get()))
     })
+}
+
+/// The CPUs this process may use, for sizing a pool: `std::thread::available_parallelism`,
+/// except while the server thread holds a core of its own ([`server_core`]), when the calling
+/// thread's own mask is narrower than the process's (the server thread's is that core alone,
+/// the threads moved off it have the rest): then the whole set the reservation was taken from.
+pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
+    server_core::whole_set().map_or_else(std::thread::available_parallelism, Ok)
 }
 
 /// `HORIZON_SERIAL_TICK=all`: every [`par_chunks_mut`] keeps its chunks on the
@@ -98,7 +114,10 @@ pub fn par_chunks_mut_with<T: Send>(
         let threads: Vec<_> = (0..helpers)
             .filter_map(|_| {
                 horizon_guest_stack::builder()
-                    .spawn_scoped(scope, work)
+                    .spawn_scoped(scope, || {
+                        server_core::leave_reserved();
+                        work()
+                    })
                     .ok()
             })
             .collect();
@@ -163,12 +182,27 @@ pub fn default_workers() -> usize {
     workers_for(worker_count(), performance_cores)
 }
 
+/// The cores this process has for its pools: [`worker_count`]'s share, narrowed to
+/// the performance cores where the machine tells them apart (its efficiency cores
+/// don't carry a worker, see [`default_workers`]).
+pub(crate) fn usable_cores() -> usize {
+    usable_cores_for(worker_count(), performance_cores)
+}
+
+/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here, the
+/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere).
+fn usable_cores_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
+    let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
+    cores.min(fast)
+}
+
 /// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
 /// sysctl) are performance cores where the machine tells them apart (`None` elsewhere):
 /// one less than the smaller count, at least 1.
 fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
-    let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
-    cores.min(fast).saturating_sub(1).max(1)
+    usable_cores_for(cores, performance)
+        .saturating_sub(1)
+        .max(1)
 }
 
 /// The machine's performance cores:
@@ -240,6 +274,12 @@ fn parse_worker_count(value: Option<String>) -> Option<usize> {
     value?.trim().parse().ok().filter(|&n| n > 0)
 }
 
+/// `true` only for `1` (`" 1 "` counts): `HORIZON_DECODER_PRIORITY` off where
+/// a run doesn't ask for it, and off for a value someone mistyped.
+fn parse_decoder_priority(value: Option<String>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
 /// Ask the OS to run the calling thread ahead of the process's other
 /// threads, as vanilla's `MinecraftServer.spin` does for its server thread
 /// (`Thread.setPriority(8)` when there are more than four processors), so
@@ -250,7 +290,7 @@ fn parse_worker_count(value: Option<String>) -> Option<usize> {
 /// unprivileged thread lower its priority but not raise it (and the JVM
 /// leaves it there too). Whether the OS took it.
 pub fn favour_current() -> bool {
-    if std::thread::available_parallelism().map_or(1, |n| n.get()) <= 4 {
+    if available_parallelism().map_or(1, |n| n.get()) <= 4 {
         return false;
     }
     favour()
@@ -276,6 +316,18 @@ fn favour() -> bool {
 #[cfg(not(any(target_vendor = "apple", windows)))]
 fn favour() -> bool {
     false
+}
+
+/// Called by a chunk decoder thread as it starts (the `ChunkDecoder` worker,
+/// up to four): the calling thread stays at the ordinary priority, below the
+/// one that ticks and draws a frame, as a decoder should. `HORIZON_DECODER_PRIORITY=1`
+/// gives the old raise back for an A/B run ([`favour_current`]); a value read
+/// once, like [`worker_count`]. Whether the OS took a raise it still asked for.
+pub fn chunk_decoder_current() -> bool {
+    static SWITCH: OnceLock<bool> = OnceLock::new();
+    let asked = *SWITCH
+        .get_or_init(|| parse_decoder_priority(std::env::var("HORIZON_DECODER_PRIORITY").ok()));
+    asked && favour_current()
 }
 
 /// The CPU time the calling thread has used, where only an OS call gives it
@@ -365,6 +417,8 @@ pub fn put_helpers_behind() {
 /// wants its core. A tick or a frame then gets a core when it starts instead
 /// of waiting behind them. Nothing elsewhere. Whether the OS took it.
 pub fn behind_server() -> bool {
+    // Avoid the server core when this thread's existing selection permits it.
+    server_core::leave_reserved();
     HELPERS_BEHIND.load(Ordering::Relaxed) && behind()
 }
 
@@ -434,14 +488,17 @@ fn far() -> bool {
 /// terrain on the efficiency cores long after the near chunks were in, and
 /// it took minutes to settle. On Linux and Android an unprivileged thread
 /// can't raise its priority again: it stays behind (`behind_server`), as it
-/// always has there, and this changes nothing. Whether the OS took it.
-#[cfg(any(target_vendor = "apple", windows))]
+/// always has there, and this changes nothing. On Windows it stays below
+/// normal for good too: back at normal, the far threads stood level with the
+/// game's other helpers and the rest of the desktop, the suspected cause of a
+/// world entry freezing a 16-thread PC (#19952). Whether the OS took it.
+#[cfg(target_vendor = "apple")]
 pub fn far_terrain_behind(behind: bool) -> bool {
-    // Both set the class or priority outright: calling again is harmless.
+    // Both set the class outright: calling again is harmless.
     if behind { far() } else { far_back() }
 }
 
-#[cfg(not(any(target_vendor = "apple", windows)))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn far_terrain_behind(_behind: bool) -> bool {
     false
 }
@@ -450,15 +507,6 @@ pub fn far_terrain_behind(_behind: bool) -> bool {
 fn far_back() -> bool {
     // SAFETY: sets the calling thread's own QoS class; no pointers.
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn far_back() -> bool {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_NORMAL,
-    };
-    // SAFETY: GetCurrentThread's pseudo handle needs no closing.
-    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0 }
 }
 
 /// Run the calling thread only on a core nothing else wants: work that may
@@ -817,11 +865,34 @@ mod tests {
     /// Without `HORIZON_WORKER_THREADS`, the count is the machine's.
     #[test]
     fn worker_count_defaults_to_the_machine() {
+        let _test = super::server_core::RESERVATION_TEST.lock().unwrap();
         if std::env::var_os("HORIZON_WORKER_THREADS").is_some() {
             return;
         }
-        let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert_eq!(super::worker_count(), machine);
+        assert_eq!(super::worker_count(), machine());
+    }
+
+    /// The machine's count as std sees it from a thread with the main thread's CPUs. libtest
+    /// starts each test on a new thread from its main thread: one started while another test's
+    /// reservation had moved that main thread off the reserved core inherits the narrower mask,
+    /// and lives too short for the keeper to see it. The main thread is given back, so its mask
+    /// is the machine's again once that test ends (this test holds the same lock).
+    fn machine() -> usize {
+        std::thread::spawn(|| {
+            #[cfg(target_os = "linux")]
+            // SAFETY: a zeroed cpu_set_t is the empty set; the size passed is its own, and the
+            // mask set is the main thread's, on this short-lived thread only.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                if libc::sched_getaffinity(libc::getpid(), size, &mut set) == 0 {
+                    libc::sched_setaffinity(0, size, &set);
+                }
+            }
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        })
+        .join()
+        .unwrap()
     }
 
     /// The pool leaves a core, counting only the performance cores where the machine has them.
@@ -916,6 +987,88 @@ mod tests {
         .unwrap();
     }
 
+    /// Only `1` asks for the decoders to be raised again: a run asks, a
+    /// mistyped or missing value leaves them below the frame.
+    #[test]
+    fn decoder_priority_switch_parses() {
+        for (value, on) in [
+            (None, false),
+            (Some("1"), true),
+            (Some(" 1 "), true),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("2"), false),
+            (Some(""), false),
+        ] {
+            assert_eq!(super::parse_decoder_priority(value.map(String::from)), on);
+        }
+    }
+
+    /// What #18241 is about: the thread a chunk decoder runs on stays at the
+    /// ordinary priority the pools' helpers have, while a thread that asks for
+    /// the raise the frame asks for goes above it — the control half, since
+    /// `favour_current` asks for nothing on a machine of four cores or fewer
+    /// and the first half alone would then pass without proving anything. A
+    /// run that starts with `HORIZON_DECODER_PRIORITY=1` has to raise the
+    /// decoder again instead, which checks the switch the same way.
+    #[cfg(windows)]
+    #[test]
+    fn a_decoder_thread_stays_below_the_frame() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) <= 4 {
+            return;
+        }
+        // A run started with `HORIZON_DECODER_PRIORITY=1` asks for the old
+        // raise: the same measurement then has to show it, which is the A/B.
+        // Read here, not through the switch the code under test reads.
+        let asked = std::env::var("HORIZON_DECODER_PRIORITY").is_ok_and(|v| v.trim() == "1");
+        let priority = |call: fn() -> bool| {
+            std::thread::spawn(move || {
+                call();
+                // SAFETY: reads the priority of the thread it runs on; the
+                // pseudo handle needs no closing.
+                unsafe { GetThreadPriority(GetCurrentThread()) }
+            })
+            .join()
+            .unwrap()
+        };
+        let decoder = priority(super::chunk_decoder_current);
+        let frame = priority(super::favour_current);
+        assert_eq!(
+            decoder,
+            if asked {
+                THREAD_PRIORITY_ABOVE_NORMAL
+            } else {
+                THREAD_PRIORITY_NORMAL
+            }
+        );
+        assert_eq!(frame, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
+    /// #19952: on Windows a far terrain thread stays below normal priority
+    /// once the near terrain is in, so the frame, the near terrain and the
+    /// desktop keep going first however many far threads there are.
+    #[cfg(windows)]
+    #[test]
+    fn a_far_terrain_thread_stays_below_normal_once_near_terrain_is_in() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let priority = std::thread::spawn(|| {
+            assert!(super::far_terrain_current());
+            super::far_terrain_behind(false);
+            // SAFETY: reads the priority of the thread it runs on; the
+            // pseudo handle needs no closing.
+            unsafe { GetThreadPriority(GetCurrentThread()) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(priority, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
     /// A helper goes behind only once a dedicated server asks for it, and
     /// then, on Linux and Android, 10 nice levels below the process or in the idle class.
     #[test]
@@ -965,7 +1118,12 @@ mod tests {
     }
 
     /// The option set is the purge delay: mimalloc v3's default for it is
-    /// 1000 ms, and it is 0 once configured.
+    /// 1000 ms, and it is 0 once configured. Configured, a Linux process also
+    /// takes no transparent huge pages, whatever the system's setting.
+    ///
+    /// The allocator's options are the process's, and libtest runs tests in
+    /// parallel: this must stay the only test here that configures it, or the
+    /// default read first sees another test's setting.
     #[test]
     fn configuring_the_allocator_purges_at_once() {
         // SAFETY: reads and sets one integer option.
@@ -975,24 +1133,19 @@ mod tests {
         }
         super::configure_allocator();
         assert_eq!(get(), 0);
-    }
-
-    /// Configured, the process takes no transparent huge pages, whatever the
-    /// system's setting.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn configuring_the_allocator_turns_transparent_huge_pages_off() {
-        super::configure_allocator();
-        // SAFETY: reads this process's flag.
-        assert_eq!(
-            unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
-            1
-        );
-        // SAFETY: reads one integer option.
-        assert_eq!(
-            unsafe { libmimalloc_sys::mi_option_get(super::ALLOW_THP) },
-            0
-        );
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: reads this process's flag.
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_THP_DISABLE, 0, 0, 0, 0) },
+                1
+            );
+            // SAFETY: reads one integer option.
+            assert_eq!(
+                unsafe { libmimalloc_sys::mi_option_get(super::ALLOW_THP) },
+                0
+            );
+        }
     }
 }
 

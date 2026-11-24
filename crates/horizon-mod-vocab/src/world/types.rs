@@ -652,7 +652,7 @@ pub enum ExplosionDestroyError {
     TooMany(u64),
     /// A stale level, or one not in place; a stale source or one in another level; a client.
     Unavailable,
-    /// A centre or radius that isn't finite, or a negative radius.
+    /// A centre or radius that isn't finite, a negative radius, or a radius over 64.
     InvalidBlast,
     /// A host without a game.
     NoGame,
@@ -781,6 +781,25 @@ impl SpawnLimits {
 impl Default for SpawnLimits {
     fn default() -> Self {
         Self::VANILLA
+    }
+}
+
+impl SpawnLimits {
+    /// Sets one category's limit and returns true. `MobCategory::Misc` has no limit: it is
+    /// refused (false, nothing changes).
+    pub fn set(&mut self, category: MobCategory, limit: u32) -> bool {
+        let slot = match category {
+            MobCategory::Monster => &mut self.monster,
+            MobCategory::Creature => &mut self.creature,
+            MobCategory::Ambient => &mut self.ambient,
+            MobCategory::Axolotls => &mut self.axolotls,
+            MobCategory::UndergroundWaterCreature => &mut self.underground_water_creature,
+            MobCategory::WaterCreature => &mut self.water_creature,
+            MobCategory::WaterAmbient => &mut self.water_ambient,
+            MobCategory::Misc => return false,
+        };
+        *slot = limit;
+        true
     }
 }
 
@@ -1582,6 +1601,51 @@ impl StructureSearchResult {
             structure,
             position,
         }
+    }
+}
+
+/// A structure a position is in, from `LevelRef::structures_at`: by its start's box, one of its
+/// pieces as placed, or both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct StructureAt {
+    /// Registry id of the structure.
+    pub structure: String,
+    /// Whether its start's box holds the position (`StructureManager.getStructureAt`).
+    pub in_box: bool,
+    /// Whether one of its pieces, as placed, holds the position
+    /// (`StructureManager.getStructureWithPieceAt`). A piece that settled below the box it was
+    /// made in, as a shipwreck does, holds blocks outside the start's box.
+    pub in_piece: bool,
+}
+
+impl StructureAt {
+    /// A structure reaching a position, by its start's box and by a piece.
+    pub fn new(structure: String, in_box: bool, in_piece: bool) -> Self {
+        Self {
+            structure,
+            in_box,
+            in_piece,
+        }
+    }
+}
+
+/// A loaded block entity from `LevelRef::block_entities`: its block's position and its type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+#[derive(horizon_mod_api_macros::Wire)]
+pub struct BlockEntityAt {
+    /// The position of its block.
+    pub pos: [i32; 3],
+    /// Registry id of its type (`BlockEntity.getType`): `minecraft:chest`.
+    pub id: String,
+}
+
+impl BlockEntityAt {
+    /// A block entity at `pos` of type `id`.
+    pub fn new(pos: [i32; 3], id: String) -> Self {
+        Self { pos, id }
     }
 }
 

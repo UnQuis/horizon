@@ -2,7 +2,7 @@
 use horizon_core::nbt::Tag;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub enum Holder<T> {
     Named(Arc<str>),
     Direct(T),
@@ -17,12 +17,12 @@ impl<T> From<&str> for Holder<T> {
         Self::Named(name.into())
     }
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub struct Material {
     pub palette_id: Arc<str>,
     pub description: Tag,
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub struct Pattern {
     pub asset_id: Arc<str>,
     pub description: Tag,
@@ -66,10 +66,14 @@ pub fn material_from_nbt(tag: &Tag) -> Option<Holder<Material>> {
 }
 pub fn pattern_from_nbt(tag: &Tag) -> Option<Holder<Pattern>> {
     holder(tag, |tag| {
+        let decal = match tag.get("decal") {
+            Some(v) => super::component_bool(v)?,
+            None => false,
+        };
         Some(Pattern {
             asset_id: name(tag.get("asset_id")?)?,
             description: description(tag.get("description")?)?,
-            decal: matches!(tag.get("decal"), Some(Tag::Byte(v)) if *v != 0),
+            decal,
         })
     })
 }

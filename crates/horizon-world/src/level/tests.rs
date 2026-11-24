@@ -55,6 +55,10 @@ pub(crate) struct TestLevel {
     pub block_events_ready: bool,
     /// Positions that refuse fluids, fire and piston moves, as a land claim would.
     pub guarded: HashSet<BlockPos>,
+    /// The states `template_suppressed` names: blocks of a mod that is off.
+    pub suppressed: HashSet<BlockStateId>,
+    /// How many times `allow_fluid_tick` was asked.
+    pub fluid_asks: std::cell::Cell<u32>,
     /// What `adjust_signal` answers at a position: the weak and direct signal,
     /// and the only direction they go in, if any.
     pub signals: HashMap<BlockPos, (i32, i32, Option<Direction>)>,
@@ -134,6 +138,8 @@ impl TestLevel {
             tick_ready: true,
             block_events_ready: true,
             guarded: HashSet::new(),
+            suppressed: HashSet::new(),
+            fluid_asks: Default::default(),
             fire_asks: Default::default(),
             source_asks: Default::default(),
             lava_asks: Default::default(),
@@ -293,7 +299,11 @@ impl LevelAccess for TestLevel {
         self.events.push(event);
     }
     fn allow_fluid_tick(&self, pos: BlockPos, _fluid: &'static str) -> bool {
+        self.fluid_asks.set(self.fluid_asks.get() + 1);
         !self.guarded.contains(&pos)
+    }
+    fn template_suppressed(&self, state: BlockStateId) -> bool {
+        self.suppressed.contains(&state)
     }
     fn allow_spread(&self, _kind: Spread, _from: BlockPos, to: BlockPos) -> bool {
         !self.guarded.contains(&to)
@@ -461,16 +471,25 @@ impl<'f> World<'f> {
     }
     pub(super) fn tick(&mut self) {
         self.level.time += 1;
+        self.ticks.begin_handling_tick();
         self.f
             .behaviours
             .tick_scheduled(&mut self.level, &mut self.ticks);
+        self.ticks.end_handling_tick();
     }
-    /// Scheduled ticks, block events and block entities, as `ServerLevel.tick`.
+    /// Scheduled ticks, block events and block entities, as `ServerLevel.tick`:
+    /// the ticks and the events inside `handlingTick` (ServerLevel.java:360,
+    /// :412), the block entities below it (:455).
     fn full_tick(&mut self) {
-        self.tick();
+        self.level.time += 1;
+        self.ticks.begin_handling_tick();
+        self.f
+            .behaviours
+            .tick_scheduled(&mut self.level, &mut self.ticks);
         self.f
             .behaviours
             .run_block_events(&mut self.level, &mut self.ticks);
+        self.ticks.end_handling_tick();
         self.f
             .behaviours
             .tick_block_entities(&mut self.level, &mut self.ticks);
@@ -883,36 +902,17 @@ fn max_chained_neighbor_updates_limits_a_chain_and_a_negative_value_lifts_it() {
 /// the ones after it are dropped without a line.
 #[test]
 fn passing_max_chained_neighbor_updates_logs_one_error_with_the_first_skipped_position() {
-    struct Lines(std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>);
-    impl log::Log for Lines {
-        fn enabled(&self, metadata: &log::Metadata) -> bool {
-            metadata.level() == log::Level::Error
-        }
-        fn log(&self, record: &log::Record) {
-            if self.enabled(record.metadata()) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((std::thread::current().id(), record.args().to_string()));
-            }
-        }
-        fn flush(&self) {}
-    }
-    static LINES: Lines = Lines(std::sync::Mutex::new(Vec::new()));
     let Some(f) = fixture() else { return };
-    log::set_logger(&LINES).expect("no other test installs a logger");
-    log::set_max_level(log::LevelFilter::Error);
+    // The crate's one test logger: this thread's errors only, as the tests run side by side.
+    crate::test_log::capture();
     wires_broken_by_updates(f, Some(1));
-    // Only this test's thread: the tests of the crate run side by side.
-    let me = std::thread::current().id();
-    let mine: Vec<String> = LINES
-        .0
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(thread, _)| *thread == me)
-        .map(|(_, line)| line.clone())
-        .collect();
+    let mine: Vec<String> = crate::test_log::with_records(|records| {
+        records
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Error)
+            .map(|(_, line)| line.clone())
+            .collect()
+    });
     assert_eq!(
         mine,
         ["Too many chained neighbor updates. Skipping the rest. First skipped position: 1, 63, 0"]
@@ -1147,8 +1147,10 @@ fn tick_block_hook_can_change_the_block_and_skip_its_own_tick() {
     let pos = BlockPos::new(1, 1, 1);
     // The due ticks run as the game runs them, stepped (scheduled_begin,
     // scheduled_step, scheduled_finish), or as tests do, through
-    // tick_scheduled.
+    // tick_scheduled; both inside the level tick's `handlingTick`
+    // (ServerLevel.java:360-412).
     let run = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
+        ticks.begin_handling_tick();
         if stepped {
             assert!(b.scheduled_begin(level, ticks, false));
             while b.scheduled_step(level, ticks, false) {}
@@ -1156,6 +1158,7 @@ fn tick_block_hook_can_change_the_block_and_skip_its_own_tick() {
         } else {
             b.tick_scheduled(level, ticks);
         }
+        ticks.end_handling_tick();
     };
     // One tick of the block at `pos` falls due.
     let due = |level: &mut Ticked, ticks: &mut Ticks, stepped: bool| {
@@ -2665,7 +2668,11 @@ fn tnt_duper_3856_piston_keeps_original_and_primes_one_tnt() {
                 base,
                 f.behaviours.block(power),
             );
+            // The event runs inside the level tick's `handlingTick`
+            // (ServerLevel.java:360-412).
+            w.ticks.begin_handling_tick();
             f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+            w.ticks.end_handling_tick();
         }
         let primed = w
             .level
@@ -3557,6 +3564,39 @@ fn open_shulker_box_supports_only_through_its_base_plate() {
             "open box facing {facing:?} lid side"
         );
     }
+}
+
+#[test]
+fn an_open_shulker_box_stops_conducting_redstone_but_a_closed_one_and_stone_do() {
+    let mut w = world!();
+    let box_pos = BlockPos::new(0, 1, 0);
+    let stone_pos = BlockPos::new(2, 1, 0);
+    w.put(box_pos, w.id("shulker_box", &[("facing", "up")]));
+    w.put(stone_pos, w.id("stone", &[]));
+    w.level.shulker_closed.remove(&box_pos);
+    let box_state = w.get(box_pos);
+    let stone_state = w.get(stone_pos);
+    {
+        let sim = w.b().sim(&mut w.level, &mut w.ticks);
+        assert!(
+            sim.is_redstone_conductor(box_state, box_pos),
+            "a closed box is a full cube"
+        );
+        assert!(
+            sim.is_redstone_conductor(stone_state, stone_pos),
+            "a full block still conducts"
+        );
+    }
+    w.level.shulker_closed.insert(box_pos, false);
+    let sim = w.b().sim(&mut w.level, &mut w.ticks);
+    assert!(
+        !sim.is_redstone_conductor(box_state, box_pos),
+        "an open lid takes the box out of the full cube"
+    );
+    assert!(
+        sim.is_redstone_conductor(stone_state, stone_pos),
+        "the open box does not change its neighbours"
+    );
 }
 
 #[test]
@@ -4894,7 +4934,7 @@ fn fresh_chunk_block_events_do_not_wait_for_ticking_readiness() {
         w.set(BlockPos::new(0, 0, 0), w.id("redstone_block", &[]));
         w.set(pos, piston);
         assert_eq!(w.ticks.block_events.len(), 1, "placement queues an event");
-        w.f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+        w.f.behaviours.tick_level_blocks(&mut w.level, &mut w.ticks);
         assert_eq!(
             w.prop(pos, "extended"),
             ticketed.to_string(),
@@ -4912,7 +4952,7 @@ fn fresh_chunk_block_events_do_not_wait_for_ticking_readiness() {
             );
         } else {
             w.level.block_events_ready = true;
-            w.f.behaviours.run_block_events(&mut w.level, &mut w.ticks);
+            w.f.behaviours.tick_level_blocks(&mut w.level, &mut w.ticks);
             assert_eq!(
                 w.prop(pos, "extended"),
                 "true",

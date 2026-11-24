@@ -362,7 +362,8 @@ impl Game<'_> {
         }
         rows
     }
-    /// Exercise `FishingHook.tick` in a still-water block on the server.
+    /// Exercise server `FishingHook.tick` in still water and client prediction on stone.
+    /// Each sampled hook is retired between seeds; only the player's original hook is restored.
     pub(super) fn fishing_bobbing_reference(&mut self) -> Vec<serde_json::Value> {
         let old_position = self.player.as_ref().unwrap().position;
         let block = [
@@ -407,12 +408,13 @@ impl Game<'_> {
             hook.random.set_seed(seed);
             self.install_fishing_hook(hook);
             self.tick_fishing();
-            let mut hook = self.hook.extract().expect("bobbing hook removed");
+            let hook = self.hook.as_mut().expect("bobbing hook removed");
             rows.push(serde_json::json!({
                 "seed": seed,
                 "vx": hook.velocity.x.to_bits() as i64, "vy": hook.velocity.y.to_bits() as i64,
                 "vz": hook.velocity.z.to_bits() as i64, "nibble": hook.nibble, "next": hook.random.next_long(),
             }));
+            self.hook.discard();
         }
         // The client must take the same block hit before moving as the server;
         // otherwise it lands farther away and slides back on the next update.
@@ -442,7 +444,6 @@ impl Game<'_> {
                 }));
             }
         }
-        self.hook.discard();
         if let Some(hook) = old_hook {
             self.hook.put_back(hook);
         }
@@ -489,7 +490,9 @@ impl Game<'_> {
         let at = [p.position.x, p.position.y, p.position.z];
         if self.hook.is_some() {
             let damage = self.retrieve_hook(stack);
-            self.damage_held(damage);
+            // FishingRodItem.hurtAndBreak(..., hand.asEquipmentSlot()): the
+            // rod in the acting hand breaks, not necessarily the main hand.
+            self.damage_held_in_slot(damage, self.acting_hand_slot());
             let pitch = 0.4 / (self.world.random.next_float() * 0.4 + 0.8);
             self.audio.play(
                 "minecraft:entity.fishing_bobber.retrieve",
@@ -963,7 +966,7 @@ impl Game<'_> {
         // The players a server serves are sent them too.
         self.lan_send_particles(super::lan_particles::QueuedParticle {
             dimension: self.dim.id(),
-            options,
+            options: options.into(),
             state: None,
             at,
             spread,
@@ -1057,7 +1060,7 @@ impl Game<'_> {
                     entity_hit_margin(h.tick_count),
                     self.mobs
                         .iter()
-                        .filter(|m| m.alive())
+                        .filter(|m| m.alive() && Some(m.id) != own_vehicle)
                         .map(|m| (m.id, m.bounds()))
                         .chain(
                             self.creatures

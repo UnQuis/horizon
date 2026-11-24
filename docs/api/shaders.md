@@ -47,6 +47,7 @@ id = "soft_light"          # [a-z0-9_]{1,64}: the settings key and the registry 
 name = "Soft Light"
 version = "1.0.0"
 api = "0.2"                # the shader API line the WGSL is written for
+post_opaque = true         # optional, let post passes read the world before translucent terrain
 description = "..."        # optional, like authors and license
 shared = ["common.wgsl"]   # optional: WGSL put before every stage's file, in order
 
@@ -56,6 +57,9 @@ clouds = true              # optional: false when the pack draws its own clouds
 sun = true                 # optional: false when the pack draws its own sun
 moon = true                # optional: false when the pack draws its own moon
 stars = true               # optional: false when the pack draws its own stars
+sun_path_rotation = 0.0    # optional: the sun's and moon's path tilted by this many degrees (-90 to 90), as
+                           # `sunPathRotation`: sun_direction, moon_direction, light_direction, the shadow
+                           # camera and Minecraft's sun, moon and stars turn with it
 
 [material]
 file = "material.wgsl"
@@ -241,7 +245,9 @@ blend = "gamma"            # optional: gamma (default) or linear
 primaries = "bt709"        # optional: bt709 (default) or bt2020, which needs blend = "linear"
 fog = "engine"             # optional: engine (default) or pack, when the pack fogs what its stages draw
 
-[ray_tracing]              # optional, needs [[post]] or [material], no keys: the post stage gets `trace` and `trace_any`, the material stage where it calls them
+[ray_tracing]              # optional, needs [[post]], [[before_world]], [material] or [entity]: the post stage gets `trace` and `trace_any`, other supported stages get them where they call them
+lights = true              # optional, default false: the light sources (`ray_lights_near`, `ray_light`) in the stages that name them
+step = true                # optional, default false: `trace_step`, a ray query whose per-surface rule is the pack's `ray_step`, in the stages that name it
 [motion]                   # optional, needs [[post]]: the post stage's motion guide (not drawn yet)
 ```
 
@@ -250,7 +256,7 @@ linear light: decode a constant written for display values with a 2.2 power, com
 `frame.luminance`, and stop returning `input.color.a` from post passes (their alpha is ignored). The example pack,
 `crates/horizon-shader-api/packs/golden_hour`, was moved this way. `packs/traced_shadows` and
 `packs/traced_water` are the smallest packs that trace rays, from a post pass and from the material stage
-([the guide](../shaders.md#ray-tracing)). `packs/horizon_hdr` is Horizon's own HDR look as a pack, from the look file
+([the guide](../shaders.md#ray-tracing)); `packs/traced_lights` lights a post pass with the block light sources. `packs/horizon_hdr` is Horizon's own HDR look as a pack, from the look file
 the renderer's own shaders start with: it reads the light-source fields, `frame.full_lightmap` and `lit_tint`
 (changelog, 2026-11-19), and its README lists what a pack can't draw of the look yet.
 
@@ -297,6 +303,45 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
 
 ## Changelog
 
+- API 0.2 (addition): `post_opaque = true` lets native post passes read the pre-translucent
+  color and depth. They reuse the material stage's capture, and only packs that read it request
+  that capture (#3734).
+
+- 2026-11-22: API 0.2 (addition, preview): `[sky] sun_path_rotation`, degrees from -90 to 90 (0 when absent): the
+  tilt of the sun's and moon's path, as `shaders/` packs' `sunPathRotation`. It turns `sun_direction`,
+  `moon_direction`, `light_direction`, the shadow camera and the sun, moon and stars Minecraft draws over the pack's
+  sky (nothing turns under the End sky). A pack without the key is unchanged.
+- 2026-11-21: API 0.2 (additions, preview; first build: Nightly `TBD`): the candidate step, under `[ray_tracing]`
+  with its second key, `step = true` (off by default). A stage whose files name `trace_step`, `RayCandidate`, a
+  `candidate_` function or a `RAY_PASS`/`RAY_STOP`/`RAY_END` action defines `struct RayState` and `fn ray_step(c:
+  RayCandidate, state: ptr<function, RayState>) -> u32`, and `trace_step` hands it every surface of one ray query, in
+  no set order ([the guide](../shaders.md#candidate-steps)); `trace_light` of #19249 is a step of a few lines. A pack
+  without the key sees the same prelude as before, and its own names stay its own.
+- 2026-11-20: API 0.2 (additions, preview): the light sources, under `[ray_tracing]` with its first key,
+  `lights = true` (off by default). A stage whose files name `ray_lights_near`, `ray_light`, `ray_light_at`,
+  `ray_light_count` or `RayLight` gets the light-giving blocks around the camera (`RayLight`: `position`, `level`,
+  `color`, `material`; up to 1024, nearest first; fluids left out) and a grid of 8-block cells listing the sources that
+  reach each, so a pass aims shadow rays at a few sources ([the guide](../shaders.md#light-sources)); only such a pass
+  binds them (binding 80). A pack without the key sees the same prelude as before, and its own names stay its own.
+- 2026-11-19: API 0.2 (change, preview): under a pack without `[[post]]` whose frame holds gamma light and whose
+  `[tonemap]`, if it has one, never reads `previous`, TAA upscaling and its sharpening apply too (#16126 step 7): the
+  world draws smaller, `frame.resolution` stays its size, `input.color` samples the picture TAA rebuilt, and the
+  sharpening runs before the decode and the tone curve. A `[tonemap]` that reads `previous` keeps TAA at the world's
+  size. With TAA or upscaling off, upscaling and sharpening change nothing. Under every pack, TAA or not,
+  `frame.projection` is now the lens the world is drawn with, of the window's aspect, where it was made again from the world's rounded size: at a resolution scale that rounds unevenly,
+  a position rebuilt from depth no longer drifts sideways.
+- 2026-11-19: API 0.2 (change, preview): a pack without `[[post]]` whose frame holds gamma light also gets the
+  player's TAA, at the world's size (#16126 step 7); `frame.jitter` and `frame.previous_jitter` then carry its offset.
+  TAA upscaling and its sharpening stay off, and under any other pack TAA is off. With TAA off nothing changes. A pack
+  must never write an infinite value into the world's frame: TAA's history would carry it.
+- 2026-11-19: API 0.2 (additions, preview): `frame.jitter`, the world's sub-pixel offset this frame in clip space,
+  which `frame.projection` leaves out, and `frame.previous_jitter`, last frame's, declared only for a pack whose files
+  name either, at the end of `Frame`. Both are `(0, 0)` while the world isn't jittered, today in every pack's frame. A
+  pack that names neither sees the same prelude as before, and its picture is unchanged.
+- 2026-11-19: API 0.2 (addition, preview): a pack without `[[post]]` whose frame holds gamma light (not
+  `blend = "linear"` on the float frame) gets the player's FXAA, at the world's size, before its `[tonemap]` (#16126
+  step 6). TAA and upscaling stay off under every pack, and a pack with a post chain is unchanged. With FXAA off
+  nothing changes.
 - 2026-11-19: API 0.2 (addition, preview): `MaterialInput.lit_tint`, vanilla's lit vertex colour as Horizon's terrain
   draws it: `shaded_tint` times the lightmap (coloured lights added under it) at each corner, then smoothed over the
   face, so `albedo * lit_tint` is vanilla's lit colour where multiplying the two smoothed apart is not (6.6 steps of
@@ -376,6 +421,11 @@ no shadow into a pack's shadow map yet, and the first-person hand has no stage.
   times the layer's opacity is cut and blends, not the returned alpha, and `horizon-shader check` refuses a `discard`
   that `entity` can reach. An entity stage that cuts or fades entities itself sets `coverage = "pack"`, which keeps
   the old behaviour.
+- 2026-11-14: API 0.2 (additions, experimental): under `[ray_tracing]` the entity stage gets `RayHit`, the trace
+  functions, `hit_normal_map`, `hit_specular_map` and `block_pbr_maps` too, as the material stage has them, where its
+  files name a trace function; an entity stage that names none is built from the same WGSL as before, a test holds.
+  `[ray_tracing]` needs a `[[post]]` pass, a `[[before_world]]` pass, a `[material]` or an `[entity]` stage. The game binds the scene to the
+  entities' draw in the world's colour pass.
 - 2026-11-14: API 0.2 (experimental): `RAY_ENTITY` also holds the block entities at rest that the block entity cache
   keeps (on in every graphics preset: closed chests, shulker boxes, bells, decorated pots, banners), in view or not,
   so they cast traced shadows and show in reflections as the mobs do. A hit on one is an entity hit like any other.

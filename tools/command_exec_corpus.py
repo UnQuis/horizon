@@ -30,6 +30,18 @@ def setup(*commands):
     return [cmd(c, False) for c in commands]
 
 
+# Feedback names: an item summoned with no item reads as air; a named ominous
+# item spawner is called by its CustomName.
+SUMMON_NAME_CASES = [
+    cmd('/summon minecraft:item 4.5 210 4.5'),
+    cmd('/summon minecraft:item 4.5 210 4.5 {}'),
+    cmd('/kill @e[type=minecraft:item]'),
+    cmd('/summon minecraft:ominous_item_spawner 4.5 210 8.5 {CustomName:"sw",Tags:["n"]}'),
+    cmd('/tp @e[type=minecraft:ominous_item_spawner,tag=n] 4.5 215 8.5'),
+    cmd('/kill @e[type=minecraft:ominous_item_spawner,tag=n]'),
+]
+
+
 def weather_predicate_cases():
     return [('any', None, None), ('rain', True, None), ('dry', False, None),
             ('thunder', None, True), ('quiet', None, False),
@@ -761,6 +773,7 @@ def entities():
         cmd('/summon minecraft:ominous_item_spawner 4.5 210 8.5'),
         cmd('/data get entity @e[type=minecraft:ominous_item_spawner,limit=1] item'),
         cmd('/kill @e[type=minecraft:ominous_item_spawner]'),
+        *SUMMON_NAME_CASES,
         cmd('/summon minecraft:ominous_item_spawner 4.5 210 8.5 {spawn_item_after_ticks:5L}'),
         {'op': 'tick', 'n': 10},
         cmd('/execute if entity @e[type=minecraft:ominous_item_spawner]'),
@@ -900,6 +913,9 @@ def scores():
         cmd('/scoreboard objectives setdisplay list harness'),
         cmd('/scoreboard objectives setdisplay sidebar harness'),
         cmd('/scoreboard objectives modify harness displayname "Shown"'),
+        cmd('/scoreboard objectives modify harness displayname {"text":"Shown"}'),
+        cmd('/scoreboard objectives modify harness displayname {"text":"Shown","bold":true}'),
+        cmd('/scoreboard objectives modify harness displayname [{"text":"Shown","bold":true}]'),
         cmd('/scoreboard objectives modify harness rendertype hearts'),
         cmd('/execute store result score @s harness run scoreboard players get @s harness'),
         cmd('/execute if score @s harness matches 15'),
@@ -2005,7 +2021,19 @@ def loot_world_pack_tables():
         cmd('/function parity:pack_loot_give'),
         cmd('/clear @s minecraft:emerald 0'),
         cmd('/loot give @s loot parity:missing'),
-        *setup('/clear @s', '/setblock 2 220 2 minecraft:air'),
+        # An int provider's constant is read by Codec.INT, which cuts 2.5 to 2.
+        *setup('/clear @s'),
+        cmd('/loot give @s loot parity:pack_fraction'),
+        cmd('/clear @s minecraft:emerald 0'),
+        # EnchantedCountIncreaseFunction: grow(Math.round(level * count)), so 5 + round(-1.5) is 4.
+        *setup('/clear @s', '/kill @e[type=minecraft:endermite]',
+               '/summon minecraft:endermite 2.5 221 2.5 {NoAI:1b,Tags:["pack_round"]}',
+               '/item replace entity @s weapon.mainhand with minecraft:iron_sword'
+               '[minecraft:enchantments={"minecraft:looting":1}]'),
+        cmd('/loot give @s kill @e[type=minecraft:endermite,tag=pack_round,limit=1]'),
+        cmd('/clear @s minecraft:emerald 0'),
+        *setup('/clear @s', '/tp @e[type=minecraft:endermite,tag=pack_round] 2.5 -100 2.5',
+               '/setblock 2 220 2 minecraft:air'),
     ]
 
 
@@ -3157,6 +3185,7 @@ def social():
         cmd('/help execute'),
         cmd('/help scoreboard players'),
         cmd('/help nonexistent'),
+        cmd('/help give @s minecraft:stone 64'),
         *setup('/scoreboard objectives remove trig', '/scoreboard objectives remove plain'),
     ]
 
@@ -6607,6 +6636,15 @@ def advancement_loot_fixtures(group_names):
         tables['parity:pack_loot'] = {'type': 'minecraft:chest', 'pools': [{'rolls': 1, 'entries': [
             {'type': 'minecraft:item', 'name': 'minecraft:emerald',
              'modifier': {'type': 'minecraft:set_count', 'count': 3}}]}]}
+        tables['parity:pack_fraction'] = {'type': 'minecraft:chest', 'pools': [{'rolls': 1, 'entries': [
+            {'type': 'minecraft:item', 'name': 'minecraft:emerald',
+             'modifier': {'type': 'minecraft:set_count', 'count': 2.5}}]}]}
+        # No other group summons an endermite, so its table is this group's to replace.
+        tables['minecraft:entities/endermite'] = {'type': 'minecraft:entity', 'pools': [{'rolls': 1, 'entries': [
+            {'type': 'minecraft:item', 'name': 'minecraft:emerald', 'modifier': [
+                {'type': 'minecraft:set_count', 'count': 5},
+                {'type': 'minecraft:enchanted_count_increase', 'enchantment': 'minecraft:looting',
+                 'count': -1.5}]}]}]}
     try:
         from . import player_food_predicate_corpus as player_food
     except ImportError:

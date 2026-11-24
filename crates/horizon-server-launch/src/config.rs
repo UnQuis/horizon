@@ -230,6 +230,39 @@ pub struct Config {
     /// `[entities]` (docs/server.md): mob settings passed to the game; written only when it isn't the default.
     #[serde(default, skip_serializing_if = "Entities::is_default")]
     pub entities: Entities,
+    /// `[proxy]` (docs/hosting.md): the supervisor owns the public port and the game listens behind it;
+    /// written only when it isn't the default.
+    #[serde(default, skip_serializing_if = "Proxy::is_default")]
+    pub proxy: Proxy,
+}
+
+/// `[proxy]`: the supervisor listens on `server.port` and signs players in itself (proxy/mod.rs), and the
+/// game listens on 127.0.0.1 behind it, with Velocity forwarding. Off by default. Read when horizon-server
+/// starts: turning it on or off needs a restart of horizon-server, not only of the game.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Proxy {
+    pub enabled: bool,
+    /// The port the game listens on, on 127.0.0.1; 0 takes a free one at every start of horizon-server.
+    pub game_port: u16,
+    /// How long a player is held through a restart before it is sent away if the game isn't back.
+    pub hold_seconds: u32,
+}
+
+impl Default for Proxy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            game_port: 0,
+            hold_seconds: 60,
+        }
+    }
+}
+
+impl Proxy {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[entities]`: `villager_lobotomize = true` skips the brain of villagers that cannot move (stuck in a cell,
@@ -759,6 +792,12 @@ impl Config {
         self.chat_filter.check()?;
         self.prune_chunks.check()?;
         self.entities.check()?;
+        if !(1..=3600).contains(&self.proxy.hold_seconds) {
+            return Err("proxy.hold_seconds must be from 1 to 3600".into());
+        }
+        if self.proxy.enabled && self.proxy.game_port == self.server.port {
+            return Err("proxy.game_port is server.port: the game listens behind the proxy, on its own port".into());
+        }
         // The game opens these as given, appending player text or rewriting them, so they stay
         // in the server folder: not absolute, not up a level, no drive (`C:x`) on Windows.
         for (what, path) in [
@@ -793,6 +832,22 @@ impl Config {
                 range.end()
             ));
         }
+        // The game reads these properties as Java ints; a larger number fails to parse and is silently
+        // replaced by the default (20, 10). Smaller or larger values it clamps itself, so only these are refused.
+        let server = &self.server;
+        for (name, value) in [
+            ("max_players", server.max_players),
+            ("view_distance", server.view_distance),
+            ("simulation_distance", server.simulation_distance),
+            ("max_view_distance", server.max_view_distance),
+        ] {
+            if i32::try_from(value).is_err() {
+                return Err(format!(
+                    "server.{name} is {value}: use at most {}",
+                    i32::MAX
+                ));
+            }
+        }
         if let Some((section, field, key)) =
             TYPED.iter().find(|t| self.properties.contains_key(t.2))
         {
@@ -817,14 +872,56 @@ impl Config {
                 .iter()
                 .map(|(k, v)| (k.clone(), property_text(v))),
         );
+        // Behind the proxy the game listens where only it goes (`game_port` is set once the proxy runs).
+        if self.proxy.enabled && self.proxy.game_port != 0 {
+            for (key, value) in [
+                ("server-ip".to_owned(), "127.0.0.1".to_owned()),
+                ("server-port".to_owned(), self.proxy.game_port.to_string()),
+                ("online-mode".to_owned(), "false".to_owned()),
+            ] {
+                match out.iter_mut().find(|(k, _)| *k == key) {
+                    Some(slot) => slot.1 = value,
+                    None => out.push((key, value)),
+                }
+            }
+        }
         out
     }
 
     /// Writes this configuration into `server.properties`, keeping the keys it doesn't set. Returns what it
-    /// wrote, for [`sync_back`].
+    /// wrote, for [`sync_back`]. A file (or link) that exists but can't be read or parsed is left as it is
+    /// and is an error: writing over it would lose the owner's other keys. (The game refuses an unparsable
+    /// file too.)
     pub fn write_properties(&self, dir: &Path) -> std::io::Result<Vec<(String, String)>> {
         let path = dir.join(PROPERTIES);
-        let mut properties = read_properties(&path).unwrap_or_default();
+        let mut properties = match std::fs::read(&path) {
+            Ok(bytes) => load_properties(&path, &bytes).map_err(|why| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{why} (left as it is)"),
+                )
+            })?,
+            // Only a file that isn't there at all: a link to a volume that is away reads as missing too,
+            // and the rename would replace the link.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&path)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Properties::default()
+            }
+            Err(e) => {
+                let why = if e.kind() == std::io::ErrorKind::NotFound {
+                    "it links to a file that isn't there".to_owned()
+                } else {
+                    e.to_string()
+                };
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("{}: {why} (left as it is)", path.display()),
+                ));
+            }
+        };
         let written = self.vanilla();
         for (key, value) in &written {
             properties.put(key, value.clone());
@@ -848,6 +945,16 @@ impl Config {
         }
         ServerProperties::new(properties, &mut SystemEntropy::default())
             .map_or(4, |p| p.op_permission_level)
+    }
+
+    /// A key as the game reads it at its next start: `server.properties` with this configuration's keys
+    /// written over it (as [`Config::write_properties`] does), so a key only the file sets counts too.
+    pub fn effective_property(&self, dir: &Path, key: &str) -> Option<String> {
+        let mut properties = read_properties(&dir.join(PROPERTIES)).unwrap_or_default();
+        for (k, value) in self.vanilla() {
+            properties.put(&k, value);
+        }
+        properties.get(key).map(str::to_owned)
     }
 
     /// A configuration from a vanilla `server.properties`: typed settings from their keys, and every other
@@ -930,6 +1037,7 @@ pub fn render(config: &Config) -> String {
         "combat",
         "biome_regions",
         "entities",
+        "proxy",
     ] {
         if let Some(settings) = table.get(section) {
             let mut only = toml::Table::new();
@@ -1036,7 +1144,14 @@ pub fn update_all(dir: &Path, changes: &[(String, String, toml::Value)]) -> Resu
 
 pub fn read_properties(path: &Path) -> Result<Properties, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    Properties::load_file(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    load_properties(path, &bytes)
+}
+
+/// The properties file at `path`, read as `bytes`; when they don't load, an error naming the file and the
+/// line of the entry that breaks it.
+fn load_properties(path: &Path, bytes: &[u8]) -> Result<Properties, String> {
+    Properties::load_file_locating(bytes)
+        .map_err(|(e, line)| format!("{}, line {line}: {e}", path.display()))
 }
 
 /// Sets one value in a TOML document, keeping the comment after the old value.
@@ -1124,6 +1239,27 @@ keep = {keep}
         assert!(with(1001).is_err());
         assert!(with(1).is_ok() && with(1000).is_ok());
         assert_eq!(Config::default().backups.keep, 12);
+    }
+
+    /// The game parses these as Java ints and replaces what does not fit with its default, unannounced.
+    #[test]
+    fn server_numbers_the_game_cannot_read_are_refused() {
+        let with = |key: &str, n: u32| Config::parse(&format!("[server]\n{key} = {n}\n"));
+        for key in [
+            "max_players",
+            "view_distance",
+            "simulation_distance",
+            "max_view_distance",
+        ] {
+            let err = with(key, 3_000_000_000).unwrap_err();
+            assert!(
+                err.contains(&format!("server.{key} is 3000000000")),
+                "{err}"
+            );
+            assert!(with(key, i32::MAX as u32).is_ok());
+        }
+        // The game clamps these itself, so a file that worked keeps working.
+        assert!(with("view_distance", 64).is_ok() && with("max_players", 5000).is_ok());
     }
 
     #[test]
@@ -1524,6 +1660,139 @@ keep = {keep}
         assert_eq!(back.properties["spawn-protection"], toml::Value::Integer(4));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn the_proxy_is_off_by_default_and_moves_the_game_behind_it_when_on() {
+        let config = Config::default();
+        assert!(!config.proxy.enabled);
+        let key = |c: &Config, k: &str| c.vanilla().into_iter().find(|(key, _)| key == k);
+        // Off, the game keeps the owner's port and online mode.
+        assert_eq!(key(&config, "server-port").unwrap().1, "25565");
+        assert_eq!(key(&config, "online-mode").unwrap().1, "true");
+
+        let on = Config::parse("[proxy]\nenabled = true\ngame_port = 25999\n").unwrap();
+        assert!(on.proxy.enabled);
+        assert_eq!(key(&on, "server-port").unwrap().1, "25999");
+        assert_eq!(key(&on, "server-ip").unwrap().1, "127.0.0.1");
+        // The proxy signs players in: the game trusts what it forwards.
+        assert_eq!(key(&on, "online-mode").unwrap().1, "false");
+        // The owner's own port is where the proxy listens, and the file keeps it.
+        assert_eq!(on.server.port, 25565);
+        assert!(render(&on).contains("[proxy]"));
+        assert!(!render(&config).contains("[proxy]"));
+    }
+
+    #[test]
+    fn the_games_port_behind_the_proxy_is_not_the_public_one() {
+        let err = Config::parse("[proxy]\nenabled = true\ngame_port = 25565\n").unwrap_err();
+        assert!(err.contains("proxy.game_port"), "{err}");
+        assert!(Config::parse("[proxy]\nunknown = 1\n").is_err());
+    }
+    /// One bad escape in an owner's server.properties: the start refuses with the file and line instead of
+    /// writing server.toml's keys over a file that lost every other key (the game refuses the file too).
+    #[test]
+    fn a_malformed_server_properties_is_left_as_it_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-config-malformed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner = "#Minecraft server properties\nrcon.port=25576\nlevel-name=castle\nmotd=caf\\uZZZZ\nview-distance=16\n";
+        std::fs::write(dir.join(PROPERTIES), owner).unwrap();
+        let e = Config::default().write_properties(&dir).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        let e = e.to_string();
+        assert!(e.contains(PROPERTIES) && e.contains("line 4"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(PROPERTIES)).unwrap(),
+            owner
+        );
+        // The line is counted as the properties reader counts lines.
+        for (text, line) in [
+            ("motd=ok\rbad=\\uZZZZ\r", 2),
+            ("motd=ok\r\nbad=\\uZZZZ\r\n", 2),
+            ("motd=\\u12\\\n34\nbad=\\uZZZZ\n", 3),
+        ] {
+            std::fs::write(dir.join(PROPERTIES), text).unwrap();
+            let e = Config::default().write_properties(&dir).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("line {line}:")),
+                "{text:?}: {e}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A server.properties that exists but can't be read is not replaced either; only a missing one is
+    /// written from server.toml alone.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_server_properties_is_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-config-unreadable-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PROPERTIES);
+        let owner = "rcon.port=25576\nlevel-name=castle\n";
+        std::fs::write(&path, owner).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to check there.
+        if std::fs::read(&path).is_err() {
+            let e = Config::default().write_properties(&dir).unwrap_err();
+            assert!(e.to_string().contains(PROPERTIES), "{e}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), owner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A server.properties linked to a volume that isn't mounted reads as missing, but it is the owner's
+    /// file: the link is kept, not replaced by a file of server.toml's keys.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_properties_link_to_a_missing_file_is_left_as_it_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-server-config-dangling-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PROPERTIES);
+        let target = dir.join("away").join(PROPERTIES);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let e = Config::default().write_properties(&dir).unwrap_err();
+        assert!(e.to_string().contains(PROPERTIES), "{e}");
+        assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key only `server.properties` sets reaches whoever asks as the game would read it, and server.toml
+    /// wins where both set it.
+    #[test]
+    fn an_effective_property_includes_keys_only_the_file_sets() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-effective-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(PROPERTIES),
+            "enable-status=false\nnetwork-compression-threshold=64\n",
+        )
+        .unwrap();
+        let config = Config::parse("[properties]\nnetwork-compression-threshold = 512\n").unwrap();
+        assert_eq!(
+            config.effective_property(&dir, "enable-status").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            config
+                .effective_property(&dir, "network-compression-threshold")
+                .as_deref(),
+            Some("512")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn written_files_stay_in_the_server_folder() {
         for bad in [

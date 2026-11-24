@@ -73,7 +73,14 @@ impl Launcher {
             SelfUpdate::Ready(v) => format!(
                 "{}  ·  {}",
                 backend::VERSION,
-                trf("{version} available", &[("version", v)])
+                if horizon_launcher::update_handoff::installs_on_close() {
+                    trf(
+                        "{version} installs when you close Horizon",
+                        &[("version", v)],
+                    )
+                } else {
+                    trf("{version} available", &[("version", v)])
+                }
             ),
             SelfUpdate::Stuck(Some(e)) => format!(
                 "{}  ·  {}",
@@ -110,7 +117,7 @@ impl Launcher {
         };
         let launcher_action = match &self.self_update {
             SelfUpdate::Ready(_) => Some(
-                button("update-settings", "Update", Kind::Secondary, &t)
+                button("update-settings", "Update now", Kind::Secondary, &t)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.apply_launcher_update(cx);
                         cx.notify();
@@ -366,7 +373,7 @@ impl Launcher {
                                     this.build_native_on(base, back_up)
                                 }
                                 PendingConsent::Toggle(entry) => this.mods_switch(&entry),
-                                PendingConsent::Install(source, id, known) => this.mods_install(source, id, known),
+                                PendingConsent::Install(request) => this.mods_install(request),
                                 PendingConsent::Github(found, only) => this.github_install(found, only),
                                 PendingConsent::Local(id) => {
                                     this.mods.message = horizon_launcher::browser::java::set_enabled(&this.mods.home(), &id, true).err().map(Err);

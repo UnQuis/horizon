@@ -1,5 +1,9 @@
 //! The game's side of the `draw` area (`horizon-mod-api/src/host/draw.rs`).
-use crate::game::{Game, api_values::TryIntoEngine};
+use crate::game::{
+    Game,
+    api_values::TryIntoEngine,
+    native_scene::{SceneBlocks, SceneFrame},
+};
 use mod_api::{prelude::*, *};
 
 /// [`DrawContext`] on the game's `crate::hud::HudBatch`: one per hook call.
@@ -96,8 +100,54 @@ impl DrawContext for GameDrawContext<'_, '_> {
         view: SceneView,
     ) -> Result<(), mod_api::SceneError> {
         let blocks = crate::game::api_values::aggregates::scene_blocks(&scene.blocks)?;
+        self.game.native_draw_scene(
+            &mut *self.surface,
+            &SceneBlocks::stationary(&blocks),
+            scene,
+            SceneFrame::new(rect, view),
+        )
+    }
+    fn draw_scene_with_quads(
+        &mut self,
+        rect: [f32; 4],
+        scene: &Scene,
+        view: SceneView,
+        quads: &[SceneTexturedQuad],
+    ) -> Result<(), SceneWithQuadsError> {
+        if !self.game.native_window() {
+            return Err(SceneWithQuadsError::Scene(SceneError::Unavailable));
+        }
+        let frame = SceneFrame::new(rect, view).with_textured_quads(&self.game.gui.atlas, quads)?;
+        let blocks = crate::game::api_values::aggregates::scene_blocks(&scene.blocks)
+            .map_err(SceneWithQuadsError::Scene)?;
         self.game
-            .native_draw_scene(&mut *self.surface, rect, &blocks, scene, view)
+            .native_draw_scene(
+                &mut *self.surface,
+                &SceneBlocks::stationary(&blocks),
+                scene,
+                frame,
+            )
+            .map_err(SceneWithQuadsError::Scene)
+    }
+    fn draw_scene_with_sections(
+        &mut self,
+        rect: [f32; 4],
+        scene: &Scene,
+        view: SceneView,
+        sections: &[SceneSection],
+    ) -> Result<(), SceneSectionError> {
+        if sections.is_empty() {
+            return self.draw_scene(rect, scene, view).map_err(Into::into);
+        }
+        let cells = crate::game::api_values::aggregates::scene_blocks(&scene.blocks)?;
+        let blocks = SceneBlocks::posed(&cells, sections)?;
+        self.game.native_draw_scene(
+            &mut *self.surface,
+            &blocks,
+            scene,
+            SceneFrame::new(rect, view),
+        )?;
+        Ok(())
     }
     fn push_clip(&mut self, rect: [f32; 4]) -> Result<(), GuiClipRefusal> {
         self.clips.push(self.surface, rect)
@@ -112,6 +162,9 @@ impl DrawContext for GameDrawContext<'_, '_> {
     fn draw_menu_background(&mut self, rect: [f32; 4], in_world: bool) {
         self.game
             .native_draw_menu_background(&mut *self.surface, rect, in_world)
+    }
+    fn blur_behind(&mut self) {
+        self.game.native_blur_behind(&mut *self.surface)
     }
     fn tiled_sprite(&mut self, sprite: &str, rect: [f32; 4], size: f32, argb: u32) -> bool {
         self.game
@@ -188,6 +241,9 @@ impl BlockEntityDrawContext for GameBlockEntityDrawContext<'_, '_> {
     }
     fn set_light(&mut self, light: u32) {
         self.game.native_draw_set_light(&mut *self.surface, light)
+    }
+    fn set_glint(&mut self, glint: bool) {
+        self.game.native_draw_set_glint(&mut *self.surface, glint)
     }
     fn quad(&mut self, sprite: &str, corners: [[f32; 3]; 4], uv: [f32; 4], tint: u32) -> bool {
         self.game
@@ -320,6 +376,12 @@ impl WorldDrawContext for GameWorldDrawContext<'_, '_> {
     }
     fn quads(&mut self, quads: &[WorldQuad]) -> Result<(), DrawError> {
         self.game.native_world_draw_quads(&mut *self.surface, quads)
+    }
+    fn beam(&mut self, beam: &WorldBeam) -> Result<(), DrawError> {
+        self.game.native_world_draw_beam(&mut *self.surface, beam)
+    }
+    fn text(&mut self, text: &WorldText) -> Result<(), DrawError> {
+        self.game.native_world_draw_text(&mut *self.surface, text)
     }
     fn pipeline_quads(
         &mut self,

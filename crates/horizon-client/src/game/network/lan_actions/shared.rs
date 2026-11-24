@@ -9,7 +9,7 @@ pub(super) enum MenuOpen {
 
 /// Per-guest state of the gameplay code that lives outside `Guest`.
 #[derive(Default)]
-pub(super) struct GuestPlay {
+pub(in crate::game) struct GuestPlay {
     mining: Option<Mining>,
     destroy_delay: u32,
     using: Option<(usize, u32)>,
@@ -76,7 +76,7 @@ pub(super) struct GuestPlay {
     /// `Stats.LEAVE_GAME` is counted: a guest is saved more than once on the
     /// way out, the statistic is awarded once (`Game::award_leave_game`).
     pub(super) left_game: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     /// `ServerPlayer.levitationStartPos` and `levitationStartTime`.
     levitation: Option<([f64; 3], u64)>,
     /// The fall, lava ride, Nether trip and blast the guest's advancements track.
@@ -195,7 +195,7 @@ pub(super) struct GuestSwap {
     message: Option<(String, std::time::Instant)>,
     host_ender: Option<(i32, i32, i32)>,
     adv_loaded: bool,
-    last_inventory: u64,
+    last_inventory: Option<u64>,
     levitation: Option<([f64; 3], u64)>,
     marks: super::advancements::TravelMarks,
     death_cause: Option<String>,
@@ -239,6 +239,15 @@ impl GuestPlay {
     /// The guest's `Player.attackStrengthTicker` outside its turn.
     pub(in crate::game) fn attack_ticks(&self) -> u32 {
         self.attack_ticks
+    }
+    /// Fresh play state for a scoped fake-player action: starts with a full attack charge
+    /// (100 ticks, matching a local player's initial `attack_ticks`) so weapon attacks deal
+    /// full damage.
+    pub(in crate::game) fn scoped() -> Self {
+        Self {
+            attack_ticks: 100,
+            ..Self::default()
+        }
     }
     /// The main-hand item of the guest's last tick (`Game.attack_item`).
     pub(in crate::game) fn attack_item(&self) -> Option<&str> {
@@ -2340,7 +2349,39 @@ mod pickup_xp_tests {
     use super::super::native_entity_refs::tests::with_game;
     use super::super::native_item_places::tests::{guest, open_to_lan};
     use horizon_client::entities::ExperienceOrb;
-    use horizon_core::geometry::Vec3;
+    use horizon_core::{geometry::Vec3, random::RandomSource};
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_guest_picks_an_orb_with_their_own_random() {
+        with_game(|game| {
+            open_to_lan(game);
+            let mut g = guest(1);
+            g.loaded = true;
+            g.position = [16.0, 70.0, 0.5];
+            game.lan.as_mut().unwrap().hub.guests.push(g);
+            game.as_guest(1, |game| game.player.as_mut().unwrap().random.set_seed(0))
+                .unwrap();
+
+            // Section 0 comes before section 1 even though its orb joined second.
+            let right = Vec3::new(16.5, 70.0, 0.5);
+            let left = Vec3::new(15.5, 70.0, 0.5);
+            game.orbs.push(ExperienceOrb::new(41, right, Vec3::ZERO, 7));
+            game.orbs.push(ExperienceOrb::new(40, left, Vec3::ZERO, 1));
+            game.guest_orbs(0);
+            game.guest_orbs(0);
+
+            let guest = &game.lan.as_ref().unwrap().hub.guests[0];
+            assert_eq!(guest.xp_total, 7);
+            assert_eq!(game.orbs.len(), 1);
+            assert_eq!(game.orbs[0].id, 40);
+            // Seed 0 after nextInt(2) and the cooldown tick's nextInt(1).
+            assert_eq!(
+                guest.motion.as_ref().unwrap().random.clone().next_int(),
+                1_033_096_058
+            );
+        });
+    }
 
     /// Listens to `pickup_xp`, canceling it when told to.
     struct Listen(bool);
@@ -2374,6 +2415,7 @@ mod pickup_xp_tests {
                 attachment_lifetime: Default::default(),
                 rotation: [0.0, 0.0],
                 join: Default::default(),
+                section_order: 0,
                 id: 40,
                 position: p,
                 previous: p,

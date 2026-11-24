@@ -13,21 +13,29 @@ impl Game<'_> {
         self.lod = None;
         self.lod_source_attempted = false;
         self.lod_observe.clear();
-        self.lod_blue_map = None;
         self.far_beacons.clear();
         self.lod_covered_at = None;
         if let Some(renderer) = &mut self.renderer {
             renderer.clear_lods();
         }
     }
+    /// Clears far terrain for a world or dimension change, arming the next
+    /// far terrain's world-entry first-load hold.
+    pub(super) fn clear_lod_for_world_entry(&mut self) {
+        self.clear_lod();
+        self.lod_first_load = true;
+    }
     pub(super) fn prepare_lod(&mut self) {
-        let enabled = self.far_terrain_choice().0 > 0
-            && self.renderer.is_some()
-            && self.player.is_some()
-            && self.title.is_none();
+        let in_world = self.renderer.is_some() && self.player.is_some() && self.title.is_none();
+        let enabled = in_world && self.far_terrain_choice().0 > 0;
         if !enabled {
             if self.lod.is_some() || self.lod_source_attempted {
                 self.clear_lod();
+            }
+            if in_world {
+                // Far terrain is off in an already-entered world: toggling it
+                // on later must not start a world-entry first-load hold.
+                self.lod_first_load = false;
             }
             return;
         }
@@ -39,12 +47,13 @@ impl Game<'_> {
             .as_ref()
             .is_some_and(|level| self.remote.as_ref().is_some_and(|r| r.level != *level))
         {
-            self.clear_lod();
+            self.clear_lod_for_world_entry();
         }
-        if self.lod_source_attempted {
+        if self.lod_source_attempted || self.export_server_calls_blocked() {
             return;
         }
         self.lod_source_attempted = true;
+        let arm_first_load = std::mem::take(&mut self.lod_first_load);
         self.lod_level = None;
         let dim = self.dim;
         let source = match (&self.integrated, self.server_far_terrain(), &self.remote) {
@@ -75,35 +84,7 @@ impl Game<'_> {
                 let root = home.join("server-terrain");
                 let dir = terrain::level_dir(&root, address, remote.hashed_seed, &remote.level);
                 self.lod_level = Some(remote.level.clone());
-                // Past them, the server's BlueMap, if the player named it or
-                // lets Horizon look for it (on the BlueMap worker).
-                let maps = root.join(terrain::server_folder(address)).join("BlueMap");
-                let settings = &self.settings.horizon.blue_map;
-                let blue_map = horizon_client::bluemap_detect::source(
-                    settings,
-                    address,
-                    &maps,
-                    std::time::SystemTime::now(),
-                )
-                .map(|source| {
-                    use horizon_client::{bluemap, bluemap_detect::Source};
-                    // The map's address only at debug: logs land in crash reports.
-                    log::info!("Horizon: far terrain also draws {}'s BlueMap", remote.level);
-                    if let Source::Url { url, .. } = &source {
-                        log::debug!("Horizon: BlueMap at {url}");
-                    }
-                    let map = Arc::new(bluemap::BlueMap::from_source(
-                        source,
-                        &remote.level,
-                        maps,
-                        settings.radius_blocks(),
-                        bluemap::Palette::from_game(self.pack.assets.registry, self.res.biomes()),
-                    ));
-                    map.start();
-                    map
-                });
-                self.lod_blue_map = blue_map.clone();
-                // And the player's Bobby cache of the level, only read.
+                // Past them, the player's Bobby cache of the level, only read.
                 let bobby = terrain::bobby_level_dir(
                     &terrain::minecraft_dir().join(".bobby"),
                     address,
@@ -131,24 +112,30 @@ impl Game<'_> {
                         });
                     terrain::Bobby::new(bobby, decode, self.res.facts())
                 });
-                terrain::ServerTerrain::with_bobby(dir, blue_map, bobby) as _
+                terrain::ServerTerrain::with_bobby(dir, bobby) as _
             }),
             _ => Some(self.streaming.lod_source()),
         };
         if let Some(source) = source {
-            let lod = horizon_client::lod::Lod::new(source, self.worker_context());
+            let mut lod = horizon_client::lod::Lod::new(source, self.worker_context());
+            if arm_first_load {
+                lod.arm_first_load();
+            }
             // Far tiles are never in the ray scene: the arenas' looks alone.
             lod.set_looks(self.streaming.looks, self.streaming.nether_shading);
             lod.set_shader_pack(self.streaming.shader_pack);
             self.lod = Some(lod);
-            self.lod_observe.extend(self.world.chunks.keys().copied());
+            let resident: Vec<_> = self.world.chunks.keys().copied().collect();
+            self.lod_observe_later(resident);
         }
     }
     pub(in crate::game) fn update_world(&mut self) {
         if let Err(e) = horizon_client::spans::time("poll_remote", || self.poll_remote()) {
             log::warn!("Horizon: {e}");
         }
-        if let Err(e) = self.advance_studio_replay() {
+        if self.export.is_none()
+            && let Err(e) = self.advance_studio_replay()
+        {
             log::warn!("Horizon Studio replay: {e}");
         }
         // The renderer laid translucent quads out again (a shader pack's flat terrain came
@@ -183,17 +170,12 @@ impl Game<'_> {
         }
         self.observe_light_edits();
         self.ask_edited_light_emission();
-        if let (Some(map), Some(p), Some(lod)) = (&self.lod_blue_map, &self.player, &mut self.lod) {
-            map.set_center(p.position.x.floor() as i32, p.position.z.floor() as i32);
-            for change in map.take_changed() {
-                lod.refresh(change.area, change.widths);
-            }
-        }
         if let Some(p) = &self.player {
-            self.streaming.center = (
-                (p.position.x.floor() as i32) >> 4,
-                (p.position.z.floor() as i32) >> 4,
-            );
+            let own = super::player_chunk(p.position);
+            self.streaming.center = self
+                .remote
+                .as_ref()
+                .map_or(own, |r| view_center(own, r.chunk_center));
         }
         horizon_client::spans::time("tick_pregen", || self.tick_pregen());
         // A headless game has nothing to draw sections with: like a server's, they aren't
@@ -227,6 +209,10 @@ impl Game<'_> {
             self.streaming.complete_commit(&mut self.world, commit)
         });
         self.streaming.extra.truncate(areas);
+        // A lectern read from a save resolves its book pages as its chunk
+        // arrives (`LecternBlockEntity.loadAdditional`): the chunk was decoded
+        // on a worker, which has no game to read a selector or a score with.
+        horizon_client::spans::time("resolve_loaded_lecterns", || self.resolve_loaded_lecterns());
         // The viewed levels' meshing, queued after the player's level's (nothing while no view
         // names one).
         if self.streaming.mesh
@@ -262,18 +248,34 @@ impl Game<'_> {
         for chunk in &unloaded {
             self.world.modified.unloaded(&(chunk.x, chunk.z));
         }
+        self.lod_observe_later(uploads.iter().map(|(key, _)| (key.0, key.2)));
         if let Some(lod) = &mut self.lod {
-            self.lod_observe
-                .extend(uploads.iter().map(|(key, _)| (key.0, key.2)));
             for chunk in &unloaded {
                 self.lod_observe.remove(&(chunk.x, chunk.z));
             }
             // Unloaded columns first (their summaries are all that remains),
-            // then a few resident ones (an edit copies a chunk the worker
-            // still holds). The worker summarizes them.
+            // then resident ones that left the full-detail area (their
+            // sections are held until their summary is drawn), then a few
+            // other resident ones (an edit copies a chunk the worker still
+            // holds). The worker summarizes them.
             horizon_client::spans::time("lod_observe", || {
                 for chunk in &unloaded {
                     lod.observe(chunk.clone(), self.res.facts());
+                }
+                let mut remaining =
+                    horizon_client::lod::OBSERVE_AHEAD.saturating_sub(lod.observing());
+                while remaining > 0 {
+                    let asks = lod.take_summary_asks(remaining);
+                    if asks.is_empty() {
+                        break;
+                    }
+                    for key in asks {
+                        if let Some(chunk) = self.world.chunks.get(&key) {
+                            self.lod_observe.remove(&key);
+                            lod.observe(chunk.clone(), self.res.facts());
+                            remaining -= 1;
+                        }
+                    }
                 }
                 while lod.observing() < horizon_client::lod::OBSERVE_AHEAD
                     && let Some(&key) = self.lod_observe.iter().next()
@@ -285,19 +287,18 @@ impl Game<'_> {
                 }
             });
         }
-        for chunk in &unloaded {
-            self.world.modified.unloaded(&(chunk.x, chunk.z));
-        }
         horizon_client::spans::time("unload_entities", || self.unload_entities(&unloaded));
         if !unloaded.is_empty() {
             let _span = horizon_client::spans::guard("unload_block_entities");
-            let gone: horizon_client::fast_hash::FxHashSet<(i32, i32)> =
-                unloaded.iter().map(|c| (c.x, c.z)).collect();
-            let gone_chunks: Vec<(i32, i32)> = gone.iter().copied().collect();
+            let gone_chunks: Vec<(i32, i32)> = unloaded.iter().map(|c| (c.x, c.z)).collect();
             self.world.block_entities.unload_chunks(&gone_chunks);
-            self.world
-                .block_names
-                .retain(|p, _| !gone.contains(&(p.0 >> 4, p.2 >> 4)));
+            if !self.world.block_names.is_empty() {
+                let gone: horizon_client::fast_hash::FxHashSet<(i32, i32)> =
+                    gone_chunks.iter().copied().collect();
+                self.world
+                    .block_names
+                    .retain(|p, _| !gone.contains(&(p.0 >> 4, p.2 >> 4)));
+            }
         }
         // LevelChunk.registerTickContainerInLevel: a chunk that became
         // resident has its tick containers before a command can schedule into
@@ -318,10 +319,12 @@ impl Game<'_> {
         let view = (self.streaming.center, radius);
         let has = |column: (i32, i32)| self.world.chunks.contains_key(&column);
         let now = Instant::now();
-        let arriving = {
+        let view_arriving = {
             let _span = horizon_client::spans::guard("view_arrival");
-            self.view_arrival.arriving(view, now, has) || self.remote_backlog() > 0
+            self.view_arrival.arriving(view, now, has)
         };
+        self.view_arriving = view_arriving;
+        let arriving = view_arriving || self.remote_backlog_delays_frame();
         // Which far tiles a zoom magnifies (`lod::ZoomAim`), read before
         // `self.renderer.as_mut()` below borrows self mutably for the rest of
         // this function. Cheap: trigonometry on one angle, or None when the
@@ -349,20 +352,8 @@ impl Game<'_> {
                 // mesh of a waiting section replaces it, and sections of
                 // chunks no longer loaded are dropped.
                 let pending = &mut self.pending_uploads;
-                let fresh: horizon_client::fast_hash::FxHashSet<(i32, i32, i32)> =
-                    uploads.iter().map(|(k, _)| *k).collect();
                 let chunks = &self.world.chunks;
-                let loaded = |k: &(i32, i32, i32)| chunks.contains_key(&(k.0, k.2));
-                let mut spent: Vec<_> = pending
-                    .extract_if(.., |(k, _)| fresh.contains(k) || !loaded(k))
-                    .collect();
-                for upload in uploads {
-                    if loaded(&upload.0) {
-                        pending.push(upload);
-                    } else {
-                        spent.push(upload);
-                    }
-                }
+                let mut spent = Vec::new();
                 let centre = self.streaming.center;
                 // Section keys count from the world's bottom (`origin`'s min_y + y * 16).
                 let bottom = f64::from(self.world.bottom_y());
@@ -370,10 +361,7 @@ impl Game<'_> {
                     .player
                     .as_ref()
                     .map_or(4, |p| ((p.position.y - bottom) / 16.0).floor() as i32);
-                let far = |k: &(i32, i32, i32)| {
-                    (k.0 - centre.0).pow(2) + (k.1 - cam_y).pow(2) + (k.2 - centre.1).pow(2)
-                };
-                pending.sort_unstable_by_key(|(k, _)| std::cmp::Reverse(far(k)));
+                pending.push_batch_for_chunks(uploads, chunks, (centre, cam_y), &mut spent);
                 let (limit, budget) = if budgeted {
                     (
                         g.chunk_updates as usize,
@@ -390,19 +378,20 @@ impl Game<'_> {
                 let auto = (!budgeted).then(|| self.upload_pace.budget(pending.len(), arriving));
                 let started = Instant::now();
                 let upload_span = horizon_client::spans::guard("upload_queue");
-                while let Some((_, mesh)) = pending.last() {
-                    if auto.is_some_and(|time| count > 0 && started.elapsed() >= time) {
-                        break;
-                    }
-                    let size = ((mesh.solid.len() + mesh.translucent.len())
-                        * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
-                        as u64;
+                while !pending.is_empty() {
                     if (limit > 0 && count >= limit)
-                        || (budget > 0 && bytes > 0 && bytes + size > budget)
+                        || auto.is_some_and(|time| count > 0 && started.elapsed() >= time)
                     {
                         break;
                     }
-                    let (key, mesh) = pending.pop().expect("checked above");
+                    let Some((_, mesh)) = pending.peek_nearest() else {
+                        break;
+                    };
+                    let size = horizon_client::streaming::upload_mesh_bytes(mesh);
+                    if budget > 0 && bytes > 0 && bytes + size > budget {
+                        break;
+                    }
+                    let (key, mesh) = pending.pop_nearest().expect("checked above");
                     renderer.upload(key, &mesh);
                     spent.push((key, mesh));
                     count += 1;
@@ -423,8 +412,7 @@ impl Game<'_> {
                 arriving || (meshing && self.view_arrival.recent(now)) || sampling,
             );
             if let (Some(lod), Some(player)) = (&mut self.lod, &self.player) {
-                let lod_distance =
-                    horizon_client::graphics::lod_distance_capped(far_distance, &renderer.info);
+                let lod_distance = far_distance.min(horizon_client::lod::MAX_CHUNKS);
                 lod.set_near_loading(self.streaming.terrain_loading());
                 lod.set_reduced_detail(far_reduced);
                 // The covered columns change only with the complete ones and
@@ -464,5 +452,103 @@ impl Game<'_> {
                 });
             }
         }
+    }
+    /// Run `f` inside a local player block-edit scope so writes record `World::immediate_sections`.
+    pub(in crate::game) fn with_player_block_edit<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.world.begin_player_edit();
+        let out = f(self);
+        self.world.end_player_edit();
+        out
+    }
+
+    /// Rebuild sections dirtied by player block edits and upload them before the current frame
+    /// renders, matching vanilla's `SectionRenderDispatcher.rebuildSectionSync`. With
+    /// `prioritizeChunkUpdates == 2` nearby dirty sections follow, nearest first, within
+    /// `NEARBY_MESH_BUDGET` (paused for `NEARBY_COOLDOWN_FRAMES` after an overrun); the rest
+    /// stay with the workers. Under Threaded (`0`, default), no main-thread meshing occurs.
+    pub(in crate::game) fn flush_immediate_meshes(&mut self) {
+        use horizon_client::streaming::immediate_mesh::{
+            IMMEDIATE_MESH_LIMIT, NEARBY_IMMEDIATE_DIST_SQ,
+        };
+        let mode = self.settings.prioritize_chunk_updates;
+        if mode == 0 || self.title.is_some() || self.renderer.is_none() {
+            self.world.immediate_sections.clear();
+            return;
+        }
+        let nearby = match self.player.as_ref() {
+            Some(p) if mode >= 2 && self.streaming.nearby_meshing_due() => {
+                self.world.nearby_dirty_sections(
+                    [
+                        p.position.x.floor() as i32,
+                        p.position.y.floor() as i32,
+                        p.position.z.floor() as i32,
+                    ],
+                    NEARBY_IMMEDIATE_DIST_SQ,
+                    IMMEDIATE_MESH_LIMIT,
+                )
+            }
+            _ => Vec::new(),
+        };
+        if self.world.immediate_sections.is_empty() && nearby.is_empty() {
+            return;
+        }
+        self.observe_light_edits();
+        self.ask_edited_light_emission();
+        let uploads = self
+            .streaming
+            .mesh_immediate(&mut self.world, mode, &nearby);
+        if uploads.is_empty() {
+            return;
+        }
+        if !self.pending_uploads.is_empty() {
+            let mut spent = Vec::new();
+            self.pending_uploads
+                .remove_keys(uploads.iter().map(|(k, _)| *k), &mut spent);
+            self.streaming.free(spent);
+        }
+        self.lod_observe_later(uploads.iter().map(|(key, _)| (key.0, key.2)));
+        if let Some(renderer) = self.renderer.as_mut() {
+            for (key, mesh) in &uploads {
+                renderer.upload(*key, mesh);
+            }
+        }
+        self.streaming.free(uploads);
+    }
+}
+
+/// The chunk the window meshes and draws around: the player's own, unless the server centred
+/// their chunk cache well away from them (a mod's view centre, horizon-rust/horizon#19219), where
+/// the chunks it sends are. Within two chunks it is the player's: the cache centre lags a move
+/// across a chunk border by a tick, and vanilla's view area follows the camera there anyway.
+pub(in crate::game) fn view_center(own: (i32, i32), cache: (i32, i32)) -> (i32, i32) {
+    // A server may send any `i32` centre: measured in `i64`, which no pair of them overflows.
+    let away = (i64::from(cache.0) - i64::from(own.0))
+        .abs()
+        .max((i64::from(cache.1) - i64::from(own.1)).abs());
+    if away > 2 { cache } else { own }
+}
+
+#[cfg(test)]
+mod view_center_tests {
+    use super::view_center;
+
+    #[test]
+    fn follows_the_cache_centre_only_when_it_moved_away() {
+        assert_eq!(view_center((0, 0), (0, 0)), (0, 0));
+        // A border crossing the server has not answered yet.
+        assert_eq!(view_center((5, 5), (4, 5)), (5, 5));
+        assert_eq!(view_center((5, 5), (7, 3)), (5, 5));
+        // A mod's view centre far from the player.
+        assert_eq!(view_center((5, 5), (8, 5)), (8, 5));
+        assert_eq!(view_center((0, 0), (-40, 120)), (-40, 120));
+        // Any centre a server sends, however far, measures without overflowing.
+        assert_eq!(view_center((0, 0), (i32::MIN, 0)), (i32::MIN, 0));
+        assert_eq!(
+            view_center((-1, 0), (i32::MAX, i32::MIN)),
+            (i32::MAX, i32::MIN)
+        );
     }
 }

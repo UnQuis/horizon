@@ -144,7 +144,9 @@ impl Game<'_> {
         };
         // A dead player acts no more, but the death screen still respawns and chats: its
         // commands run as anyone's (ServerGamePacketListenerImpl.handleChatCommand doesn't
-        // look at the player's health).
+        // look at the player's health). Resource-pack answers are connection status, not an
+        // action, and ServerCommonPacketListenerImpl.handleResourcePackResponse accepts them
+        // regardless of health.
         if host.hub.guests[gi].dead
             && !matches!(
                 packet,
@@ -152,6 +154,7 @@ impl Game<'_> {
                     | S::ChatCommand(_)
                     | S::ChatCommandSigned(_)
                     | S::CustomClickAction(_)
+                    | S::ResourcePack(_)
             )
         {
             return;
@@ -317,11 +320,7 @@ impl Game<'_> {
                     // ServerPlayerGameMode.abortDestroyBlock clears the dig and the crack; the
                     // clock `destroy_pos` names is left to the next START (arismoko/horizon#4124).
                     host.play.entry(conn).or_default().dig_ended();
-                    let state = self.world.block(a.pos[0], a.pos[1], a.pos[2]).0 as i32;
-                    host.hub.send_to(
-                        conn,
-                        &C::BlockUpdate(play::BlockUpdate { pos: a.pos, state }),
-                    );
+                    host.hub.send_block_correction(conn, &self.world, a.pos);
                     self.guest_crack_progress(conn, a.pos, -1);
                     let Some(host) = self.lan.as_ref() else {
                         return;
@@ -551,16 +550,18 @@ impl Game<'_> {
             // handleSetCreativeModeSlot's drop: a slot below 0 is a stack thrown out of the
             // creative screen (`handleCreativeModeItemDrop`), dropped from the player's hand.
             S::SetCreativeModeSlot(p) if p.slot < 0 => {
-                let Some(host) = self.lan.as_ref() else {
-                    return;
-                };
-                if !host.hub.guests[gi].creative() {
-                    return;
-                }
+                // The codec's count range is read before the handler's own checks, so the stack is
+                // validated before the creative and slot filters below.
                 let Some(stack) = self.item_from_network(&p.item) else {
                     return;
                 };
                 if !self.creative_stack_valid(gi, &stack) {
+                    return;
+                }
+                let Some(host) = self.lan.as_ref() else {
+                    return;
+                };
+                if !host.hub.guests[gi].creative() {
                     return;
                 }
                 if !self.guest_may_set_creative_slot(conn, i32::from(p.slot), Some(&stack)) {
@@ -582,18 +583,19 @@ impl Game<'_> {
             }
             S::SetCreativeModeSlot(p) => {
                 // Slot 0 is the crafting result: not a slot to set.
+                let item = self.item_from_network(&p.item);
+                // As above: the codec's count range comes before the creative and slot filters.
+                if item
+                    .as_ref()
+                    .is_some_and(|s| !self.creative_stack_valid(gi, s))
+                {
+                    return;
+                }
                 let Some(host) = self.lan.as_mut() else {
                     return;
                 };
                 let g = &host.hub.guests[gi];
                 if !g.creative() || !(1..46).contains(&p.slot) {
-                    return;
-                }
-                let item = self.item_from_network(&p.item);
-                if item
-                    .as_ref()
-                    .is_some_and(|s| !self.creative_stack_valid(gi, s))
-                {
                     return;
                 }
                 if !self.guest_may_set_creative_slot(conn, i32::from(p.slot), item.as_ref()) {
@@ -631,6 +633,8 @@ impl Game<'_> {
                     });
                 }
             }
+            // The mods' `container_click` first: a canceled click changes nothing.
+            S::ContainerClick(p) if self.lan_container_click_vetoed(conn, &p) => {}
             // AbstractContainerMenu.quickMoveStack of a mod container: the mods first.
             S::ContainerClick(p) if self.lan_mod_quick_move(conn, &p) => {}
             S::ContainerClick(p) if self.lan_merchant_click(conn, &p) => {}
@@ -661,16 +665,20 @@ impl Game<'_> {
             // STOP_RIDING_JUMP: AbstractHorse and Camel handleStopJump do
             // nothing, and a nautilus' dash is not stopped this way.
             S::PlayerCommand(p) if p.action == 4 => {}
-            // ServerboundResourcePackPacket in play: the server has nothing to
-            // do with it (a declined required pack is handled on the connection).
+            // ServerboundResourcePackPacket in play: `resource_pack_status_v2` hears the answer
+            // even after death; `resource_pack_status` only while the player lives, as it always
+            // did (a declined server.properties required pack is handled on the connection).
             S::ResourcePack(r) => {
                 let Some(host) = self.lan.as_ref() else {
                     return;
                 };
                 let guest = &host.hub.guests[gi];
-                let (uuid, name) = (guest.uuid, guest.name.clone());
+                let (uuid, name, dead) = (guest.uuid, guest.name.clone(), guest.dead);
                 self.as_guest(conn, |g| {
-                    g.native_resource_pack_status(uuid, &name, r.action);
+                    g.native_resource_pack_status_v2(uuid, &name, r.id, r.action);
+                    if !dead {
+                        g.native_resource_pack_status(uuid, &name, r.action);
+                    }
                 });
             }
             // START_SPRINTING and STOP_SPRINTING: the hub has set the sprint
@@ -1214,17 +1222,23 @@ impl Game<'_> {
         !cancel
     }
 
-    /// What ServerboundSetCreativeModeSlotPacket asks of a stack. Its codec
-    /// (`ItemStack.validatedStreamCodec`) encodes the stack with `ItemStack.CODEC`, whose count is
-    /// 1 to 99: more fails the packet and disconnects the player, as vanilla's decoder error does.
-    /// A native mod can raise an item's stack size past 99 (`item_defaults::MAX_STACK_SIZE`), so
-    /// the count is held to what the wire carries instead. handleSetCreativeModeSlot's `validData`
-    /// then ignores a stack beyond its own stack size.
+    /// What the codec of ServerboundSetCreativeModeSlotPacket accepts:
+    /// `ItemStack.validatedStreamCodec` encodes the stack with `ItemStack.CODEC`, whose count is
+    /// 1 to 99, so more fails the packet and disconnects the player, as vanilla's decoder error
+    /// does, whatever the slot or the game mode.
+    /// A native mod can raise an item's stack size past 99, and the bound follows it: an ordinary
+    /// item's 64 is still bounded to the wire's 99.
+    ///
+    /// handleSetCreativeModeSlot's `validData` is the second condition: a stack beyond its own stack
+    /// size is ignored there, not kicked. Neither condition reads the slot or the game mode, so both
+    /// are answered before the callers' filters — where vanilla's decoder stands, ahead of the
+    /// handler's `validSlot` and creative-mode checks.
     pub(super) fn creative_stack_valid(&mut self, gi: usize, s: &ItemStack) -> bool {
+        let item_max = self.stack_max_size(s);
+        let max = creative_stack_limit(item_max);
         let Some(host) = self.lan.as_mut() else {
             return false;
         };
-        let max = horizon_world::item_defaults::MAX_STACK_SIZE as u32;
         if s.count > max {
             let g = &host.hub.guests[gi];
             let conn = g.conn;
@@ -1234,7 +1248,7 @@ impl Game<'_> {
                 .kick(conn, horizon_protocol::text::literal(&reason));
             return false;
         }
-        s.count <= self.stack_max_size(s)
+        s.count <= item_max
     }
 
     pub(super) fn item_from_network(
@@ -1242,9 +1256,8 @@ impl Game<'_> {
         stack: &Option<horizon_protocol::item::Stack>,
     ) -> Option<ItemStack> {
         let s = stack.as_ref()?;
-        let mut out = self.lan.as_ref()?.hub.stack_from_network(s);
-        out.count = out.count.max(1);
-        Some(out)
+        let out = self.lan.as_ref()?.hub.stack_from_network(s);
+        (out.count > 0 && &*out.item != "minecraft:air").then_some(out)
     }
 
     /// `LivingEntity.tickDeath`: 20 ticks after dying the player is removed,
@@ -1294,3 +1307,17 @@ impl Game<'_> {
         host.hub.teleport(gi, Some(at));
     }
 }
+
+/// Vanilla's `ExtraCodecs.intRange(1, 99)`: the count `ItemStack.CODEC` carries, so the bound the
+/// packet's codec enforces.
+const CREATIVE_COUNT_LIMIT: u32 = 99;
+
+/// The count that codec accepts: vanilla's `1..=99`, raised by a stack size a native mod put above
+/// 99.
+fn creative_stack_limit(stack_max: u32) -> u32 {
+    stack_max.max(CREATIVE_COUNT_LIMIT)
+}
+
+#[cfg(test)]
+#[path = "tests/creative_stack_bound_tests.rs"]
+mod creative_stack_bound_tests;

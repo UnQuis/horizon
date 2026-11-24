@@ -198,6 +198,22 @@ Typed humanoid parts have separate storage, so all twelve fit alongside the eigh
   `getParentModel()` layers do: a villager's type, profession and level, a spider's eyes. The
   armour, held items and other layers keep every part, and the cape, a layer of its own, stays.
 
+## Drawing the player's arms with a held item
+
+In `render_hand`, call `host.local_player_arm_skin()` to get `(sprite, slim)` for
+the local player. The key is the current first-person arm's atlas sprite: pass it
+directly to `event.draw.model_part(part, sprite, 0xFFFFFF)`. If the player's skin
+isn't in the atlas, the key uses the same Steve fallback as the ordinary arm
+without changing `slim`. Skip drawing if the call returns `None`; read it again
+when drawing rather than caching the key across frames.
+
+Bake `minecraft:player_slim#main` and `minecraft:player#main` once with `bake_layer`
+and choose the layer by `slim`. `event.render.hand` distinguishes the main and off
+hand; the main arm is left when `host.gui_options().main_hand_left` is true,
+and the off arm is the opposite. Pose the part in the draw context's hand space
+(blocks, +x right, +y up, -z away). Return `Flow::Continue` to keep the default
+held item in addition to the arm you drew.
+
 ## Text and animation in block entities
 
 `BlockEntityDrawContext::text` draws a component under the current pose in font pixels,
@@ -226,3 +242,18 @@ Multiply tinted faces by `block_tint_color(state, face.tint_index, pos)` at thei
 position. Untinted faces return `None`. Water faces use tint index 0 and the world's
 water colour, including resource-pack water colormaps; other water indices return
 `None`. This differs from `fluid_box`, whose colour comes from its fluid stack.
+
+## Texture pixels on the CPU
+
+A mod that colours things by the player's own textures without drawing them on the GPU
+(a map averaging each block's top, a software renderer) reads them with
+`sprite_pixels(&sprites)`. Find the sprites with `block_sprites` or `texture_sprites`;
+each answer is RGBA8, rows top to bottom, a square the arrays' edge on each side, so
+`rgba.len()` is edge × edge × 4. Resource packs are included. An animated sprite gives
+the frame it starts on. A sprite past the arrays' layers gives `None`, and so does every
+sprite on a client that loaded no pixels.
+
+The game keeps the pixels compressed once the GPU has them, and each call uncompresses
+the whole store once: ask for every sprite you need in one call, and again only when
+`block_sprites_version` changes. One call returns at most 256 MiB, the default texture
+budget, and returns `Err` without reading anything past that; ask in parts then.

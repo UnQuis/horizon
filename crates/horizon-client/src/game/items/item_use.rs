@@ -257,17 +257,12 @@ impl Game<'_> {
     /// remainder of a stack that is not emptied goes to the inventory on the
     /// server and arrives with its inventory update.
     pub(super) fn finish_result(&self, stack: &ItemStack, info: &ItemInfo) -> Option<ItemStack> {
-        if self.creative || self.consumable(stack).is_none() {
-            return Some(stack.clone());
-        }
-        let mut left = stack.clone();
-        left.count = left.count.saturating_sub(1);
-        if left.count > 0 {
-            return Some(left);
-        }
-        info.use_remainder
-            .as_deref()
-            .map(|remainder| ItemStack::new(remainder, 1))
+        finish_remaining(
+            stack,
+            info.use_remainder.clone(),
+            self.creative,
+            self.consumable(stack).is_some(),
+        )
     }
     /// `LivingEntityUseItemEvent.Tick` for `stack` in use `ticks` so far, as
     /// `updatingUsingItem` starts: a mod may change the ticks left, which
@@ -632,11 +627,26 @@ pub(super) fn use_pose(
     }
 }
 
+/// `use_pose`, but BLOCK turns a sword (or any `blocks_attacks` item) across
+/// the body; a `ShieldItem` (`shield`) leaves it as it is.
+pub(super) fn held_use_pose(
+    animation: UseAnimation,
+    shield: bool,
+    remaining: f32,
+    duration: f32,
+    partial: f32,
+) -> horizon_client::first_person::ItemPose {
+    if animation == UseAnimation::Block && !shield {
+        return horizon_client::first_person::ItemPose::Block;
+    }
+    use_pose(animation, remaining, duration, partial)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         bow_release_power, consumes_at_once, count_down, duration_leaving, held, release_parts,
-        start_of, tick_left, ticks_left, use_counter_leaving, use_pose,
+        held_use_pose, start_of, tick_left, ticks_left, use_counter_leaving, use_pose,
     };
     use horizon_client::first_person::ItemPose;
     use horizon_core::use_animation::UseAnimation;
@@ -1011,6 +1021,89 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
+    fn both_held_hands_can_draw_the_resolved_player_skin() {
+        use mod_api::prelude::DrawClientHost;
+        use mod_api::{ClientHost, Flow, Hand, Hooks, ModEntry, ModelPart, Mods, RenderHandEvent};
+        use std::sync::OnceLock;
+
+        const ALEX: &str = "entity/player/slim/alex";
+        const STEVE: &str = "entity/player/wide/steve";
+
+        struct Mod(OnceLock<ModelPart>);
+        #[mod_api::__subscriptions]
+        impl Hooks for Mod {
+            fn render_hand(
+                &self,
+                host: &dyn ClientHost,
+                event: &mut RenderHandEvent<'_, '_>,
+            ) -> Flow {
+                assert!(event.render.stack.is_some());
+                let (sprite, slim) = host.local_player_arm_skin().unwrap();
+                assert!(slim, "an atlas fallback must not widen a slim arm");
+                let model = self
+                    .0
+                    .get_or_init(|| host.bake_layer("minecraft:player_slim#main").unwrap());
+                let arm_name = match event.render.hand {
+                    Hand::Main => "right_arm",
+                    Hand::Off => "left_arm",
+                };
+                let arm = model.get_child(arm_name).unwrap();
+                assert!(event.draw.model_part(arm, sprite, 0xFFFFFF));
+                Flow::Continue
+            }
+        }
+
+        let mods: Mods = vec![ModEntry::new("hands", Box::new(Mod(OnceLock::new())))].into();
+        crate::game::api_values::install_parts(&mods).unwrap();
+        mod_platform::testing::with_mods(mods, || {
+            super::super::native_entity_refs::tests::with_client_game(|game| {
+                assert_eq!(DrawClientHost::local_player_arm_skin(game), None);
+                game.player = Some(
+                    horizon_client::motion::PlayerMotion::new(
+                        game.motion,
+                        horizon_core::geometry::Vec3::ZERO,
+                    )
+                    .unwrap(),
+                );
+                let stack = horizon_client::items::ItemStack::new("minecraft:iron_sword", 1);
+                game.inventory[game.selected] = Some(stack.clone());
+                game.offhand = Some(stack.clone());
+                game.visible_hands[0].1 = Some(stack.clone());
+                game.visible_hands[1].1 = Some(stack);
+                game.tick_player_model();
+                let model = game.player_model.as_mut().unwrap();
+                model.skin = Some(ALEX.into());
+                model.slim = true;
+
+                for sprite in [ALEX, STEVE] {
+                    let rect = game.gui.atlas.sprites[sprite];
+                    assert_eq!(
+                        DrawClientHost::local_player_arm_skin(game),
+                        Some((sprite, true))
+                    );
+                    let (vertices, runs) = game.hand_geometry(0.0);
+                    let &[(main_arm, _), (main_item, _), (off_arm, _), (off_item, _)] =
+                        runs.as_slice()
+                    else {
+                        panic!("expected two arm/item pairs, got {runs:?}");
+                    };
+                    assert!(main_arm < main_item && main_item < off_arm);
+                    assert!(off_arm < off_item && (off_item as usize) < vertices.len());
+                    for (start, end) in [(main_arm, main_item), (off_arm, off_item)] {
+                        assert!(vertices[start as usize..end as usize].iter().all(|v| {
+                            (rect.u0..=rect.u1).contains(&v.uv[0])
+                                && (rect.v0..=rect.v1).contains(&v.uv[1])
+                        }));
+                    }
+                    game.gui.atlas.sprites.remove(sprite);
+                }
+                assert_eq!(DrawClientHost::local_player_arm_skin(game), None);
+            });
+        });
+    }
+
+    #[test]
     fn a_use_runs_out_on_its_last_tick() {
         // a 32 tick food: ticks 0 to 30 go on, the 32nd tick finishes it.
         assert_eq!(count_down(0, 32), Some(1));
@@ -1167,6 +1260,15 @@ mod tests {
         ] {
             assert!(matches!(pose(animation), ItemPose::Using));
         }
+        // BLOCK turns a sword across the body but leaves a `ShieldItem` as it is.
+        assert!(matches!(
+            held_use_pose(UseAnimation::Block, false, 12.0, 32.0, 0.5),
+            ItemPose::Block
+        ));
+        assert!(matches!(
+            held_use_pose(UseAnimation::Block, true, 12.0, 32.0, 0.5),
+            ItemPose::Using
+        ));
     }
 }
 
@@ -1592,5 +1694,71 @@ pub(super) mod interact_vibration_tests {
         }) else {
             panic!("prepared resources failed to load")
         };
+    }
+}
+
+/// What `Item.finishUsingItem` leaves in the hand: a stack that is not a
+/// consumable stays as it is; a consumable loses one, and once that empties
+/// the hand the stack's own `use_remainder` takes it (else `default`, the
+/// item's). Neither in creative mode.
+fn finish_remaining(
+    stack: &ItemStack,
+    default: Option<String>,
+    creative: bool,
+    consumable: bool,
+) -> Option<ItemStack> {
+    if creative || !consumable {
+        return Some(stack.clone());
+    }
+    let mut left = stack.clone();
+    left.count = left.count.saturating_sub(1);
+    if left.count > 0 {
+        return Some(left);
+    }
+    horizon_client::item_sync::use_remainder(stack, default)
+        .as_deref()
+        .map(|remainder| ItemStack::new(remainder, 1))
+}
+
+#[cfg(test)]
+mod finish_remainder_tests {
+    use super::finish_remaining;
+    use horizon_client::items::{ItemInfo, ItemStack};
+    use horizon_core::nbt::Tag;
+
+    /// The stack's own `use_remainder` decides what an emptied hand holds,
+    /// and a removed component leaves nothing even when the item has one.
+    #[test]
+    fn a_used_up_stack_keeps_its_own_use_remainder() {
+        let info = ItemInfo::default();
+        let mut stew = ItemStack::new("minecraft:mushroom_stew", 1);
+        stew.data_mut().set_other(
+            "minecraft:use_remainder",
+            Some(Tag::compound([(
+                "id",
+                Tag::String("minecraft:bowl".into()),
+            )])),
+        );
+        let left = finish_remaining(&stew, info.use_remainder.clone(), false, true).unwrap();
+        assert_eq!(&*left.item, "minecraft:bowl");
+
+        let plain = ItemStack::new("minecraft:mushroom_stew", 1);
+        let left = finish_remaining(
+            &plain,
+            Some("minecraft:glass_bottle".into()),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(&*left.item, "minecraft:glass_bottle");
+
+        let mut removed = plain.clone();
+        removed.data_mut().set_other(
+            "!minecraft:use_remainder",
+            Some(Tag::compound(Vec::<(&str, Tag)>::new())),
+        );
+        assert!(
+            finish_remaining(&removed, Some("minecraft:glass_bottle".into()), false, true).is_none()
+        );
     }
 }

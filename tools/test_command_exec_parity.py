@@ -30,11 +30,12 @@ import sys
 import zipfile
 
 try:
-    from . import lab, test_rust_parity as base
+    from . import fast_bins, lab, test_rust_parity as base
     from .integration_env import run_game
     from . import command_exec_corpus as corpus_module
     from . import seed_agent
 except ImportError:
+    import fast_bins
     import lab
     import seed_agent
     from integration_env import run_game
@@ -195,6 +196,7 @@ def main():
     parser.add_argument('--mob-absorption-infinite-fixture', action='store_true', help='infinite Absorption used up, kept, and beside another infinite effect')
     parser.add_argument('--mob-absorption-raw-diagnostic', action='store_true', help='add each mob\'s whole entity data')
     parser.add_argument("--mob-pickup-save-fixture", action="store_true")
+    parser.add_argument('--merchant-restock-fixture', action='store_true')
     parser.add_argument('--merchant-crafted-fixture', action='store_true')
     parser.add_argument('--mob-name-presentation-diagnostic', action='store_true',
                         help='retain all 312 mob-name records, including ten separate name/saved-text presentation observations')
@@ -461,6 +463,9 @@ def main():
     if args.selector_bounds_fixture:
         from selector_bounds_corpus import selector_bounds
         groups = [("setup", corpus_module.group_setup()), ("selector entity bounds", selector_bounds())]
+    if args.merchant_restock_fixture:
+        from merchant_restock_corpus import cases
+        groups = [('merchant live restock', cases())]
     if args.baby_modifier_fixture:
         from baby_modifier_corpus import baby_modifier
         groups = [('setup', corpus_module.group_setup()), ('baby modifier mutation', baby_modifier(args.baby_modifier_raw_diagnostic))]
@@ -564,6 +569,8 @@ def main():
         direct_input = build / 'orb-water-inputs.json'
         direct_input.write_text(json.dumps(arithmetic_inputs()), encoding='utf-8')
         java_options = ['-Dhorizon.orbWaterArithmetic=' + str(direct_input)]
+    if args.merchant_restock_fixture:
+        java_options += ['-Dhorizon.merchantFixture=true']
     if args.function_admission_fixture:
         java_options.append('-Dhorizon.functionAdmissionFixture=true')
     if synced:
@@ -606,7 +613,7 @@ def main():
     if args.binary:
         binary = args.binary.resolve(strict=True)
     else:
-        run(['cargo', 'build', '--profile', 'fast', '-p', 'horizon-game', '--bin', 'horizon-client'], 'compile-rust', cwd=lab.ROOT)
+        run(fast_bins.command('horizon-client'), 'compile-rust', cwd=lab.ROOT)
         metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=lab.ROOT, text=True))
         binary = Path(metadata['target_directory']) / 'fast' / ('horizon-client.exe' if os.name == 'nt' else 'horizon-client')
     rust_dir = build / 'rust'
@@ -631,7 +638,7 @@ def main():
     if args.loaded_fixture:
         env['HORIZON_HARNESS_LOADED_FIXTURE'] = '1'
         env['HORIZON_HARNESS_CLIENT_CONFIG'] = str(build / 'rust-client-config.json')
-    run([binary, '--resources', lab.RESOURCES, '--world', 'harness', '--seed', SEED, '--radius', 2 if args.loaded_fixture else 4], 'rust', game=True, cwd=rust_dir, env=env)
+    run([binary, '--resources', Path(os.environ.get('HORIZON_TEST_RESOURCES', lab.RESOURCES)), '--world', 'harness', '--seed', SEED, '--radius', 2 if args.loaded_fixture else 4], 'rust', game=True, cwd=rust_dir, env=env)
 
     if any(op['op'] == 'raid_state' for op in script):
         from raid_village_corpus import validate_native_inputs
@@ -696,7 +703,7 @@ def main():
     failed_positions = set()
     for position, (v, r) in enumerate(zip(vanilla, rust)):
         assert v['cmd'] == r['cmd'], (v['cmd'], r['cmd'])
-        kind = ('strict_record' if v != r else None) if args.merchant_gate_fixture or args.merchant_crafted_fixture else compare(v, r, recorded_ops[position].get('comparison'))
+        kind = ('strict_record' if v != r else None) if args.merchant_gate_fixture or args.merchant_crafted_fixture or args.merchant_restock_fixture else compare(v, r, recorded_ops[position].get('comparison'))
         if kind:
             failed_positions.add(position)
             mismatches.append({'kind': kind, 'cmd': v['cmd'], 'vanilla': v, 'rust': r})

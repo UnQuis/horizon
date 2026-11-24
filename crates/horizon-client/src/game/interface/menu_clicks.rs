@@ -3,6 +3,17 @@
 //! display and throw clicks, and a mouse button over the inventory (`click_inventory`).
 use super::*;
 
+/// `ArmorSlot.mayPlace`: the stack's own `equippable` slot is the slot's.
+fn armor_slot_accepts(items: &horizon_client::items::Items, stack: &ItemStack, slot: usize) -> bool {
+    let wanted = ["head", "chest", "legs", "feet"][slot - 500];
+    horizon_client::item_sync::equippable_slot(stack, items).as_deref() == Some(wanted)
+}
+
+/// `ItemStack.getMaxStackSize` of the stack a click merges into.
+fn merge_max(items: &horizon_client::items::Items, stack: &ItemStack) -> u32 {
+    horizon_client::menu::item_max_stack(items, stack)
+}
+
 impl Game<'_> {
     /// `quickMoveStack` of the open plain menu for a shift-click.
     pub(super) fn inventory_quick_move(&mut self, slot: usize) -> bool {
@@ -118,6 +129,8 @@ impl Game<'_> {
     /// Bedrock's tick when a stack splits: a right-click with an empty hand on a stack of more
     /// than one, which the menu halves. Returns the clicked slot and the counts that confirm
     /// the click actually did it (the stack before, and the half the hand should hold after).
+    /// Read through `slot_view`: a crafting result slot is computed, not stored. `&mut self`
+    /// stays, as for `split_done`: a mod point's signature hash covers the receiver.
     pub(super) fn split_click(
         &mut self,
         ops: &[(Option<usize>, i32, horizon_client::menu::Input)],
@@ -128,7 +141,7 @@ impl Game<'_> {
         if self.carried.is_some() {
             return None;
         }
-        let stack = self.slot_mut(*slot).clone()?;
+        let stack = self.slot_view(*slot)?;
         (stack.count > 1).then(|| (*slot, stack.count, stack.count.div_ceil(2)))
     }
     /// Whether the menu did the split `split_click` described: the hand took the upper half and
@@ -138,8 +151,7 @@ impl Game<'_> {
         let carried = self.carried.as_ref().is_some_and(|c| c.count == half);
         carried
             && self
-                .slot_mut(slot)
-                .clone()
+                .slot_view(slot)
                 .is_some_and(|s| s.count.saturating_add(half) == before)
     }
     /// Several clicks on one menu instance (a quick craft drag is three).
@@ -816,7 +828,7 @@ impl Game<'_> {
         {
             return;
         }
-        let max = |items: &Items, s: &ItemStack| items.get(&s.item).map_or(64, |i| i.max_stack);
+        let max = merge_max;
         let shift = held_shift;
         if slot >= 300
             && let Some(key) = self.container
@@ -905,14 +917,10 @@ impl Game<'_> {
             return;
         }
         if (500..504).contains(&slot) {
-            let wanted = ["head", "chest", "legs", "feet"][slot - 500];
-            let fits = self.carried.as_ref().is_none_or(|c| {
-                self.res
-                    .items()
-                    .get(&c.item)
-                    .and_then(|i| i.equip_slot.as_deref())
-                    == Some(wanted)
-            });
+            let fits = self
+                .carried
+                .as_ref()
+                .is_none_or(|c| armor_slot_accepts(self.res.items(), c, slot));
             if !fits {
                 return;
             }
@@ -988,5 +996,61 @@ impl Game<'_> {
         } else {
             self.play_client_player_sound(sound, volume, pitch);
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_component_click_tests {
+    use super::{armor_slot_accepts, merge_max};
+    use horizon_client::items::{ItemInfo, ItemStack, Items};
+    use horizon_core::nbt::Tag;
+
+    /// A click into an armour slot reads the carried stack's `equippable`
+    /// component, so a patched item fits where it says and a removed one
+    /// fits nowhere.
+    #[test]
+    fn an_armour_slot_click_reads_the_stacks_equippable() {
+        let mut items = Items::for_tests(Default::default());
+        items.items.insert(
+            "minecraft:iron_helmet".into(),
+            ItemInfo {
+                equip_slot: Some("head".into()),
+                ..Default::default()
+            },
+        );
+        let helmet = ItemStack::new("minecraft:iron_helmet", 1);
+        assert!(armor_slot_accepts(&items, &helmet, 500));
+        assert!(!armor_slot_accepts(&items, &helmet, 501));
+
+        let mut patched = helmet.clone();
+        patched.data_mut().set_other(
+            "minecraft:equippable",
+            Some(Tag::compound([("slot", Tag::String("chest".into()))])),
+        );
+        assert!(!armor_slot_accepts(&items, &patched, 500));
+        assert!(armor_slot_accepts(&items, &patched, 501));
+
+        let mut removed = helmet.clone();
+        removed.data_mut().set_other(
+            "!minecraft:equippable",
+            Some(Tag::compound(Vec::<(&str, Tag)>::new())),
+        );
+        assert!(!armor_slot_accepts(&items, &removed, 500));
+    }
+
+    /// A merge takes as much as the target stack's own `max_stack_size`, so a
+    /// removed component leaves room for none.
+    #[test]
+    fn a_merge_reads_the_stacks_own_max_stack_size() {
+        let items = Items::for_tests(Default::default());
+        let mut stone = ItemStack::new("minecraft:stone", 1);
+        stone
+            .data_mut()
+            .set_other("minecraft:max_stack_size", Some(Tag::Int(16)));
+        assert_eq!(merge_max(&items, &stone), 16);
+        stone
+            .data_mut()
+            .set_other("!minecraft:max_stack_size", Some(Tag::compound(Vec::<(&str, Tag)>::new())));
+        assert_eq!(merge_max(&items, &stone), 1);
     }
 }

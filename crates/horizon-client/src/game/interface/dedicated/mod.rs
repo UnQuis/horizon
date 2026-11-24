@@ -165,6 +165,23 @@ struct Setup {
     /// `--allowMissingMods`: open a world whose saved mods are missing (`missing_mods`).
     allow_missing_mods: bool,
 }
+/// Whether `horizon-server` runs this game, and so starts it again after a `/restart`.
+pub(super) fn supervised() -> bool {
+    std::env::var_os(super::launch_api::SUPERVISED_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// `/restart` (Horizon's own, on a server `horizon-server` runs): like `/stop`, then the process exits
+/// with a code that asks the supervisor to start the game again. `stop` is the server loop's flag.
+/// Unsupervised nothing would start the game again, so it says so and stops nothing.
+pub(super) fn request_restart(supervised: bool, stop: &mut bool) -> Text {
+    if !supervised {
+        return Text::translate("horizon.commands.restart.unsupervised", &[]);
+    }
+    super::exit_code::set_restart_requested();
+    *stop = true;
+    Text::translate("horizon.commands.restart.restarting", &[])
+}
+
 static SETUP: OnceLock<Mutex<Option<Setup>>> = OnceLock::new();
 /// usercache.json (Services.nameToIdCache): used by the server thread only.
 static USER_CACHE: Mutex<Option<UserCache>> = Mutex::new(None);
@@ -182,6 +199,12 @@ pub(super) fn player_joined(id: u128, name: &str) {
 /// A player in the user cache by id, on a dedicated server.
 pub(super) fn cached_user_by_id(id: u128) -> Option<NameAndId> {
     USER_CACHE.lock().unwrap().as_mut()?.get_by_id(id)
+}
+
+/// A player in the user cache by name (any case) while their entry hasn't expired, on a
+/// dedicated server: no profile lookup, no offline player.
+pub(super) fn cached_user_by_name(name: &str) -> Option<NameAndId> {
+    USER_CACHE.lock().unwrap().as_ref()?.find_by_name(name)
 }
 
 /// `server.toml`'s `[anticheat]`, beside server.properties when horizon-server runs the game; the
@@ -469,6 +492,7 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
     // A dedicated server's tree: /op, /ban, /whitelist... (single player's
     // server thread is an integrated one and never gets here).
     horizon_client::command::vanilla::set_dedicated_commands(true);
+    horizon_client::command::vanilla::set_supervised_commands(supervised());
     // Horizon's own commands are the owner's choice, off as on vanilla.
     if props
         .raw
@@ -718,8 +742,10 @@ impl Lists {
         if !self.whitelisted(user) {
             return Some(translatable("multiplayer.disconnect.not_whitelisted", &[]));
         }
-        let ip = address.ip().to_string();
-        if self.ip_bans.contains(&ip)
+        let entries = self.ip_bans.entries();
+        let key =
+            ip_ban_key(entries.iter().map(|e| e.user.as_str()), address.ip()).map(str::to_owned);
+        if let Some(ip) = key
             && let Some(ban) = self.ip_bans.get(&ip).cloned()
         {
             let mut reason = translatable_tag(
@@ -739,6 +765,20 @@ impl Lists {
         }
         None
     }
+}
+
+/// The `banned-ips.json` key that bans `ip`: its own text or another spelling of the same address, as a
+/// file written by vanilla has it (Java writes `::1` as `0:0:0:0:0:0:0:1`) or an IPv4 address in its
+/// `::ffff:` form. Keys that are not addresses never match.
+fn ip_ban_key<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    ip: std::net::IpAddr,
+) -> Option<&'a str> {
+    let ip = ip.to_canonical();
+    keys.into_iter().find(|key| {
+        key.parse::<std::net::IpAddr>()
+            .is_ok_and(|k| k.to_canonical() == ip)
+    })
 }
 
 /// DedicatedServerProperties.LEGACY_PRESET_NAMES: the old `level-type`
@@ -1029,6 +1069,10 @@ impl Game<'_> {
     fn run_dedicated_inner(&mut self, startup_began: &mut bool) -> Result<()> {
         // This thread ticks the server (MinecraftServer.spin's priority).
         horizon_threads::favour_current();
+        // Multiple hosted servers would otherwise all select the same core.
+        let _core = horizon_threads::server_core::dedicated_enabled()
+            .then(super::integrated::take_server_core)
+            .flatten();
         self.join_world_rest()?;
         let Setup {
             props,
@@ -1637,10 +1681,10 @@ impl Game<'_> {
         if self.is_dedicated_server() {
             if self.level.spawn.is_none() {
                 let [x, y, z] = loop {
-                    self.update_world();
                     if let Some(pos) = self.find_world_spawn()? {
                         break pos;
                     }
+                    self.update_world();
                     if Instant::now() > deadline {
                         return Err("the spawn area did not load".into());
                     }
@@ -1657,8 +1701,11 @@ impl Game<'_> {
             return Ok(());
         }
         while self.player.is_none() {
-            self.update_world();
             self.spawn_player()?;
+            if self.player.is_some() {
+                break;
+            }
+            self.update_world();
             if Instant::now() > deadline {
                 return Err("the spawn area did not load".into());
             }
@@ -1935,6 +1982,13 @@ impl Game<'_> {
             "stop" => {
                 self.console_reply(Text::translate("commands.stop.stopping", &[]));
                 state.lists.lock().unwrap().stop = true;
+            }
+            // Horizon's own, unlike its tree entry also here without the supervisor, to say why it does nothing.
+            "restart" => {
+                let mut lists = state.lists.lock().unwrap();
+                let reply = request_restart(supervised(), &mut lists.stop);
+                drop(lists);
+                self.console_reply(reply);
             }
             // Horizon's own, on the console only: a performance report (report.rs).
             "horizon-report" | "horizon-trace" => {
@@ -2286,7 +2340,15 @@ impl Game<'_> {
             "say" if !rest.is_empty() => {
                 // SayCommand from the console: an unsigned system chat
                 // message of type say_command, logged as not secure.
-                let message = rest.join(" ");
+                let message = match self.console_say_message(line) {
+                    Ok(message) => message,
+                    Err(replies) => {
+                        for text in replies {
+                            self.console_reply(text);
+                        }
+                        return;
+                    }
+                };
                 // An RCON client's `say` is `[Rcon] message`, and its reply stays empty: the line is
                 // the console's own log, not a message to the source.
                 let name = if self.rcon_source { "Rcon" } else { "Server" };
@@ -2320,6 +2382,29 @@ impl Game<'_> {
                 }
             }
         }
+    }
+
+    /// The message of a console `say` line as `SayCommand` takes it: the line is parsed as the
+    /// dispatcher parses a player's, so a bad selector fails the command (the error lines are the
+    /// `Err`), and a good one becomes the names it selects.
+    fn console_say_message(&mut self, line: &str) -> std::result::Result<String, Vec<Text>> {
+        self.as_console_in_overworld(|g| {
+            let dispatcher = g.ui.dispatcher.0.clone();
+            let parse = dispatcher.parse(line, &g.ui.registries);
+            match parse.executable() {
+                Ok((ctx, _)) => match ctx.get("message") {
+                    Some(horizon_client::command::Arg::Str(s)) => {
+                        Ok(g.expand_selectors(s).plain())
+                    }
+                    _ => Ok(line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+                },
+                Err(e) => {
+                    g.chat_capture = Some(Vec::new());
+                    g.syntax_failure(&e, line);
+                    Err(g.chat_capture.take().unwrap_or_default())
+                }
+            }
+        })
     }
 
     fn console_whitelist(&mut self, state: &mut ServerState, rest: &[&str]) {
@@ -2560,12 +2645,15 @@ impl Game<'_> {
     }
 
     /// `Hub::kick`, with the server's `kick` event recorded. Whether it started the guest's
-    /// disconnect: false for a missing guest and one whose disconnect is already pending.
+    /// disconnect: false for a missing guest and one whose disconnect is already pending or who is hearing `player_leaving`.
     pub(super) fn kick_conn(&mut self, conn: u32, reason: Tag) -> bool {
         let Some(h) = self.lan.as_mut() else {
             return false;
         };
-        if h.hub.guest(conn).is_none_or(|g| g.disconnect_pending) {
+        if h.hub
+            .guest(conn)
+            .is_none_or(|g| g.disconnect_pending || g.leaving)
+        {
             return false;
         }
         h.hub.kick(conn, reason);
@@ -2739,6 +2827,52 @@ mod tests {
         process::{Command, Stdio},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// `banned-ips.json` holds addresses as text: one written by vanilla spells `::1` as Java does
+    /// (`0:0:0:0:0:0:0:1`), and an IPv4 player may arrive in its `::ffff:` form. The same address bans
+    /// whatever its spelling; other addresses and keys that are no address do not.
+    #[test]
+    fn an_ip_ban_matches_the_address_not_its_spelling() {
+        use super::ip_ban_key;
+        let keys = [
+            "203.0.113.7",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:198.51.100.2",
+            "not an address",
+        ];
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.7")), Some("203.0.113.7"));
+        assert_eq!(
+            ip_ban_key(keys, ip("::ffff:203.0.113.7")),
+            Some("203.0.113.7")
+        );
+        assert_eq!(ip_ban_key(keys, ip("::1")), Some("0:0:0:0:0:0:0:1"));
+        assert_eq!(
+            ip_ban_key(keys, ip("198.51.100.2")),
+            Some("::ffff:198.51.100.2")
+        );
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.8")), None);
+        assert_eq!(ip_ban_key(keys, ip("::2")), None);
+    }
+
+    /// `/restart` without `horizon-server` refuses and stops nothing; with it, it asks the server loop to end.
+    #[test]
+    fn restart_without_a_supervisor_does_nothing_and_says_why() {
+        let mut stop = false;
+        let reply = super::request_restart(false, &mut stop);
+        assert!(!stop);
+        assert!(!super::super::exit_code::restart_requested());
+        assert_eq!(
+            reply.translation_key(),
+            Some("horizon.commands.restart.unsupervised")
+        );
+        let reply = super::request_restart(true, &mut stop);
+        assert!(stop);
+        assert_eq!(
+            reply.translation_key(),
+            Some("horizon.commands.restart.restarting")
+        );
+    }
 
     /// A console line runs in the overworld even after a server tick left the nether in place.
     #[test]
@@ -3262,5 +3396,73 @@ mod console_source_tests {
         );
         // The console's source is put back after each line.
         assert!(game.command_source.is_none());
+    }
+
+    /// `say` at the console: the message goes through `MessageArgument`, as a player's does. A selector
+    /// becomes the names it selects (none for the console's own `@s`), and a bad one fails the command
+    /// instead of reaching the players as the text that was typed.
+    #[test]
+    #[ignore = "daily"]
+    fn the_consoles_say_resolves_and_checks_its_selectors() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut resources = None;
+        let res = resources.insert(loaded.resources);
+        let mut game = Game::new(
+            res,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert_eq!(game.console_say_message("say hello"), Ok("hello".to_owned()));
+        assert_eq!(
+            game.console_say_message("say hello @s").map(|m| m.trim_end().to_owned()),
+            Ok("hello".to_owned())
+        );
+        let (ok, _) = console(&mut game, "summon pig 0 80 0 {NoAI:1b}");
+        assert!(ok);
+        assert_eq!(
+            game.console_say_message("say hi @e[type=pig]"),
+            Ok("hi Pig".to_owned())
+        );
+        let failed = game
+            .console_say_message("say @e[type=nothing]")
+            .expect_err("an unknown entity type fails the command");
+        assert_eq!(
+            failed.first().map(|t| t.plain()).as_deref(),
+            Some("Invalid or unknown entity type 'minecraft:nothing'")
+        );
     }
 }

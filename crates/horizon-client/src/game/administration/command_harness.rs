@@ -523,12 +523,7 @@ impl Game<'_> {
                 "player_loop" => {
                     let ticks = op["n"].as_u64().unwrap_or(1);
                     let count = |g: &mut Self| {
-                        Ok(g.stats
-                            .values
-                            .get("minecraft:custom")
-                            .and_then(|m| m.get("minecraft:play_time"))
-                            .copied()
-                            .unwrap_or(0))
+                        Ok(g.stats.get("custom", "minecraft:play_time"))
                     };
                     let before = self.harness_owner(count)?;
                     self.chat_capture = Some(Vec::new());
@@ -997,6 +992,7 @@ impl Game<'_> {
                     out.push_str(&record.to_string());
                     out.push('\n');
                 }
+                "merchant_save" => self.in_owner_level(|g| g.save_game())?,
                 "merchant_saved_stats" => {
                     let (state, raw) = self.harness_owner(|g| {
                         g.load_stats();

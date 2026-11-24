@@ -121,6 +121,40 @@ fn lists_what_each_world_is() {
     fs::remove_dir_all(&home).unwrap();
 }
 
+/// A world's picture is drawn made small, and one wider than any GPU's texture limit (20000 × 1,
+/// under a kilobyte) not at all: GPUI's atlas added a max-size texture for it on every frame.
+#[test]
+fn a_world_picture_is_drawn_small_or_not_at_all() {
+    let home = scratch("pictures");
+    let dir = world(&home, "W", vec![("LevelName", name("W"))]);
+    assert_eq!(icon_picture(&dir), None);
+    fs::write(dir.join("icon.png"), crate::test_support::png(20000, 1)).unwrap();
+    assert_eq!(icon_picture(&dir), None);
+    fs::write(dir.join("icon.png"), crate::test_support::png(64, 64)).unwrap();
+    let icon = icon_picture(&dir).unwrap();
+    assert_eq!(crate::test_support::dimensions(&icon), (64, 64));
+    fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn a_last_played_that_cannot_be_a_time_lists_the_world_with_its_files_time() {
+    let home = scratch("bad-last-played");
+    // i64::MAX milliseconds overflows SystemTime on Windows and every date format.
+    for (folder, millis) in [("Huge", i64::MAX), ("Negative", -5_000)] {
+        world(&home, folder, vec![("LastPlayed", Tag::Long(millis))]);
+    }
+
+    let all = list(&home);
+    assert_eq!(all.len(), 2);
+    for w in &all {
+        let changed = fs::metadata(w.path.join("level.dat"))
+            .and_then(|m| m.modified())
+            .unwrap();
+        assert_eq!(w.last_played, changed, "{}", w.folder);
+    }
+    fs::remove_dir_all(&home).unwrap();
+}
+
 #[test]
 fn a_backup_is_named_and_laid_out_as_vanillas() {
     let home = scratch("backup");

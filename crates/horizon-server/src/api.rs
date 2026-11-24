@@ -381,6 +381,8 @@ pub struct Shared {
     pub event_added: std::sync::Condvar,
     /// The management protocol's connections, which its notifications go to (management.rs).
     pub management: crate::management::Clients,
+    /// `[proxy]`'s listener, when it is on (proxy/mod.rs).
+    pub proxy: Mutex<Option<crate::proxy::Proxy>>,
 }
 
 impl Shared {
@@ -413,7 +415,15 @@ impl Shared {
             events: Mutex::default(),
             event_added: std::sync::Condvar::new(),
             management: crate::management::Clients::default(),
+            proxy: Mutex::new(None),
         })
+    }
+
+    /// What `[proxy]` is told as the game starts, stops and ends (proxy/mod.rs); nothing when it is off.
+    pub fn proxy(&self, tell: impl FnOnce(&crate::proxy::Proxy)) {
+        if let Some(proxy) = self.proxy.lock().unwrap().as_ref() {
+            tell(proxy);
+        }
     }
 
     /// Ends an update or rollback: its outcome, in the log and in `status`.
@@ -455,7 +465,16 @@ impl Shared {
             update.busy = Some("Looking for the newest release".into());
         }
         if let Some(tag) = tag {
-            if !install.release(&tag).is_dir() || tag.contains(['/', '\\']) {
+            // A plain release name, as `update::unpack` requires: ".." is a folder without a slash, and
+            // would point `current` at the install's root.
+            // On Windows `releases\C:` joins to the drive-relative path `C:`, so a tag with a colon
+            // is refused too, and it must be exactly one normal path component.
+            let mut parts = std::path::Path::new(&tag).components();
+            let plain = !tag.starts_with('.')
+                && !tag.contains(['/', '\\', ':'])
+                && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+                && parts.next().is_none();
+            if !plain || !install.release(&tag).is_dir() {
                 self.update.lock().unwrap().busy = None;
                 return Err(format!(
                     "{tag} isn't installed (`horizon-server update` downloads it)"
@@ -1045,6 +1064,40 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_update_names_a_release_not_a_folder_around_it() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("horizon-server-update-tag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("releases/v2")).unwrap();
+        let dir = root.join("server");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = Shared::with_install(&dir, Some(Install { root: root.clone() }));
+        for tag in ["..", ".", "", ".hidden", "v2/../v2", "..\\x", "C:", "C:x"] {
+            let err = shared
+                .start_update(Some(tag.into()), Duration::from_secs(1))
+                .unwrap_err();
+            assert!(err.contains("isn't installed"), "{tag:?}: {err}");
+            assert!(shared.update.lock().unwrap().pending.is_none(), "{tag:?}");
+        }
+        shared
+            .start_update(Some("v2".into()), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            shared
+                .update
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .map(|p| p.0.as_str()),
+            Some("v2")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn tokens_compare_whole() {
@@ -1651,6 +1704,7 @@ mod tests {
             "api.allow_public",
             "panel.bind",
             "properties.enable-rcon",
+            "anticheat.strikes=",
         ] {
             let (status, _) = call(
                 "PATCH",

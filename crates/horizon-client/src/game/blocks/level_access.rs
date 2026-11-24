@@ -195,6 +195,12 @@ impl LevelAccess for GameLevel<'_> {
         self.native_block_grow_feature(self.dimension, pos, &mut feature, &mut cancel);
         feature.filter(|_| !cancel).map(std::borrow::Cow::Owned)
     }
+    fn structure_grow(&self, source: BlockPos, placed: &[[i32; 3]]) {
+        if self.native_authoritative && mod_api::__private::listened(mod_api::HookId::StructureGrow)
+        {
+            self.native_structure_grow(self.dimension, source, placed);
+        }
+    }
     fn crop_grow_pre(&mut self, pos: BlockPos, state: BlockStateId, vanilla: bool) -> bool {
         if !self.native_authoritative || !mod_api::__private::listened(mod_api::HookId::CropGrowPre)
         {
@@ -547,6 +553,12 @@ impl LevelAccess for GameLevel<'_> {
             self.native_analog_output(self.dimension, pos, state, direction, &mut output);
         }
         output.clamp(0, 15)
+    }
+    /// Only the server's switch counts: a client replays what its server sent (a piston's block
+    /// event), whatever its own copy of the mod list says.
+    #[inline]
+    fn template_suppressed(&self, state: BlockStateId) -> bool {
+        self.native_authoritative && super::code_block_owners::suppressed(self.registry, state)
     }
     fn before_random_tick(
         &mut self,

@@ -119,6 +119,26 @@ fn contents_weight(items: &Items, inside: &[ItemStack]) -> Weight {
     })
 }
 
+/// `BundleContents.computeContentWeight` returns an error when its fraction
+/// arithmetic exceeds Java's integer bounds. The weight may exceed one.
+pub(crate) fn valid_contents_weight(items: &Items, inside: &[ItemStack]) -> bool {
+    fn checked(weight: Weight) -> Option<Weight> {
+        (i32::try_from(weight.n).is_ok() && i32::try_from(weight.d).is_ok()).then_some(weight)
+    }
+    fn weigh(items: &Items, inside: &[ItemStack]) -> Option<Weight> {
+        inside.iter().try_fold(Weight::ZERO, |total, stack| {
+            let weight = if let Some(nested) = contents_of(items, stack) {
+                checked(weigh(items, nested)?.add(Weight::new(1, 16)))?
+            } else {
+                item_weight(items, stack)
+            };
+            let weight = checked(weight.times(stack.count))?;
+            checked(total.add(weight))
+        })
+    }
+    weigh(items, inside).is_some()
+}
+
 /// `BundleItem.onDestroyed` (`ItemStack.onDestroyed` for a bundle): the stack
 /// is emptied and every stack it held comes back as its own item copy, which
 /// `ItemUtils.onContainerDestroyed` drops where the entity lay.
@@ -553,5 +573,50 @@ mod tooltip_tests {
         assert_eq!(&*removed.item, "minecraft:apple");
         assert_eq!(removed.count, 2);
         assert_eq!(contents.selected(), -1);
+    }
+}
+
+#[cfg(test)]
+mod stack_size_tests {
+    use super::*;
+
+    /// Stone with its own `max_stack_size`, or with the component removed
+    /// (`!minecraft:max_stack_size`).
+    fn stone(size: Option<i32>, count: u32) -> ItemStack {
+        let mut stack = ItemStack::new("minecraft:stone", count);
+        let data = stack.data_mut();
+        match size {
+            Some(n) => data.set_other("minecraft:max_stack_size", Some(Tag::Int(n))),
+            None => data.set_other(
+                "!minecraft:max_stack_size",
+                Some(Tag::Compound(Default::default())),
+            ),
+        };
+        stack.tidy();
+        stack
+    }
+
+    /// `BundleContents.getWeight` weighs a stack by
+    /// `1 / ItemStack.getMaxStackSize()`: four stones with a `max_stack_size`
+    /// of 4 fill a bundle, and one whose component is removed is vanilla's
+    /// `getOrDefault` default of 1, which fills it on its own.
+    #[test]
+    fn a_bundle_weighs_a_stack_by_its_own_max_stack_size() {
+        let Some(items) = crate::items::prepared_items() else {
+            return;
+        };
+        let bundle = ItemStack::new("minecraft:bundle", 1);
+        let mut four = stone(Some(4), 8);
+        let mut contents = Contents::of(&items, &bundle).expect("a bundle");
+        assert_eq!(contents.room_for(&items, &four), 4);
+        assert_eq!(contents.try_insert(&items, &mut four, true), 4);
+        assert_eq!(four.count, 4);
+        assert!(contents.is_full());
+        let mut one = stone(None, 2);
+        let mut contents = Contents::of(&items, &bundle).expect("a bundle");
+        assert_eq!(contents.room_for(&items, &one), 1);
+        assert_eq!(contents.try_insert(&items, &mut one, true), 1);
+        assert_eq!(one.count, 1);
+        assert!(contents.is_full());
     }
 }

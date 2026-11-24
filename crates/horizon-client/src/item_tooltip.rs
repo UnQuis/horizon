@@ -743,7 +743,7 @@ pub fn written_book_lines(
         return Vec::new();
     };
     let mut lines = Vec::new();
-    if !book.author.trim().is_empty() {
+    if !horizon_core::java_character::is_blank(&book.author) {
         lines.push(
             crate::text::format_translation(
                 &text("book.byAuthor"),
@@ -763,19 +763,20 @@ pub fn jukebox_line(
     display: &TooltipDisplay,
     translate: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    if !display.shows("minecraft:jukebox_playable") {
+    const JUKEBOX_PLAYABLE: &str = "minecraft:jukebox_playable";
+    if !display.shows(JUKEBOX_PLAYABLE) {
         return None;
     }
-    let song = match stack
-        .data()
-        .and_then(|d| d.other("minecraft:jukebox_playable"))
-    {
+    let song = match stack.data().and_then(|data| data.other(JUKEBOX_PLAYABLE)) {
         Some(Tag::String(song)) => song.to_string_lossy(),
         // An inline song carries its own description.
         Some(inline) => {
             return inline
                 .get("description")
                 .map(|d| crate::entity_nbt::name_text(d).plain());
+        }
+        None if crate::item_data::ingredient_components::removed(stack, JUKEBOX_PLAYABLE) => {
+            return None;
         }
         None => info?.jukebox_song.clone()?,
     };
@@ -1484,9 +1485,9 @@ pub fn styled_name(stack: &ItemStack, fallback: impl FnOnce() -> String) -> crat
     }
     // A potion or tipped arrow is named by its contents, not its `item_name`.
     if crate::brewing::contents_name_key(stack).is_none()
-        && let Some(component) = stack.data().and_then(|d| d.other("minecraft:item_name"))
+        && let Some(name) = stack.item_name_text()
     {
-        return crate::entity_nbt::name_text(component);
+        return name;
     }
     crate::text::Text::untrusted_legacy(&fallback())
 }

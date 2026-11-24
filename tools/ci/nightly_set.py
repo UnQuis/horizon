@@ -48,7 +48,9 @@ COUNCIL = ".github/council.txt"
 CODEOWNERS = ".github/CODEOWNERS"
 # What CODEOWNERS guards today, refused even if the file moved: what builds, signs and checks releases.
 ALWAYS_GUARDED = ["/.github/", "/tools/ci/", "/crates/horizon-release-sign/", "/crates/horizon-server/src/update.rs",
-                  "/launcher/src/backend.rs", "/launcher/links.json"]
+                  "/launcher/src/backend.rs", "/launcher/links.json", "/launcher/src/backend/release_selection.rs",
+                  "/launcher/src/update_handoff.rs", "/launcher/src/native_mods/sdk_cache.rs",
+                  "/crates/cargo-horizon-mod/src/sdk_fetch.rs", "/xtask/", "/.cargo/"]
 STATE_BRANCH = "nightly-state"
 BUILD_PREFIX = "nightly/build-"
 MAX_PRS = 30
@@ -595,6 +597,13 @@ def answer(repo: str, issue: str, text: str) -> None:
     gh("api", f"repos/{repo}/issues/{issue}/comments", "-f", f"body=🤖 Nightly: {text}")
 
 
+def title_request(title: str) -> str:
+    """The request id in a `nightly build` run's name, or ''. It sits right after the mode (nightly-build.yml's
+    run-name), before the free-form base, so a base that mentions another request's id is never taken for it."""
+    match = re.match(r"nightly build \((?:dry run|real)\) \(request ([^)\s]+)\)", title)
+    return match.group(1) if match else ""
+
+
 def dispatch(repo: str, issue: str, request: str, dry_run: list[dict] | None) -> str:
     """Starts `nightly build` for this request; returns its run's URL once GitHub lists it."""
     args = ["workflow", "run", "nightly-build.yml", "--repo", repo, "--ref", "main", "-f", f"issue={issue}",
@@ -607,7 +616,7 @@ def dispatch(repo: str, issue: str, request: str, dry_run: list[dict] | None) ->
         runs = json.loads(gh("run", "list", "--repo", repo, "--workflow", "nightly-build.yml", "--event",
                              "workflow_dispatch", "--limit", "20", "--json", "displayTitle,url", check=False) or "[]")
         for r in runs:
-            if request in r["displayTitle"]:
+            if title_request(r["displayTitle"]) == request:
                 return r["url"]
     return f"https://github.com/{repo}/actions/workflows/nightly-build.yml"
 

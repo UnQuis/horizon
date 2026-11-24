@@ -228,7 +228,7 @@ The opening, then Play ([clip](docs/opening.webm)):
   keeping every field the launcher doesn't show and the servers joined with Direct Connection. The
   same from the command line: `horizon-launcher multiplayer [list|add|remove] [--instance <name>]`
   and `horizon-launcher play --server <address or name>`.
-- **Patch notes**: each release's notes, newest first, with a link to GitHub Sponsors. Quiet "Sponsor", "Discord" and "Website" links sit in the sidebar footer.
+- **Patch notes**: each release's notes, newest first, with a link to Horizon's Open Collective. Quiet "Sponsor", "Discord" and "Website" links sit in the sidebar footer.
 
 Data lives in the platform's data directory (`~/.local/share/horizon-launcher` on Linux,
 `~/Library/Application Support/horizon-launcher` on macOS, `%APPDATA%\horizon-launcher` on
@@ -284,9 +284,12 @@ page `servers.json` (the list), `servers/<name>/` (the servers created there) an
   Without one, `HTTPS_PROXY` and `HTTP_PROXY` are used when the launcher is started with them, and
   `NO_PROXY` names the hosts to reach directly, a modpack import's jars included. A server on this
   computer never goes through it.
-- **Links**: the Discord invite, the Sponsors page and the website come from `launcher/links.json` on main
+- **Links**: the Discord invite, the Open Collective page and the website come from `launcher/links.json` on main
   (`{"discord": "...", "sponsor": "...", "website": "..."}`), so they change without a launcher release. Offline,
-  the launcher uses the same values built in; an empty address hides its button.
+  the launcher uses the same values built in; an empty address hides its button. An optional `"min_launcher":
+  "0.2.80"` names the oldest launcher that may stay in use, for a release known to be broken: an older one that
+  updates itself installs the update it downloads and restarts at once, or when its window closes while a game
+  it started runs. A failed update says why and the launcher goes on. Unset, nothing changes.
 
 Long pages, dialogs, the server console and data previews have a visible scrollbar when
 their content overflows. Drag the thumb or click the track to navigate without a mouse wheel.
@@ -323,9 +326,11 @@ every 0.2 tag counts as newer than all of those (docs/versioning.md). It downloa
 against the release's signed `SHA256SUMS`, and says "A new version is available" in the sidebar with
 **Update**: the window closes, the launcher's own file runs again as the installer (`apply-update`,
 `src/update_handoff.rs`), which waits for the window's process to exit, puts the new launcher in place (the
-binary, the `.app` bundle or the AppImage) and starts it. Nothing goes in without **Update**: closing the window
-drops a downloaded update, and the next start checks again. When the installer can't put it in place, the old
-launcher starts again and says why. Each process stages in its own folder, and the installer checks the signed
+binary, the `.app` bundle or the AppImage) and starts it. Until then the sidebar says it installs when the
+launcher closes: closing the window installs it the same way without the restart, so the next start is the new
+launcher, and a game started from the window keeps running. Quitting for a data move drops it, and the next start
+checks again. When the installer can't put it in place, the old launcher stays (after **Update** it starts again)
+and says why at its next start. Each process stages in its own folder, and the installer checks the signed
 SHA-256 again before anything goes in; when the launcher in place is already that version or newer, it changes
 nothing. Servers keep running through **Update**. A copy that can't replace itself says so at once and offers
 **Download again** (the website's install page): one in a read-only folder (the disk image, or the read-only copy
@@ -534,6 +539,13 @@ crashes it writes `crash-reports/crash-<date>_<time>-client.txt` beside them. Wh
 launcher started crashes, the Play page says so, with buttons to open or copy the report, open the
 logs folder and report it on Discord; Settings has the logs folder too. A crash report leaves the
 machine only if you turn on crash reports (below).
+
+On Linux and macOS, `untrusted control socket directory` is a launch refusal
+before the game starts, not a game crash. The error names the directory it
+could not trust. Check that path and have the system administrator restore its
+expected ownership or permissions. Do not make it writable to get past the
+error. A normal Linux `/` is owned by root and is not group- or world-writable;
+the sticky-bit `/tmp` directory is allowed.
 
 ## Data collection
 

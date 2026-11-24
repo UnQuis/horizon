@@ -18,7 +18,6 @@ pub use compile_child::compile_child;
 #[cfg(test)]
 #[path = "../tests/support/no_hooks.rs"]
 mod no_hooks;
-mod points;
 mod prepared;
 mod registration_capabilities;
 mod runtime;
@@ -34,7 +33,6 @@ use runtime::take_refusal as wasm_call_refusal;
 pub(crate) mod boundary {
     include!(concat!(env!("OUT_DIR"), "/wire_host_generated.rs"));
 }
-pub(crate) use runtime::WeakWasmMod;
 pub use runtime::{CallClass, WasmHandler, WasmMod};
 
 #[cfg(any(test, feature = "test-copy-probe"))]
@@ -119,12 +117,11 @@ pub enum Refusal {
     /// a hand-written codec changed, or it predates calls by name.
     Layout { built: u64, game: u64 },
     /// The mod calls or answers `call` (`Owner::method`), which this game changed (`changed`) or
-    /// no longer has: it was built against another version of that call.
+    /// doesn't have: it was built against another version of that call. A missing call may be one
+    /// this game dropped or one added after it, and the package records nothing that says which.
     Call { call: String, changed: bool },
     /// Two mods of one linked group were built against different mod APIs.
     MixedGroup { first: String, second: String },
-    /// The mod's generated point records differ from this game's.
-    PointLayout { built: u64, game: u64 },
     /// The game has no shared Rust standard library beside its executable.
     NoStd,
     /// The group's mods declare more memory (`wasm_memory_mib`) than this instance's cap.
@@ -189,18 +186,12 @@ impl std::fmt::Display for Refusal {
                 changed: false,
             } => write!(
                 f,
-                "calls `{call}`, which this game no longer has: rebuild it"
+                "calls `{call}`, which this game doesn't have: it was built for an older or newer game and needs a build for this one"
             ),
             Self::MixedGroup { first, second } => write!(
                 f,
                 "{first} and {second} share a linked group but were built against different mod APIs: rebuild them together"
             ),
-            Self::PointLayout { built, game } => {
-                write!(
-                    f,
-                    "built for another version of the mod points API (mod layout {built}, game layout {game})"
-                )
-            }
             Self::NoStd => write!(f, "this game has no wasm standard library member"),
             Self::Memory {
                 group,
@@ -631,8 +622,8 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// Initializes programmatically loaded mods with the final inventory, then installs
-    /// their point listeners. Call once, before sealing the point registry.
+    /// Initializes programmatically loaded mods with the final inventory. Call once, at
+    /// startup.
     pub fn initialize(
         &self,
         inventory: &[mod_api::PackageInfo],
@@ -667,14 +658,12 @@ fn initialize_selected<'a>(
     let _timer = load_times::timer(load_times::Phase::Initialize);
     let mut refused = Vec::new();
     for (manifest, module) in modules {
-        let result = if initialize_modules(std::slice::from_ref(module), inventory) {
-            points::listen(manifest, module)
-        } else {
-            Err(Refusal::Runtime("initialization failed".into()))
-        };
-        if let Err(why) = result {
+        if !initialize_modules(std::slice::from_ref(module), inventory) {
             module.disable();
-            refused.push((manifest.id.clone(), why));
+            refused.push((
+                manifest.id.clone(),
+                Refusal::Runtime("initialization failed".into()),
+            ));
         }
     }
     report_refusals(&refused, &mut std::io::stdout().lock());
@@ -886,25 +875,6 @@ mod tests {
         assert!(reason.contains("stage 4b"));
         assert_eq!(native_only_hook("entity_tick_pre"), None);
         assert_eq!(native_only_hook("alter_ground"), None);
-    }
-
-    #[test]
-    fn point_layout_refusal_reports_both_layouts_to_console() {
-        let mut console = Vec::new();
-        report_refusals(
-            &[(
-                "layout_mod".into(),
-                Refusal::PointLayout {
-                    built: 123,
-                    game: 456,
-                },
-            )],
-            &mut console,
-        );
-        assert_eq!(
-            String::from_utf8(console).unwrap(),
-            "wasm mod layout_mod refused: built for another version of the mod points API (mod layout 123, game layout 456)\n"
-        );
     }
 
     #[test]
@@ -1154,14 +1124,14 @@ mod tests {
         let packages = vec![
             package("b", "1.0.0", "lib = \"^1\"", 'b', "t", ""),
             package("lib", "1.2.0", "", 'a', "t", ""),
-            package("c", "1.0.0", "lib = \"^1\"", 'c', "t", ""),
+            package("e", "1.0.0", "lib = \"^1\"", 'c', "t", ""),
             package("alone", "1.0.0", "", 'd', "t", ""),
         ];
         let (groups, refused) = groups(&packages, horizon_mod_package::manifest::Side::Both);
         assert!(refused.is_empty());
         assert_eq!(
             ids(&packages, &groups),
-            [vec!["lib", "b", "c"], vec!["alone"]]
+            [vec!["lib", "b", "e"], vec!["alone"]]
         );
     }
 
@@ -1217,7 +1187,7 @@ mod tests {
             package("lib", "2.0.0", "", 'a', "t", ""),
             package("b", "1.0.0", "missing = \"^1\"", 'b', "t", ""),
             package(
-                "c",
+                "e",
                 "1.0.0",
                 "b = \"^1\"\nextra = { version = \"^1\", optional = true }",
                 'c',
@@ -1238,7 +1208,7 @@ mod tests {
                     }
                 ),
                 (
-                    "c".to_string(),
+                    "e".to_string(),
                     Refusal::DependencyRefused {
                         dependency: "b".into()
                     }
@@ -1248,8 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_internals_refuse_the_mod_and_its_dependents_but_an_injection_loads() {
-        let inject = "[[inject]]\nid = \"stop\"\nat = \"horizon_client::game::server_lifecycle::remember_shutdown\"\nkind = \"head\"\nwith = \"on_stop\"\nhash = \"h\"\n";
+    fn declared_internals_refuse_the_mod_and_its_dependents() {
         let packages = vec![
             package(
                 "deep",
@@ -1260,7 +1229,7 @@ mod tests {
                 "[[internals]]\npath = \"Game::world\"\nkind = \"field\"\nhash = \"h\"\n",
             ),
             package("user", "1.0.0", "deep = \"^1\"", 'b', "t", ""),
-            package("typed", "1.0.0", "", 'c', "t", inject),
+            package("typed", "1.0.0", "", 'c', "t", ""),
         ];
         let (groups, refused) = groups(&packages, horizon_mod_package::manifest::Side::Both);
         assert_eq!(ids(&packages, &groups), [vec!["typed"]]);
@@ -1288,7 +1257,7 @@ mod tests {
         let packages = vec![
             package("lib", "1.0.0", "", 'a', "t", ""),
             package("b", "1.0.0", "lib = \"^1\"", 'b', "t", &linked),
-            package("c", "1.0.0", "lib = \"^1\"", 'c', "other", ""),
+            package("e", "1.0.0", "lib = \"^1\"", 'c', "other", ""),
         ];
         let (_, refused) = groups(&packages, horizon_mod_package::manifest::Side::Both);
         assert_eq!(
@@ -1301,7 +1270,7 @@ mod tests {
                     }
                 ),
                 (
-                    "c".to_string(),
+                    "e".to_string(),
                     Refusal::Toolchain {
                         found: "other".into(),
                         group: "t".into()

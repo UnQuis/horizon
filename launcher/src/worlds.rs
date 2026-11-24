@@ -48,7 +48,7 @@ pub struct World {
     pub version: Option<String>,
     /// Bytes on disk, every file in its folder.
     pub size: u64,
-    /// `icon.png`, the picture the game took of it.
+    /// `icon.png`, the picture the game took of it: drawn only through [`icon_picture`].
     pub icon: Option<PathBuf>,
     /// The ids of the mods it was last saved with: the code mods of `fml.LoadingModList`, then the
     /// content mods of Horizon's `horizon.ContentModList`, as the game writes them.
@@ -82,6 +82,26 @@ pub fn list(home: &Path) -> Vec<World> {
     worlds
 }
 
+/// The most a world's `icon.png` is read of: what a pack's `pack.png` may weigh
+/// (`packs::entry`); vanilla's is 64 × 64, a few kilobytes.
+const MAX_ICON_FILE: u64 = 4 << 20;
+
+/// The picture of the world in the folder `world` (its `icon.png`), as the launcher's lists draw
+/// it: PNG made small ([`crate::pictures::list_picture`]). None when there is none, or it isn't
+/// a picture within those limits.
+pub fn icon_picture(world: &Path) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(world.join("icon.png"))
+        .ok()?
+        .take(MAX_ICON_FILE + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_ICON_FILE {
+        return None;
+    }
+    crate::pictures::list_picture(bytes)
+}
+
 /// level.dat: gzip, as vanilla writes it, or plain.
 fn level_dat(path: &Path) -> Option<Tag> {
     let bytes = fs::read(path).ok()?;
@@ -94,6 +114,17 @@ fn level_dat(path: &Path) -> Option<Tag> {
         Err(_) => bytes,
     };
     Some(nbt::read_named(&raw, Limits::default()).ok()?.0.tag)
+}
+
+/// The time a `LastPlayed` of `millis` after the epoch names, or None for one that can't be a
+/// time: zero or less, or past the year 9999. An edited or corrupt level.dat can hold any number,
+/// and a huge one overflows `SystemTime` on Windows and the date shown everywhere.
+fn played_at(millis: i64) -> Option<SystemTime> {
+    /// 9999-12-31T23:59:59.999Z.
+    const LAST: i64 = 253_402_300_799_999;
+    (1..=LAST)
+        .contains(&millis)
+        .then(|| UNIX_EPOCH + Duration::from_millis(millis as u64))
 }
 
 fn read(path: &Path) -> Option<World> {
@@ -123,10 +154,7 @@ fn read(path: &Path) -> Option<World> {
         (_, 3) => "Spectator",
         _ => "Survival",
     };
-    let last_played = match number(field("LastPlayed")) {
-        millis if millis > 0 => UNIX_EPOCH + Duration::from_millis(millis as u64),
-        _ => changed,
-    };
+    let last_played = played_at(number(field("LastPlayed"))).unwrap_or(changed);
     let icon = path.join("icon.png");
     // `[{ModId, ModVersion}]` lists, as `save::level_mods` writes them; anything else reads as none.
     let listed = |list: Option<&Tag>| -> Vec<String> {
