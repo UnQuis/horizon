@@ -486,6 +486,8 @@ enum OwnProfile {
 pub(super) struct Remote {
     pub(super) professions: Arc<horizon_client::mobs::villager::ResolvedProfessions>,
     pub session: Session,
+    /// A network session, not the integrated server's memory connection or a replay.
+    pub(super) external_server: bool,
     pub brand: String,
     pub(super) recipe_viewer: crate::game::recipe_book::ViewerChannels,
     /// This connection's configured feature flags, carried through reconfiguration.
@@ -728,7 +730,7 @@ pub(super) struct Remote {
     /// The player's own shared flag 0 (`Entity.isOnFire`) as the server last
     /// set it: its fire (blaze fireballs, fire aspect, lightning) never
     /// reaches the window's own `fire_ticks` otherwise.
-    own_on_fire: bool,
+    pub(in crate::game) own_on_fire: bool,
     /// `LivingEntity.DATA_ARROW_COUNT_ID` and `DATA_STINGER_COUNT_ID` of the
     /// own player, as the server synced them.
     pub(super) own_arrows: i32,
@@ -2086,6 +2088,9 @@ impl horizon_client::interaction_input::TargetUseWorld for RemoteUseWorld<'_, '_
 impl horizon_client::interaction_input::InteractionWorld for RemoteInputWorld<'_, '_> {
     fn pick_hit_result(&mut self) {
         self.0.pick_tick_targets();
+    }
+    fn queued_keys(&mut self) {
+        self.0.remote_queued_keys();
     }
     fn release_hit_result(&mut self) {
         self.0.release_tick_targets();
