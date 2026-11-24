@@ -119,7 +119,7 @@ fn structural_families_fit_the_guest_shadow_stack() {
 #[test]
 fn datapack_schema_families_fit_the_guest_shadow_stack() {
     std::thread::Builder::new()
-        .stack_size(128 * 1024)
+        .stack_size(GUEST_STACK)
         .spawn(|| {
             let mut kind = DatapackFieldKind::Bool;
             for _ in 0..8 {

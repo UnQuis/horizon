@@ -284,27 +284,17 @@ impl DatapackFieldKind {
             (Self::List { element, max_len }, DatapackValue::List(values)) => {
                 values.len() <= *max_len as usize && values.iter().all(|value| element.accepts(value))
             }
+            // A decoded object holds every field in schema order, so that is the only form
+            // accepted: a partial or reordered default would differ from the explicit `{}`.
             (Self::Object { fields, max_len }, DatapackValue::Object(values)) => {
-                let mut seen = std::collections::BTreeSet::new();
-                if values.len() > fields.len()
-                    || !values.iter().all(|(name, _)| {
-                        fields.iter().any(|field| { field.name == *name }) && seen.insert(name.as_str())
-                    })
-                {
-                    return false;
-                }
-                fields.iter().all(|field| {
-                    values
+                values.len() == fields.len()
+                    && fields
                         .iter()
-                        .find(|(name, _)| *name == field.name)
-                        .map(|(_, value)| field.kind.accepts(value))
-                        .unwrap_or_else(|| {
-                            field
-                                .default
-                                .as_ref()
-                                .is_some_and(|default| field.kind.accepts(default))
+                        .zip(values)
+                        .all(|(field, (name, value))| {
+                            field.name == *name && field.kind.accepts(value)
                         })
-                }) && object_json_len(values) <= *max_len as usize
+                    && object_json_len(values) <= *max_len as usize
             }
             _ => false,
         }
@@ -374,11 +364,11 @@ pub fn canonicalize_datapack_defaults(
     fields: &mut [DatapackField],
 ) -> Result<(), DatapackRegistrationError> {
     for field in fields.iter_mut() {
-        let kind = field.kind.clone();
-        if let Some(value) = field.default.as_mut() {
-            canonicalize_value(&kind, value)?;
-        }
+        // Children first: an object default takes omitted fields from them.
         canonicalize_child_defaults(&mut field.kind)?;
+        if let Some(value) = field.default.as_mut() {
+            canonicalize_value(&field.kind, value)?;
+        }
     }
     Ok(())
 }
@@ -412,12 +402,33 @@ fn canonicalize_value(
             Ok(())
         }
         (DatapackFieldKind::Object { fields, .. }, DatapackValue::Object(values)) => {
-            // Child schema defaults were already canonicalized by
-            // canonicalize_child_defaults on this kind.
-            for (name, value) in values {
-                if let Some(field) = fields.iter().find(|field| field.name == *name) {
-                    canonicalize_value(&field.kind, value)?;
-                }
+            // Materialize the default as the decoder would build it from the same object:
+            // every field in schema order, an omitted one from its (already canonical) default.
+            // An unknown or repeated name, or an omitted required field, is a bad default.
+            if values
+                .iter()
+                .enumerate()
+                .any(|(index, (name, _))| {
+                    !fields.iter().any(|field| field.name == *name)
+                        || values[..index].iter().any(|(seen, _)| seen == name)
+                })
+            {
+                return Err(DatapackRegistrationError::InvalidDefault);
+            }
+            let mut given = std::mem::take(values);
+            for field in fields {
+                let value = match given.iter().position(|(name, _)| *name == field.name) {
+                    Some(index) => {
+                        let (_, mut value) = given.swap_remove(index);
+                        canonicalize_value(&field.kind, &mut value)?;
+                        value
+                    }
+                    None => field
+                        .default
+                        .clone()
+                        .ok_or(DatapackRegistrationError::InvalidDefault)?,
+                };
+                values.push((field.name.clone(), value));
             }
             Ok(())
         }
@@ -1104,6 +1115,66 @@ mod tests {
             ("a".into(), DatapackValue::Text("bad".into())),
         ]);
         assert!(!object.accepts(&duplicate));
+    }
+
+    /// A partial, reordered object default is completed at registration into the value an
+    /// explicit `{}`-plus-those-fields decodes to; one missing a required field is refused.
+    #[test]
+    fn object_defaults_materialize_like_a_decoded_object() {
+        let display = |default| {
+            vec![DatapackField::with_default(
+                "display",
+                DatapackFieldKind::Object {
+                    fields: vec![
+                        DatapackField::with_default(
+                            "glow",
+                            DatapackFieldKind::Bool,
+                            DatapackValue::Bool(false),
+                        ),
+                        DatapackField::with_default(
+                            "icon",
+                            DatapackFieldKind::Identifier,
+                            DatapackValue::Text("minecraft:stone".into()),
+                        ),
+                        DatapackField::required("label", DatapackFieldKind::Text { max_len: 16 }),
+                    ],
+                    max_len: 256,
+                },
+                default,
+            )]
+        };
+        let partial = DatapackValue::Object(vec![
+            ("label".into(), DatapackValue::Text("Ring".into())),
+            ("glow".into(), DatapackValue::Bool(true)),
+        ]);
+        // Unmaterialized, it is not a value of the kind.
+        assert_eq!(
+            check_schema(&display(partial.clone())),
+            Err(DatapackRegistrationError::InvalidDefault)
+        );
+        let mut fields = display(partial);
+        canonicalize_datapack_defaults(&mut fields).expect("partial default completes");
+        assert_eq!(check_schema(&fields), Ok(()));
+        let decl = DatapackRegistryDeclaration {
+            mod_id: "example".into(),
+            key: "example:slot".into(),
+            fields: fields.clone(),
+            sync: DatapackRegistrySync::ServerOnly,
+        };
+        let explicit = decl
+            .decode_entry(r#"{"display":{"label":"Ring","glow":true}}"#)
+            .expect("explicit object decodes");
+        let omitted = decl.decode_entry("{}").expect("default fills the object");
+        assert_eq!(omitted.get("display"), explicit.get("display"));
+
+        let mut missing = display(DatapackValue::Object(vec![(
+            "glow".into(),
+            DatapackValue::Bool(true),
+        )]));
+        assert_eq!(
+            canonicalize_datapack_defaults(&mut missing),
+            Err(DatapackRegistrationError::InvalidDefault)
+        );
     }
 
     #[test]
