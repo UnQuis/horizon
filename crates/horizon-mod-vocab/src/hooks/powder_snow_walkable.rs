@@ -1,5 +1,5 @@
 //! The `powder_snow_walkable` hook: declarations the mod API generator reads (see `hooks/mod.rs`).
-// catalog-order: 0352
+// catalog-order: 0354
 
 pub trait Hooks {
     /// Whether a living entity can walk on the powder snow block at `pos`, with
