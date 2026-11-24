@@ -51,6 +51,7 @@ impl Renderer {
             lod_retiring,
             lod_leaving,
             lod_pending,
+            lod_tracker,
             detail_columns,
             detail_revision,
             upload_retries,
@@ -76,6 +77,7 @@ impl Renderer {
         self.world_held = from.external.is_some();
         // The mesher makes the layout the sections are uploaded in.
         crate::mesher::packed::pack_quads(self.packed_quads);
+        crate::mesher::meshlet::pack_meshlets(self.mesh_terrain.is_some());
         if let (Some(flat), Some(old)) = (&mut self.flat, &mut from.flat) {
             flat.take_tables(old);
         }

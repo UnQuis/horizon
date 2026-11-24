@@ -1,8 +1,8 @@
 //! One source staging pass for the launcher and `horizon-stage`.
 use crate::{internals, replace};
 /// The build a staged copy is of, named in each build-data file's header.
-pub use point_shape::build_data::Build;
-use point_shape::build_data::Document;
+pub use mod_surface::build_data::Build;
+use mod_surface::build_data::Document;
 use std::{path::Path, time::Instant};
 
 /// Discovery instrumentation must never be used to build or publish a game.
@@ -113,6 +113,7 @@ pub fn stage(
         started.elapsed().as_secs_f64()
     );
     functions.retain_slotted(&replace.slots, &generic);
+    functions.staged_exports = internals.staged_exports.clone();
     // One line: the index is the largest build-data file, and only programs read it.
     let path = points_json.with_file_name(crate::functions::FILE);
     let text = serde_json::to_string(&Document::new(build, &functions))
@@ -187,10 +188,10 @@ mod tests {
                 assert_eq!(bytes.last(), Some(&b'\n'));
                 let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 // Every build-data file opens with the header naming the build.
-                for file in point_shape::build_data::FILES {
+                for file in mod_surface::build_data::FILES {
                     let text = std::fs::read_to_string(root.join(file)).unwrap();
                     let (build, _): (Build, serde_json::Value) =
-                        point_shape::build_data::read(file, &text).unwrap();
+                        mod_surface::build_data::read(file, &text).unwrap();
                     assert_eq!(build.commit, "c".repeat(40), "{file}");
                 }
                 // Launchers from before #19576 read the point list: it stays, empty.

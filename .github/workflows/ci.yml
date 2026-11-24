@@ -2,6 +2,8 @@ name: checks
 # verify: every pull request and every push to main, its parts side by side (below). It is the check main
 # requires, so it runs in every run of this workflow, even a cancelled one: a skipped job counts as passed, and every
 # run must report a real verify (a pull request that changes no Rust skips its Rust parts or finishes them in seconds).
+# native-clippy: Windows and macOS lint the server build and OS-specific crates after Linux lint passes; documentation-only
+# pull requests skip it. Disposable hosted runners keep forks away from the Mac mini's release and parity data.
 # parity: the vanilla harnesses a pull request's changes can affect, on the Mac mini's runner, which holds the
 # maintainer's own Minecraft files (Horizon never downloads the game); .github/workflows/parity.yml. Only for a pull
 # request that changes a harness, oracle, probe or the runner: the rest are checked on main by parity-main. A fork's pull
@@ -234,6 +236,9 @@ jobs:
     name: verify (format and lint)
     needs: verify-scope
     if: github.event_name != 'merge_group' && needs.verify-scope.outputs.rust != 'false'
+    # Pass verify-scope's decision through so native-clippy can wait on this job's answer without re-running it.
+    outputs:
+      rust: ${{ needs.verify-scope.outputs.rust }}
     runs-on: ${{ vars.SELF_HOSTED_CI == 'all' && fromJSON('["self-hosted", "linux", "horizon-checks"]') || 'blacksmith-16vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
@@ -278,6 +283,41 @@ jobs:
         if: always()
         continue-on-error: true
         run: timeout -k 5 10 tools/ci/load_probe.sh || echo "The load probe did not run"
+  # Only after Linux lint passes, so a lint-broken or documentation-only pull request takes no native runner. Main and manual
+  # runs have no rust answer from verify-scope and still lint. Native SDKs avoid cross-build setup; no tests or release
+  # builds here. verify-lint skips the merge queue, so this dependent job does too; queued pull requests were already linted.
+  native-clippy:
+    name: native clippy (${{ matrix.os }})
+    needs: verify-lint
+    if: needs.verify-lint.outputs.rust != 'false'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-11
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: native-clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint the server build and platform-specific crates
+        run: >-
+          cargo +stable clippy --all-targets --locked --no-default-features
+          -p horizon-client -p horizon-threads -p horizon-perf-format
+          -p horizon-perf-share -p horizon-server -- -D warnings
   # The server build (released as horizon-engine): the game without sound or controllers. Its libraries and binaries,
   # not the tests and examples verify-lint checks. Every pull request that changes Rust runs it, whatever crate the
   # change is in (tools/ci/rust_changes.py's server_build answer goes unread on purpose): the merge queue doesn't, so a
@@ -372,9 +412,9 @@ jobs:
           [ "$TESTED" = true ] || cargo +stable fmt --check
           cargo +stable clippy --all-targets --locked -- -D warnings
           if [ "$TESTED" = true ]; then
-            cargo +stable test --locked --lib --bins --no-run
+            cargo +stable test --locked --lib --bins --tests --no-run
           else
-            cargo +stable test --locked --lib --bins
+            cargo +stable test --locked --lib --bins --tests
           fi
       - name: Load probe
         if: always()
@@ -453,12 +493,38 @@ jobs:
             cargo +stable test --locked --workspace --lib --bins --tests --no-run $TIMINGS
             exit 0
           fi
-          cargo +stable test --locked --workspace --lib --bins --tests $TIMINGS
-          # The full content-root tests (#[ignore]d: minutes each on a laptop). The same build as above; they need the
-          # prepared vanilla data, so without it they pass at once. Keep the target selection identical to avoid
+          cargo +stable test --locked --workspace --lib --bins --tests --no-run $TIMINGS
+          # The build is done and Cargo holds no lock while tests run, so the three test phases share the 16 cores
+          # (the build leaves them ~70% idle, and one binary at a time left them idle again: horizon-world's unit
+          # tests alone ran 48 s with the other binaries waiting). The unit and integration binaries run 4 at a time
+          # (tools/ci/run_test_binaries.py, which lists them with the same arguments, nothing compiles); the content-root
+          # tests (#[ignore]d: minutes each on a laptop; they need the prepared vanilla data, so without it they pass at
+          # once) and the doc tests run beside them. The target selection stays identical to the build's, to avoid
           # recompiling the workspace with a different dependency graph.
-          cargo +stable test --locked --workspace --lib --bins --tests mod_content::tests:: -- --ignored
-          cargo +stable test --locked --workspace --doc
+          logs="$RUNNER_TEMP/test-phases"
+          mkdir -p "$logs"
+          python3 tools/ci/run_test_binaries.py --jobs 4 -- cargo +stable test --locked --workspace --lib --bins --tests \
+            > "$logs/unit.log" 2>&1 &
+          unit=$!
+          cargo +stable test --locked --workspace --lib --bins --tests mod_content::tests:: -- --ignored \
+            > "$logs/content-root.log" 2>&1 &
+          content=$!
+          cargo +stable test --locked --workspace --doc > "$logs/doc.log" 2>&1 &
+          doc=$!
+          status=0
+          for phase in unit:$unit content-root:$content doc:$doc; do
+            name=${phase%%:*}
+            if wait "${phase#*:}"; then
+              echo "::group::$name tests passed"
+              cat "$logs/$name.log"
+              echo "::endgroup::"
+            else
+              echo "::error::The $name tests failed"
+              cat "$logs/$name.log"
+              status=1
+            fi
+          done
+          exit $status
       - name: Upload the cargo build timings
         # Also after a failed test: the build, and so its timings, finished before the tests ran.
         if: "!cancelled() && github.ref == 'refs/heads/main'"
@@ -604,7 +670,7 @@ jobs:
       - name: Test the Windows Wasm module cache
         run: cargo test --locked --target x86_64-pc-windows-msvc -p horizon-mod-wasm --lib module_cache
   verify:
-    needs: [verify-scope, verify-tree, verify-lint, verify-server, verify-launcher, verify-test, verify-mod-api, verify-windows-wasm-cache]
+    needs: [verify-scope, verify-tree, verify-lint, verify-server, verify-launcher, verify-test, verify-mod-api, verify-windows-wasm-cache, native-clippy]
     if: always()
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
@@ -614,6 +680,7 @@ jobs:
           SCOPE: ${{ needs.verify-scope.result }}
           TREE: ${{ needs.verify-tree.result }}
           LINT: ${{ needs.verify-lint.result }}
+          NATIVE: ${{ needs.native-clippy.result }}
           SERVER: ${{ needs.verify-server.result }}
           LAUNCHER: ${{ needs.verify-launcher.result }}
           TEST: ${{ needs.verify-test.result }}
@@ -629,11 +696,12 @@ jobs:
         # launcher), the merge queue. The Windows cache part is only for pull requests. Anywhere else the part was
         # never decided for (verify-scope failed, or the run was cancelled first), which fails.
         run: |
-          echo "which parts run: $SCOPE, tree and Python tests: $TREE, format and lint: $LINT, server build: $SERVER, launcher: $LAUNCHER, Rust tests: $TEST, mod API: $MODAPI, Windows Wasm cache: $WINDOWS_WASM_CACHE"
+          echo "which parts run: $SCOPE, tree and Python tests: $TREE, format and lint: $LINT, native clippy: $NATIVE, server build: $SERVER, launcher: $LAUNCHER, Rust tests: $TEST, mod API: $MODAPI, Windows Wasm cache: $WINDOWS_WASM_CACHE"
           [ "$SCOPE" = success ] || exit 1
           [ "$TREE" = success ] || [ "$TREE" = skipped ] || exit 1
           left_out() { [ "$EVENT" = merge_group ] || [ "$1" = false ]; }
           [ "$LINT" = success ] || { [ "$LINT" = skipped ] && left_out "$RUST_ANSWER"; } || exit 1
+          [ "$NATIVE" = success ] || { [ "$NATIVE" = skipped ] && left_out "$RUST_ANSWER"; } || exit 1
           [ "$SERVER" = success ] || { [ "$SERVER" = skipped ] && left_out "$RUST_ANSWER"; } || exit 1
           [ "$LAUNCHER" = success ] || { [ "$LAUNCHER" = skipped ] && left_out "$LAUNCHER_ANSWER"; } || exit 1
           [ "$TEST" = success ] || { [ "$TEST" = skipped ] && [ "$RUST_ANSWER" = false ]; } || exit 1

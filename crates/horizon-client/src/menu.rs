@@ -1422,7 +1422,7 @@ impl Menu {
             return false;
         }
         if let Some(result) = self.state.containers[RESULT][0].as_mut() {
-            result.data_mut().custom_name = (!name.trim().is_empty())
+            result.data_mut().custom_name = (!horizon_core::java_character::is_blank(&name))
                 .then(|| horizon_core::nbt::Tag::String(name.as_str().into()));
             result.tidy();
         }
@@ -1726,9 +1726,20 @@ impl Menu {
     /// How many of `stack` slot `s` holds: `Slot.getMaxStackSize(stack)` where `Slot.mayPlace`
     /// takes it, else none.
     pub fn slot_holds(&self, env: &Env, s: usize, stack: &ItemStack) -> u32 {
-        match self.may_place(env, s, stack) {
-            true => self.slot_max(env, s, stack),
-            false => 0,
+        if self.state.slots[s].role == Role::Hidden {
+            return 0;
+        }
+        let (allowed, max) = self.slot_rules(
+            env,
+            s,
+            stack,
+            self.vanilla_may_place(env, s, stack),
+            self.vanilla_slot_max(s, stack),
+        );
+        if allowed {
+            self.limit_slot_max(s, max)
+        } else {
+            0
         }
     }
 
@@ -2222,7 +2233,7 @@ pub(crate) fn inventory_add(
     items: &Items,
     stack: &mut ItemStack,
 ) -> bool {
-    if stack.count == 0 {
+    if stack.count == 0 || &*stack.item == "minecraft:air" {
         return false;
     }
     if items.get(&stack.item).is_some_and(|i| i.max_damage > 0) && stack.damage > 0 {
@@ -3183,6 +3194,27 @@ pub(crate) mod tests {
             assert_eq!(menu.player_item(0).unwrap().count, 16);
             assert_eq!(item.count, 7);
         });
+    }
+
+    #[test]
+    fn inventory_add_rejects_air_and_empty_stacks() {
+        let items = Items::for_tests(Default::default());
+        for mut stack in [
+            ItemStack::new("minecraft:air", 1),
+            ItemStack::new("minecraft:stone", 0),
+        ] {
+            let mut inventory = [const { None }; 41];
+            let count = stack.count;
+            assert!(!super::inventory_add(
+                &mut inventory,
+                0,
+                false,
+                &items,
+                &mut stack
+            ));
+            assert!(inventory.iter().all(Option::is_none));
+            assert_eq!(stack.count, count);
+        }
     }
 
     #[test]
@@ -4859,6 +4891,7 @@ pub(crate) mod tests {
     }
 
     mod crafted_stat_tests;
+    mod hook_result_tests;
     mod mod_grid_tests;
 
     /// Extra sources (`native_recipe_sources`) count as more inventory: the

@@ -69,7 +69,9 @@ waiting in loops, and work someone else had already done. Tests were a small par
 - **Don't wait in loops.** Start a long command in the background and carry on, or wait for it once. No
   `sleep` or `until grep` polling of builds, harnesses or CI.
 - **One test per changed behaviour.** None for a refactor or a file move, none that reads source text, and no
-  harness where vanilla has nothing to compare (Horizon's own features, performance work).
+  harness where vanilla has nothing to compare (Horizon's own features, performance work). When registering new
+  `#[ignore = "daily"]` tests under `tools/ci/ignored-tests/`, prefer a focused file (`tools/ci/ignored-tests/<area>.txt`)
+  rather than appending to the giant shared lists.
 - **A red check isn't always yours.** When `verify` fails in a test your change can't reach, say so in the pull
   request and move on; don't hunt it.
 - **Bot reviews are advice.** CodeRabbit is often right and sometimes wrong. Check each finding against the code,
@@ -100,7 +102,7 @@ Game workspace (root `Cargo.toml`); `launcher/` and `crates/horizon-telemetry-se
 | `horizon-prepare` | Builds `.local/horizon-client/26.3` from the player's own Minecraft install (runs the Java exporters) |
 | `horizon-server` | `horizon-server`: `server.toml`, CLI, supervisor of the headless game ([docs/hosting.md](docs/hosting.md)) |
 | `horizon-server-files` | `server.properties`, eula, ops/whitelist/bans, usercache |
-| `horizon-anticheat` | The dedicated server's anticheat, off by default: `[anticheat]` settings, violation levels, the checks' rules; the hub runs them (`lan/anticheat.rs`) ([docs/anticheat.md](docs/anticheat.md)) |
+| `horizon-anticheat` | The dedicated server's anticheat, on by default (`combat` and `ground` act; `timer` and `prediction` log only): `[anticheat]` settings, violation levels, the checks' rules; the hub runs them (`lan/anticheat.rs`) ([docs/anticheat.md](docs/anticheat.md)) |
 | `horizon-cosmetics` | Cosmetic items Horizon clients draw on players (off by default): the item format, bones and animations ([docs/cosmetics.md](docs/cosmetics.md)) |
 | `horizon-addresses` | Every built-in address of an outside service vanilla doesn't contact (Horizon layer; [docs/layers.md](docs/layers.md#built-in-addresses)) |
 | `horizon-friends`, `horizon-relay` | Play with Friends: invite codes, encrypted tunnel, the relay ([docs/play-with-friends.md](docs/play-with-friends.md)) |
@@ -209,7 +211,7 @@ state stays separate from the library tests. This compiles gameplay twice for ex
 |---|---|
 | Game loop, tick, frame | `game.rs`: `fn run`, `fn tick`, `fn tick_world`, `fn render`; G: `runtime/window_handler.rs` (`impl ApplicationHandler for Game`: `window_event`, `about_to_wait`), `runtime/launch_options.rs` (the command line); L: `clock.rs`, `spans.rs`; `horizon-client-input/src/window.rs` |
 | Rendering | L: `gfx.rs` (`Renderer::new`, `Renderer::render`), `gfx/` (cull, occlusion, translucency, upload, timing, lod, weather, stars, end_sky), `*.wgsl`, `particles.rs`, `block_entity_render.rs`, `item_render.rs`, `fog.rs`, `clouds.rs`, `camera.rs`, `first_person.rs`; G: `interface/render_tick.rs`, `interface/frame_geometry.rs` (cracks, sun and moon, first-person hand, rain and snow), `interface/item_draw.rs`, `interface/screen_backgrounds.rs` (panorama, menu blur, border wall) |
-| Chunks, streaming, light | L: `streaming.rs` (worker pool: generate, light, mesh), `world.rs`, `chunk.rs`, `chunk_map.rs`, `light.rs`, `mesher.rs` + `mesher/`, `vanillagen.rs` (binds horizon-world's generator), `lod.rs` + `lod/`, `server_terrain.rs` (a server's kept chunks), `bluemap.rs` + `bluemap_detect.rs` (far terrain from its web map), `ticket_levels.rs`; G: `world/world_loading.rs`, `world/world_entry.rs`, `world/postprocess.rs`, `world/world_update.rs` (`fn update_world`, far terrain) |
+| Chunks, streaming, light | L: `streaming.rs` (worker pool: generate, light, mesh), `world.rs`, `chunk.rs`, `chunk_map.rs`, `light.rs`, `mesher.rs` + `mesher/`, `vanillagen.rs` (binds horizon-world's generator), `lod.rs` + `lod/`, `server_terrain.rs` (a server's kept chunks), `ticket_levels.rs`; G: `world/world_loading.rs`, `world/world_entry.rs`, `world/postprocess.rs`, `world/world_update.rs` (`fn update_world`, far terrain) |
 | World generation | `crates/horizon-world/src/worldgen/` (`generator*.rs`, `feature_graph.rs`, `structure/`, `carver/`) |
 | Block behaviour | `crates/horizon-world/src/level/` (`mod.rs`, `tick.rs`, `hooks.rs`, `redstone.rs`, `place.rs`, `interact.rs`); G: `blocks/block_ticks.rs` (`fn tick_blocks`); game.rs `fn process_level_events` |
 | Mobs | L: `mobs.rs` (types), `mobs/` (`ai.rs`, `goals.rs`, `brain.rs`, `*_brain.rs`, `nav.rs`, `path.rs`, `species.rs`, `spawning.rs`, `render.rs`, `anim.rs`); G: `creatures.rs` (ticking, spawning, mob events), one file per mob family (`mobs/dragon.rs`, `mobs/wither.rs`, `mobs/villagers.rs`, `mobs/piglins.rs`, `mobs/golems.rs`...), `mobs/natural_spawning.rs` |

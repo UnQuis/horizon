@@ -189,6 +189,7 @@ pub struct Guest {
     pub center_sent: Option<(i32, i32)>,
     /// Why the connection closed (the console's "lost connection").
     pub left_reason: String,
+    pub(super) logout_guard: Option<Arc<()>>,
     /// A validated movement report the mods have not ruled on yet (`player_move`).
     pub pending_move: Option<super::hub::PendingMove>,
     /// Validated movement packets waiting to be told to `player_move_packet`, oldest first, and
@@ -204,6 +205,12 @@ pub struct Guest {
     /// A mod's personal sidebar is on this client (`Game::native_sidebar`); it is gone with the
     /// connection.
     pub personal_sidebar: bool,
+    /// A mod's one-shot sidebar objective is on this client (`Game::native_send_sidebar`),
+    /// apart from the personal one; it is gone with the connection.
+    pub sent_sidebar_exists: bool,
+    /// The one-shot sidebar uses slot 1 or is waiting for the managed sidebar to clear.
+    /// A world write to slot 1 ends that claim without removing the objective.
+    pub sent_sidebar_claims_slot: bool,
     pub uuid: u128,
     pub name: String,
     /// The properties the player logged in with (`ServerPlayer.getGameProfile`).
@@ -225,6 +232,10 @@ pub struct Guest {
     /// the player away and they are still at the chunk it left. The hold ends (back to `None`) at
     /// an accepted move or teleport ack, a passenger or vehicle move, a camera change, a placement.
     pub held_ticket_chunk: Option<(i32, i32)>,
+    /// A mod's view centre for this player (`PlayerRef::set_view_center`): the chunk their chunk
+    /// tracking follows in place of their own, in their own level, without moving them. `None`:
+    /// their own chunk, as in vanilla. Ends at a respawn, a level change and when they leave.
+    pub view_center: Option<(i32, i32)>,
     pub previous_position: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -315,6 +326,12 @@ pub struct Guest {
     /// A position move arrived since the client's last ClientTickEnd
     /// (receivedPositionThisTick): a second one is a protocol error.
     pub position_this_tick: bool,
+    /// A move reached the player since its last ClientTickEnd
+    /// (`receivedMovementThisTick`): its own position packet, or the one its
+    /// vehicle drove (`handleMoveVehicle` → `handlePlayerKnownMovement`, which
+    /// a rider's `known_movement` comes from: a rider sends no position of its
+    /// own). Without one, `handleClientTickEnd` zeroes `known_movement`.
+    pub movement_this_tick: bool,
     /// Violation levels and the checks' state (the anticheat, when on).
     pub anticheat: horizon_anticheat::Player,
     /// The client ticks the movement prediction plays again (only while it records).
@@ -575,6 +592,8 @@ pub struct Guest {
     pub advancements_changed: std::collections::BTreeSet<usize>,
     /// The server's scoreboard as this player's client has it (lan/scoreboard.rs).
     pub scoreboard: super::scoreboard::View,
+    /// Whether this guest has received its initial `updateEntireScoreboard` sync.
+    pub scoreboard_synced: bool,
     /// Recipes unlocked since the client was last told
     /// (`ServerRecipeBook.addRecipes` sends them).
     pub recipes_unlocked: Vec<String>,
@@ -666,6 +685,11 @@ impl Guest {
         true
     }
 
+    /// Keep the pending logout registered while this guest is temporarily back in the hub.
+    pub fn take_logout_guard(&mut self) -> Option<Arc<()>> {
+        self.logout_guard.take()
+    }
+
     pub fn participates_online(&self) -> bool {
         self.kind == GuestKind::Network
     }
@@ -706,6 +730,17 @@ impl Guest {
                 .is_some_and(|(cx, cz)| super::hub::tracked(cx, cz, self.view_distance, x, z))
     }
 
+    /// Whether this guest is currently tracking entity `id` in `dimension` (in its own level or
+    /// through a viewed level).
+    pub fn tracks_entity(&self, dimension: &str, id: i32) -> bool {
+        (self.dimension == dimension && self.tracker.is_tracking(id))
+            || self
+                .viewed
+                .views
+                .get(dimension)
+                .is_some_and(|view| view.tracker.is_tracking(id))
+    }
+
     fn with_defaults(
         kind: GuestKind,
         j: GuestInit,
@@ -730,10 +765,13 @@ impl Guest {
             move_packets_told: (0, 0),
             center_sent: None,
             left_reason: String::new(),
+            logout_guard: None,
             pending_move: None,
             disconnect_pending: false,
             leaving: false,
             personal_sidebar: false,
+            sent_sidebar_exists: false,
+            sent_sidebar_claims_slot: false,
             uuid: j.uuid,
             name: j.name,
             properties: j.properties,
@@ -747,6 +785,7 @@ impl Guest {
             recipe_sync: Default::default(),
             position,
             held_ticket_chunk: None,
+            view_center: None,
             previous_position: position,
             yaw: 0.0,
             pitch: 0.0,
@@ -791,6 +830,7 @@ impl Guest {
             rests_on_ground: false,
             support_blocks_sent: 0,
             position_this_tick: false,
+            movement_this_tick: false,
             anticheat: Default::default(),
             record: None,
             client_sprinting: false,
@@ -904,6 +944,7 @@ impl Guest {
             advancements_visible: Vec::new(),
             advancements_changed: Default::default(),
             scoreboard: Default::default(),
+            scoreboard_synced: false,
             recipes_unlocked: Vec::new(),
         }
     }
@@ -1082,6 +1123,11 @@ impl Guest {
             (self.position[0].floor() as i32) >> 4,
             (self.position[2].floor() as i32) >> 4,
         )
+    }
+    /// The chunk this player's chunk tracking is centred on (`ChunkMap.move`'s section): a mod's
+    /// view centre, else their own chunk.
+    pub fn view_chunk(&self) -> (i32, i32) {
+        self.view_center.unwrap_or_else(|| self.chunk())
     }
     pub fn creative(&self) -> bool {
         self.game_mode == CREATIVE
@@ -2116,6 +2162,15 @@ pub(super) fn network_stack(
                 horizon_protocol::item::Component::Unit,
             ));
         }
+        // Glider too: the client starts a glide on its own (`LocalPlayer.aiStep`:
+        // `tryToStartFallFlying` reads `canGlideUsing`), so a chestplate given
+        // `glider` by a command or a mod glides only if its client sees it.
+        if d.other("minecraft:glider").is_some() {
+            stack.added.push((
+                horizon_protocol::item::component::GLIDER,
+                horizon_protocol::item::Component::Unit,
+            ));
+        }
         if let Some(component) = d
             .other("minecraft:kinetic_weapon")
             .and_then(|value| crate::item_sync::kinetic::encode(value, synced_id))
@@ -2949,6 +3004,22 @@ mod tests {
             received.component(component::LORE),
             Some(&Component::Lore(lines))
         );
+    }
+
+    #[test]
+    fn a_saved_glider_reaches_the_client() {
+        let mut item = ItemStack::new("minecraft:diamond_chestplate", 1);
+        item.data_mut()
+            .set_other("minecraft:glider", Some(Tag::Compound(Default::default())));
+        let sent = stack_to_network(|_| 7, |_, _| None, &Some(item));
+        let mut writer = Writer::new();
+        horizon_protocol::item::Slot::write(&sent, &mut writer);
+        let mut reader = Reader::new(&writer.data);
+        let received = horizon_protocol::item::Slot::read(&mut reader)
+            .unwrap()
+            .unwrap();
+        // A unit component: the client reads its presence (`glider_and_slot`).
+        assert!(received.component(component::GLIDER).is_some());
     }
 
     #[test]

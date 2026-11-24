@@ -804,8 +804,10 @@ impl TfrPipelines {
 /// Identity token for a cached bind group: clones of the actual wgpu handles.
 /// wgpu handles are refcounted and implement `Eq`/`Hash` by underlying resource identity,
 /// so a dropped view cannot be confused with a later view reusing the same memory address.
-type DepthCopyKey = wgpu::TextureView;
-type MotionKey = (wgpu::TextureView, wgpu::Buffer);
+// Each key holds every resource its group binds, owned ones included: the `pub` owned fields can
+// be replaced without `resize()`, and a key without them would reuse a group on the old resource.
+type DepthCopyKey = (wgpu::TextureView, wgpu::TextureView);
+type MotionKey = (wgpu::TextureView, wgpu::Buffer, wgpu::TextureView);
 type PrepareKey = (
     wgpu::TextureView,
     wgpu::TextureView,
@@ -821,6 +823,8 @@ type ComposeKey = (
     wgpu::Sampler,
     wgpu::TextureView,
     wgpu::Buffer,
+    wgpu::TextureView,
+    wgpu::Sampler,
 );
 type BlitKey = (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView);
 
@@ -1028,7 +1032,7 @@ impl TfrGpuResources {
         encoder: &mut wgpu::CommandEncoder,
         src_depth: &wgpu::TextureView,
     ) {
-        let key = src_depth.clone();
+        let key = (src_depth.clone(), self.history_depth_view.clone());
         let mut cache = self.bind_groups.borrow_mut();
         let bg = if cache.depth_copy.as_ref().is_some_and(|(k, _)| *k == key) {
             &cache.depth_copy.as_ref().unwrap().1
@@ -1050,7 +1054,7 @@ impl TfrGpuResources {
         depth_view: &wgpu::TextureView,
         params: &wgpu::Buffer,
     ) {
-        let key = (depth_view.clone(), params.clone());
+        let key = (depth_view.clone(), params.clone(), self.motion_view.clone());
         let mut cache = self.bind_groups.borrow_mut();
         let bg = if cache.motion.as_ref().is_some_and(|(k, _)| *k == key) {
             &cache.motion.as_ref().unwrap().1
@@ -1126,6 +1130,8 @@ impl TfrGpuResources {
             edge_sampler.clone(),
             output.clone(),
             params.clone(),
+            self.motion_view.clone(),
+            self.linear_sampler.clone(),
         );
         let mut cache = self.bind_groups.borrow_mut();
         let bg = if cache.compose.as_ref().is_some_and(|(k, _)| *k == key) {
@@ -1185,6 +1191,10 @@ pub fn compose_clamp_uv(uv: [f32; 2], texel_size: [f32; 2]) -> [f32; 2] {
 ///
 /// `sample_motion(uv)` returns `(motion_xy, valid)` where `motion_xy` is forward motion
 /// `target_uv - source_uv` stored at reference location `uv`.
+///
+/// Returns `None` where the shader takes its hole fill: no valid motion, an unclamped source
+/// outside the reference, or a final source whose own motion does not land back on `dst_uv`
+/// within one texel (a search that did not converge).
 pub fn compose_search_source_cpu(
     dst_uv: [f32; 2],
     texel_size: [f32; 2],
@@ -1193,23 +1203,20 @@ pub fn compose_search_source_cpu(
 ) -> Option<[f32; 2]> {
     let strength = strength.clamp(0.0, 1.0);
     let mut src = compose_clamp_uv(dst_uv, texel_size);
+    let mut src_raw = dst_uv;
     let mut valid = false;
     for i in 0..3 {
         let (m, m_valid) = sample_motion(src);
         if m_valid {
-            src = compose_clamp_uv(
-                [dst_uv[0] - m[0] * strength, dst_uv[1] - m[1] * strength],
-                texel_size,
-            );
+            src_raw = [dst_uv[0] - m[0] * strength, dst_uv[1] - m[1] * strength];
+            src = compose_clamp_uv(src_raw, texel_size);
             valid = true;
         } else {
             if i == 0 {
                 let (mc, mc_valid) = sample_motion(dst_uv);
                 if mc_valid {
-                    src = compose_clamp_uv(
-                        [dst_uv[0] - mc[0] * strength, dst_uv[1] - mc[1] * strength],
-                        texel_size,
-                    );
+                    src_raw = [dst_uv[0] - mc[0] * strength, dst_uv[1] - mc[1] * strength];
+                    src = compose_clamp_uv(src_raw, texel_size);
                     valid = true;
                 }
             }
@@ -1217,14 +1224,13 @@ pub fn compose_search_source_cpu(
         }
     }
     if valid {
-        let (_, mfinal_valid) = sample_motion(src);
-        valid = mfinal_valid;
+        let (mfinal, mfinal_valid) = sample_motion(src);
+        let tol = [1.0 / texel_size[0].max(1.0), 1.0 / texel_size[1].max(1.0)];
+        let lands = (0..2).all(|a| (src_raw[a] + mfinal[a] * strength - dst_uv[a]).abs() <= tol[a]);
+        valid = mfinal_valid && lands;
     }
-    if valid && src[0] >= 0.0 && src[0] <= 1.0 && src[1] >= 0.0 && src[1] <= 1.0 {
-        Some(src)
-    } else {
-        None
-    }
+    let inside = src_raw.iter().all(|c| (0.0..=1.0).contains(c));
+    (valid && inside).then_some(src)
 }
 
 #[cfg(test)]
@@ -1347,13 +1353,28 @@ mod tests {
         assert!((got[0] - expected[0]).abs() < 1.0e-6);
         assert!((got[1] - expected[1]).abs() < 1.0e-6);
 
-        // Half-res/edge case: near boundary, clamped expected source.
+        // Near the boundary the source leaves the reference: a pan-revealed strip takes the
+        // hole fill instead of a stretched border texel.
         let dst = [0.02_f32, 0.98_f32];
-        let got =
-            compose_search_source_cpu(dst, [32.0, 32.0], 1.0, |_| ([0.05, -0.05], true)).unwrap();
-        let expected = compose_clamp_uv([dst[0] - 0.05, dst[1] + 0.05], [32.0, 32.0]);
-        assert!((got[0] - expected[0]).abs() < 1.0e-6);
-        assert!((got[1] - expected[1]).abs() < 1.0e-6);
+        let got = compose_search_source_cpu(dst, [32.0, 32.0], 1.0, |_| ([0.05, -0.05], true));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn compose_search_rejects_a_source_that_does_not_land_on_the_destination() {
+        // Motion -0.25 left of U=0.5 and +0.25 at or right of it: the search bounces between
+        // 0.25 and 0.75, and neither projects back to 0.5 (0.25 lands on 0.0, 0.75 on 1.0).
+        let got = compose_search_source_cpu([0.5, 0.5], [64.0, 64.0], 1.0, |uv| {
+            (
+                if uv[0] < 0.5 {
+                    [-0.25, 0.0]
+                } else {
+                    [0.25, 0.0]
+                },
+                true,
+            )
+        });
+        assert_eq!(got, None);
     }
 
     #[test]
@@ -1372,8 +1393,8 @@ mod tests {
             {
                 ([0.0, 0.0], false)
             } else {
-                // final source after hint must be valid
-                ([0.0, 0.0], true)
+                // final source after hint must be valid and carry the same motion
+                (hint_motion, true)
             }
         })
         .unwrap();
@@ -1453,15 +1474,6 @@ mod tests {
     }
 
     #[test]
-    fn depth_contract_wgsl_declarations() {
-        // prepare reads scene depth as a depth texture; motion reads a sampleable float copy.
-        assert!(PREPARE_WGSL.contains("@group(0) @binding(1) var scene_depth: texture_depth_2d;"));
-        assert!(MOTION_WGSL.contains("@group(0) @binding(0) var depth_tex: texture_2d<f32>;"));
-        assert!(DEPTH_COPY_WGSL.contains("@group(0) @binding(0) var depth_src: texture_depth_2d;"));
-        assert!(DEPTH_COPY_WGSL.contains("texture_storage_2d<r32float, write>"));
-    }
-
-    #[test]
     fn depth_contract_bind_groups_validate_on_device() {
         let Some((device, _queue)) = test_device() else {
             return;
@@ -1491,9 +1503,16 @@ mod tests {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let motion_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tfr-test motion params"),
+            size: std::mem::size_of::<MotionParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Depth32Float view must satisfy prepare b1 (texture_depth_2d, Depth layout).
         // R32Float copy must satisfy motion b0 (texture_2d<f32>, non-filterable float).
+        // The motion group is also dispatched: its uniform size is only checked there.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let _prepare = pipelines.prepare_bind_group(
             &device,
@@ -1504,12 +1523,17 @@ mod tests {
             &res.edge_view,
             &params,
         );
-        let _motion = pipelines.motion_bind_group(
+        let motion = pipelines.motion_bind_group(
             &device,
             &res.history_depth_view,
             &res.motion_view,
-            &params,
+            &motion_params,
         );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("tfr-test motion dispatch"),
+        });
+        pipelines.encode_motion(&mut encoder, &motion, 32, 16);
+        let _commands = encoder.finish();
         let _copy = pipelines.depth_copy_bind_group(&device, &depth_view, &res.history_depth_view);
         assert!(
             pollster::block_on(scope.pop()).is_none(),

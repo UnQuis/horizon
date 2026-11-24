@@ -80,6 +80,13 @@ pub fn write_dat(path: &Path, tag: &Tag) -> io::Result<()> {
     };
     let raw = nbt::write_named(&root, Limits::saved()).map_err(|e| invalid(e.to_string()))?;
     let bytes = Compression::Gzip.encode(&raw)?;
+    write_via_temporary(path, &bytes)
+}
+
+/// `bytes` written to `path` through a sibling renamed over it once whole,
+/// which is how the `.dat` and JSON files of a world are written; the sibling
+/// takes the file's own permissions, as writing in place kept them.
+fn write_via_temporary(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // A sibling written and synced, then renamed over the file: a stop or a
     // full disk leaves the old file whole, never an emptied one.
     // A linked file is written where the link points, as `fs::write` did.
@@ -102,12 +109,19 @@ pub fn write_dat(path: &Path, tag: &Tag) -> io::Result<()> {
     if fs::symlink_metadata(&temporary).is_ok_and(|meta| meta.file_type().is_file()) {
         fs::remove_file(&temporary)?;
     }
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // A renamed sibling is created with the default mode; keep the file's own
+    // (owner-only, say), as writing in place kept it.
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(path) {
+        let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    }
+    let written = options
         .open(&temporary)
         .and_then(|mut file| {
-            file.write_all(&bytes)?;
+            file.write_all(bytes)?;
             file.sync_all()
         })
         .and_then(|()| fs::rename(&temporary, path));
@@ -715,6 +729,93 @@ fn fix_world_files_deferred(
     Ok((loaded, Some(data)))
 }
 
+/// The saved data 26.3 keeps in the world's own `data/minecraft` (`MinecraftServer`'s
+/// `SavedDataStorage`): the generator settings, the game rules, the weather and the clocks.
+const SERVER_SAVED_DATA: [&str; 4] = [
+    "world_gen_settings.dat",
+    "game_rules.dat",
+    "weather.dat",
+    "world_clocks.dat",
+];
+
+/// Names the files an adoption is still copying, so a stop part way is finished by the next open.
+const ADOPTING_MARKER: &str = ".adopting";
+
+/// A world saved by Paper 26.x keeps [`SERVER_SAVED_DATA`] only under the Overworld's
+/// `dimensions/minecraft/overworld/data/minecraft`, where vanilla reads them from the root
+/// `data/minecraft`. When the root has none of the four, copy those the Overworld has
+/// to the root, so the seed, rules and clocks come with the world. The Overworld's files
+/// stay as they are; a root that already has one of them is left alone. A marker lists the
+/// files before the first copy, so an open after a stop part way copies the missing ones
+/// and leaves the others as they are. Returns the file names copied.
+pub fn adopt_dimension_saved_data(base: &Path) -> io::Result<Vec<&'static str>> {
+    let root = base.join("data/minecraft");
+    let overworld = base.join("dimensions/minecraft/overworld/data/minecraft");
+    let marker = root.join(ADOPTING_MARKER);
+    let pending: Vec<&'static str> = if marker.is_file() {
+        let listed = fs::read_to_string(&marker)?;
+        SERVER_SAVED_DATA
+            .into_iter()
+            .filter(|f| listed.lines().any(|l| l == *f))
+            .collect()
+    } else {
+        if SERVER_SAVED_DATA.iter().any(|f| root.join(f).is_file()) {
+            return Ok(Vec::new());
+        }
+        let wanted: Vec<&'static str> = SERVER_SAVED_DATA
+            .into_iter()
+            .filter(|f| overworld.join(f).is_file())
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        fs::create_dir_all(&root)?;
+        fs::write(&marker, wanted.join("\n"))?;
+        wanted
+    };
+    let resumed = marker_resumed(&root, &pending);
+    let mut copied = Vec::new();
+    for file in pending {
+        let from = overworld.join(file);
+        if root.join(file).is_file() || !from.is_file() {
+            continue;
+        }
+        if let Err(e) = adopt_one(&from, &root, file) {
+            // A fresh attempt is one operation: what it put in the root goes again, so a later
+            // open finds no root file and adopts all. A resumed one keeps its files and
+            // the marker, and the next open continues.
+            if !resumed {
+                for done in &copied {
+                    let _ = fs::remove_file(root.join(done));
+                }
+                let _ = fs::remove_file(&marker);
+            }
+            return Err(e);
+        }
+        copied.push(file);
+    }
+    let _ = fs::remove_file(&marker);
+    Ok(copied)
+}
+
+/// Whether the root already holds one of the files the marker lists, the sign of a resumed
+/// adoption.
+fn marker_resumed(root: &Path, pending: &[&str]) -> bool {
+    pending.iter().any(|f| root.join(f).is_file())
+}
+
+/// Copies one saved data file into the root through a temporary name, so a failed copy never
+/// leaves a partial file under the real one.
+fn adopt_one(from: &Path, root: &Path, file: &str) -> io::Result<()> {
+    fs::create_dir_all(root)?;
+    let partial = root.join(format!("{file}.adopting"));
+    let copied = fs::copy(from, &partial).and_then(|_| fs::rename(&partial, root.join(file)));
+    if copied.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    copied
+}
+
 /// The world's generator settings as 26.3 reads them once the file fixes have run, without
 /// running them: for a world older than 4772 they come out of level.dat the way
 /// `LevelDatToSavedDataFileFix` moves them (`world_gen_settings.dat` is not there yet), for any
@@ -953,8 +1054,14 @@ fn clear_staging(folder: &Path, staging: &Path, target: Option<i32>) -> io::Resu
         }
         let live = folder.join(path.file_name().unwrap_or_default());
         if may_install(folder, staging, chunk, &path, &live, target)? {
-            // Its data on the disk before it replaces anything.
-            File::open(&path)?.sync_all()?;
+            // Its data on the disk before it replaces anything. Windows'
+            // `FlushFileBuffers` refuses a read-only handle (Access is
+            // denied); POSIX `fsync` takes one.
+            File::options()
+                .read(true)
+                .write(cfg!(windows))
+                .open(&path)?
+                .sync_all()?;
             fs::rename(&path, &live)?;
         } else {
             set_aside(folder, &path)?;
@@ -1257,7 +1364,9 @@ fn upgrade_json_to(path: &Path, ty: Ty, to: i32) -> io::Result<()> {
     update(ty, &mut tag, from, to);
     set(&mut tag, "DataVersion", Tag::Int(to));
     let out = json::to_stable_string(&tag_to_json(&tag));
-    fs::write(path, String::from_utf16_lossy(&out))
+    // In place, a truncated file would not parse, the upgrade would fail before
+    // level.dat is stamped and the world would not open, at every open (#18771).
+    write_via_temporary(path, String::from_utf16_lossy(&out).as_bytes())
 }
 
 /// Everything vanilla upgrades as it reads a world, done at once: every chunk,
@@ -2088,6 +2197,63 @@ mod upgrade_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A stats file's write that fails leaves the previous JSON whole and
+    /// readable, so the next open can upgrade it: here its temporary file
+    /// cannot be created (#18771). The file is already at the target, so what
+    /// the test exercises is the write, not the fixes (those need the prepared
+    /// tables).
+    #[test]
+    fn a_failed_stats_write_keeps_the_old_file() {
+        let dir = std::env::temp_dir().join(format!("horizon-json-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("player.json");
+        let old = format!(
+            r#"{{"DataVersion":{CURRENT},"stats":{{"minecraft:custom":{{"minecraft:jump":3}}}}}}"#
+        );
+        let units: Vec<u16> = old.encode_utf16().collect();
+        assert!(json::parse_lenient(&units).is_some(), "the old file parses");
+        fs::write(&file, old.as_bytes()).unwrap();
+        let blocked = dir.join("player.json.horizon-new");
+        fs::create_dir(&blocked).unwrap();
+
+        assert!(upgrade_json(&file, Ty::Stats).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), old);
+
+        // Freed, the same write goes through and brings the file to the
+        // target: the first error was the write, not the data.
+        fs::remove_dir(&blocked).unwrap();
+        upgrade_json(&file, Ty::Stats).unwrap();
+        let after = fs::read_to_string(&file).unwrap();
+        let units: Vec<u16> = after.encode_utf16().collect();
+        let parsed = json::parse_lenient(&units).expect("the upgraded file parses");
+        assert_eq!(
+            parsed.get("DataVersion"),
+            Some(&Json::Num(CURRENT.to_string()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The sibling takes the file's own permissions, so a rewritten stats file
+    /// stays owner-only instead of becoming world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn a_stats_write_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("horizon-json-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("player.json");
+        let old = format!(r#"{{"DataVersion":{CURRENT}}}"#);
+        fs::write(&file, old.as_bytes()).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        upgrade_json(&file, Ty::Stats).unwrap();
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A temporary left by a stopped `.dat` write is replaced.
     #[test]
     fn a_stale_dat_temporary_is_replaced() {
@@ -2148,6 +2314,39 @@ mod upgrade_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A linked stats file is written where the link points, as before: the
+    /// link stays a link and no temporary is left beside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_stats_file_is_written_through() {
+        let dir = std::env::temp_dir().join(format!("horizon-json-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("real")).unwrap();
+        let real = dir.join("real/player.json");
+        let before = format!("{{ \"DataVersion\": {CURRENT} }}");
+        fs::write(&real, before.as_bytes()).unwrap();
+        let link = dir.join("player.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        upgrade_json(&link, Ty::Stats).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let after = fs::read_to_string(&real).unwrap();
+        assert_ne!(after, before);
+        let units: Vec<u16> = after.encode_utf16().collect();
+        let parsed = json::parse_lenient(&units).expect("the upgraded file parses");
+        assert_eq!(
+            parsed.get("DataVersion"),
+            Some(&Json::Num(CURRENT.to_string()))
+        );
+        assert!(!dir.join("player.json.horizon-new").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The upgrader reads chunks and `.dat` files as the game loads them: past
     /// the default node cap, within the saved-data limits.
     #[test]
@@ -2173,5 +2372,164 @@ mod upgrade_tests {
         assert!(whole(&read_dat(&file).unwrap().unwrap()));
         assert!(whole(&read_saved_dat(&file).unwrap().unwrap()));
         let _ = fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod paper_layout_tests {
+    use super::*;
+
+    const OVERWORLD: &str = "dimensions/minecraft/overworld/data/minecraft";
+
+    fn world(name: &str) -> PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("horizon-paper-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        base
+    }
+
+    fn settings(seed: i64) -> Tag {
+        Tag::compound([("seed", Tag::Long(seed))])
+    }
+
+    /// Paper's layout: the four files only under the Overworld, plus the root files Paper
+    /// leaves in `data/minecraft`. The seed and rules come to the root, byte for byte.
+    #[test]
+    fn paper_layout_is_adopted_from_the_overworld() {
+        let base = world("adopt");
+        for f in SERVER_SAVED_DATA {
+            write_saved_data(
+                &base.join(OVERWORLD).join(f),
+                settings(-4172144997902289642),
+                4899,
+            )
+            .unwrap();
+        }
+        write_saved_data(
+            &base.join("data/minecraft/scoreboard.dat"),
+            Tag::Compound(Compound::new()),
+            4899,
+        )
+        .unwrap();
+        let copied = adopt_dimension_saved_data(&base).unwrap();
+        assert_eq!(copied, SERVER_SAVED_DATA.to_vec());
+        for f in SERVER_SAVED_DATA {
+            assert_eq!(
+                fs::read(base.join("data/minecraft").join(f)).unwrap(),
+                fs::read(base.join(OVERWORLD).join(f)).unwrap(),
+                "{f}"
+            );
+        }
+        let seed = read_saved_dat(&base.join("data/minecraft/world_gen_settings.dat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            seed.get("data").and_then(|d| d.get("seed")),
+            Some(&Tag::Long(-4172144997902289642))
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A copy that fails halfway takes back what that attempt wrote: the next open adopts all
+    /// four, instead of stopping at the one root file the failed attempt left.
+    #[test]
+    fn a_failed_adoption_is_taken_back_and_retried_whole() {
+        let base = world("retry");
+        for f in SERVER_SAVED_DATA {
+            write_saved_data(&base.join(OVERWORLD).join(f), settings(7), 4899).unwrap();
+        }
+        // The second file's temporary name is taken by a folder: its copy fails.
+        let blocked = base
+            .join("data/minecraft")
+            .join(format!("{}.adopting", SERVER_SAVED_DATA[1]));
+        fs::create_dir_all(blocked.join("x")).unwrap();
+        assert!(adopt_dimension_saved_data(&base).is_err());
+        for f in SERVER_SAVED_DATA {
+            assert!(!base.join("data/minecraft").join(f).exists(), "{f}");
+        }
+        fs::remove_dir_all(&blocked).unwrap();
+        let copied = adopt_dimension_saved_data(&base).unwrap();
+        assert_eq!(copied, SERVER_SAVED_DATA.to_vec());
+        for f in SERVER_SAVED_DATA {
+            assert_eq!(
+                fs::read(base.join("data/minecraft").join(f)).unwrap(),
+                fs::read(base.join(OVERWORLD).join(f)).unwrap(),
+                "{f}"
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A stop after the first file leaves the marker: the next open copies the other three and
+    /// keeps the file already there, then drops the marker.
+    #[test]
+    fn a_stopped_adoption_is_resumed() {
+        let base = world("resume");
+        for f in SERVER_SAVED_DATA {
+            write_saved_data(&base.join(OVERWORLD).join(f), settings(7), 4899).unwrap();
+        }
+        let root = base.join("data/minecraft");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(ADOPTING_MARKER), SERVER_SAVED_DATA.join("\n")).unwrap();
+        fs::copy(
+            base.join(OVERWORLD).join(SERVER_SAVED_DATA[0]),
+            root.join(SERVER_SAVED_DATA[0]),
+        )
+        .unwrap();
+        let copied = adopt_dimension_saved_data(&base).unwrap();
+        assert_eq!(copied, SERVER_SAVED_DATA[1..].to_vec());
+        for f in SERVER_SAVED_DATA {
+            assert!(root.join(f).is_file(), "{f}");
+        }
+        assert!(!root.join(ADOPTING_MARKER).exists());
+        assert!(adopt_dimension_saved_data(&base).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A root that has any of the four is the world's own: nothing is overwritten, and a
+    /// second call after an adoption copies nothing.
+    #[test]
+    fn root_files_are_never_replaced() {
+        let base = world("keep");
+        write_saved_data(
+            &base.join(OVERWORLD).join("game_rules.dat"),
+            settings(1),
+            4899,
+        )
+        .unwrap();
+        write_saved_data(&base.join(OVERWORLD).join("weather.dat"), settings(1), 4899).unwrap();
+        write_saved_data(
+            &base.join("data/minecraft/game_rules.dat"),
+            settings(2),
+            4899,
+        )
+        .unwrap();
+        assert!(adopt_dimension_saved_data(&base).unwrap().is_empty());
+        assert!(!base.join("data/minecraft/weather.dat").exists());
+        let kept = read_saved_dat(&base.join("data/minecraft/game_rules.dat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.get("data").and_then(|d| d.get("seed")),
+            Some(&Tag::Long(2))
+        );
+
+        let fresh = world("twice");
+        write_saved_data(
+            &fresh.join(OVERWORLD).join("weather.dat"),
+            settings(3),
+            4899,
+        )
+        .unwrap();
+        assert_eq!(adopt_dimension_saved_data(&fresh).unwrap(), ["weather.dat"]);
+        assert!(adopt_dimension_saved_data(&fresh).unwrap().is_empty());
+        // A world with no per-dimension files is untouched, no empty folders appear.
+        let plain = world("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(adopt_dimension_saved_data(&plain).unwrap().is_empty());
+        assert!(!plain.join("data").exists());
+        for b in [base, fresh, plain] {
+            let _ = fs::remove_dir_all(&b);
+        }
     }
 }

@@ -60,12 +60,6 @@ pub(super) struct Replay {
     /// `connections` when the replay playing took up its session: a replay whose session has
     /// gone since is no longer playing on the one there now.
     pub(super) connection: u64,
-    /// The archive a mod's replay was opened from (`replay_open`): the editor saves its markers
-    /// and camera path only into that very file, never into one put in its place since.
-    pub(super) archive: Option<super::native_replay::FileIdentity>,
-    /// The archive file the replay playing read (any route), refreshed from the file each
-    /// editor save writes: what a mod's reopen of it is compared with, without opening it.
-    pub(super) identity: Option<super::native_replay::FileIdentity>,
     /// A seek was applied: the next frame reports its position (`replay_advanced`) and holds the
     /// clock there, so the frame drawn shows exactly where the seek went.
     pub(super) seek_report: bool,
@@ -74,6 +68,28 @@ pub(super) struct Replay {
 }
 
 impl Replay {
+    pub(super) fn export_driver(&self) -> Option<&ReplayDriver> {
+        self.driver.as_ref()?.as_any().downcast_ref()
+    }
+
+    pub(super) fn edit_driver(&mut self) -> Option<&mut ReplayDriver> {
+        self.driver.as_mut()?.as_any_mut().downcast_mut()
+    }
+
+    pub(super) fn take_replaced_recording(
+        &mut self,
+        export: Option<&mut super::export::Session>,
+        renderer: Option<&mut super::Renderer>,
+    ) -> Option<String> {
+        self.driver.as_ref()?;
+        if let Some(export) = export {
+            export.interrupt_for_replay_close(renderer);
+        }
+        self.driver = None;
+        self.reported_ms = None;
+        Some(std::mem::take(&mut self.recording))
+    }
+
     fn recording_error(
         &mut self,
         status: Option<&horizon_client::net::RecorderStatus>,
@@ -110,8 +126,10 @@ impl Game<'_> {
     /// How far the window's own player model is between two ticks: on the replay's clock while a
     /// replay plays, else the game's.
     pub(super) fn own_player_alpha(&self) -> f64 {
-        self.replay
-            .player_alpha()
+        self.export
+            .as_ref()
+            .and_then(super::export::Session::replay_alpha)
+            .or_else(|| self.replay.player_alpha())
             .unwrap_or_else(|| self.clock.camera_fraction())
     }
 
@@ -450,6 +468,9 @@ impl Game<'_> {
     /// the caller to report.
     fn fail_studio_replay(&mut self, error: std::io::Error) -> std::io::Error {
         log::error!("Studio replay read failed, closing the replay: {error}");
+        if self.export.is_some() {
+            self.abort_export(Some(error.to_string()));
+        }
         self.close_studio_replay();
         error
     }
@@ -458,6 +479,14 @@ impl Game<'_> {
     /// `init_remote_for_replay` makes anew), back as a fresh open has it, so the world rebuilt
     /// from the start shows only what the packets replayed set.
     fn reset_replay_world_extras(&mut self) {
+        // A new LocalPlayer holds nothing (vanilla's handleLogin): the snapshot sends only the
+        // slots that were full, so an item the replaced session held must not stay in an empty
+        // slot.
+        self.inventory = vec![None; 36];
+        self.offhand = None;
+        self.armor = [None, None, None, None];
+        // The snapshot says weather only when there is a storm, and a Login keeps the world's.
+        self.world.weather = Default::default();
         self.border = Default::default();
         self.tab_list = Default::default();
         self.score.board = Default::default();
@@ -487,6 +516,10 @@ impl Game<'_> {
                 break;
             }
             match horizon_protocol::packets::play::Clientbound::decode(pkt.id, &pkt.payload) {
+                // The recorded player's tab entry is for a replay that owns its session; in a live
+                // one it would list them a second time.
+                Ok(horizon_protocol::packets::play::Clientbound::PlayerInfoUpdate(_))
+                    if !self.replay.standalone => {}
                 Ok(packet) => {
                     let _ = self.handle_packet(packet);
                 }
@@ -563,9 +596,6 @@ impl Game<'_> {
             .driver
             .as_ref()
             .is_some_and(|replay| replay.is_paused());
-        if self.player_model.is_none() {
-            self.tick_player_model();
-        }
         if !paused {
             let speed = self
                 .replay
@@ -576,58 +606,95 @@ impl Game<'_> {
             self.replay.virtual_tick_ms += delta.as_secs_f32() * 1000.0 * speed;
             while self.replay.virtual_tick_ms >= 50.0 {
                 self.replay.virtual_tick_ms -= 50.0;
-                if let Some(player) = &self.player {
-                    let current_pos = player.position;
-                    let (dx, dz) = (
-                        current_pos.x - self.previous_position.x,
-                        current_pos.z - self.previous_position.z,
-                    );
-                    let walked = (dx * dx + dz * dz).sqrt() as f32;
-                    if let Some(m) = self.player_model.as_mut() {
-                        m.previous = self.previous_position;
-                        m.position = current_pos;
-                        m.previous_limb_speed = m.limb_speed;
-                        let target_speed = (walked * 4.0).min(1.0);
-                        m.limb_speed += (target_speed - m.limb_speed) * 0.4;
-                        if m.limb_speed < 0.001 {
-                            m.limb_speed = 0.0;
-                        }
-                        m.limb_position += m.limb_speed;
-                        m.previous_yaw = m.yaw;
-                        m.previous_head_yaw = m.head_yaw;
-                        m.previous_head_pitch = m.head_pitch;
-                        m.previous_body_yaw = m.body_yaw;
-                        m.yaw = self.yaw;
-                        m.head_yaw = self.yaw;
-                        m.head_pitch = self.pitch;
-                        let mut target = m.body_yaw;
-                        if dx * dx + dz * dz > 0.0025 {
-                            let walk = (dz.atan2(dx) as f32).to_degrees() - 90.0;
-                            let facing =
-                                ((self.yaw - walk + 180.0).rem_euclid(360.0) - 180.0).abs();
-                            target = if 95.0 < facing && facing < 265.0 {
-                                walk - 180.0
-                            } else {
-                                walk
-                            };
-                        }
-                        let diff = (target - m.body_yaw + 180.0).rem_euclid(360.0) - 180.0;
-                        m.body_yaw += diff * 0.3;
-                        let body_diff = (self.yaw - m.body_yaw + 180.0).rem_euclid(360.0) - 180.0;
-                        if body_diff.abs() > 50.0 {
-                            m.body_yaw += body_diff - body_diff.signum() * 50.0;
-                        }
-                        m.age = m.age.wrapping_add(1);
-                    }
-                    self.previous_position = current_pos;
-                }
+                self.tick_replay_player_model();
             }
         } else if let Some(m) = self.player_model.as_mut() {
             m.previous_limb_speed = m.limb_speed;
         }
+        // A replay can draw before its first 20 Hz model tick is due.
+        if self.player_model.is_none() {
+            self.tick_player_model();
+        }
         self.studio_replay_advanced();
         self.announce_replay_advance();
         Ok(())
+    }
+
+    /// Deliver a batch without consulting wall time, pause or looping.
+    pub(super) fn export_replay_to(&mut self, cursor_ms: f64) -> Result<()> {
+        let driver = self
+            .replay
+            .driver
+            .as_mut()
+            .and_then(|driver| driver.as_any_mut().downcast_mut::<ReplayDriver>())
+            .ok_or("the replay closed")?;
+        let packets = match driver.advance_to(cursor_ms) {
+            Ok(packets) => packets,
+            Err(error) => return Err(self.fail_studio_replay(error).into()),
+        };
+        self.dispatch_studio_replay_packets(packets);
+        Ok(())
+    }
+
+    pub(super) fn tick_replay_player_model(&mut self) {
+        if self.player_model.is_none() {
+            // Initialization already updates the pose, walk animation and age.
+            self.tick_player_model();
+            if let Some(player) = &self.player {
+                self.previous_position = player.position;
+            }
+            return;
+        }
+        if let Some(player) = &self.player {
+            let current_pos = player.position;
+            let (dx, dz) = (
+                current_pos.x - self.previous_position.x,
+                current_pos.z - self.previous_position.z,
+            );
+            let walked = (dx * dx + dz * dz).sqrt() as f32;
+            if let Some(m) = self.player_model.as_mut() {
+                m.previous = self.previous_position;
+                m.position = current_pos;
+                m.previous_limb_speed = m.limb_speed;
+                let target_speed = (walked * 4.0).min(1.0);
+                m.limb_speed += (target_speed - m.limb_speed) * 0.4;
+                if m.limb_speed < 0.001 {
+                    m.limb_speed = 0.0;
+                }
+                m.limb_position += m.limb_speed;
+                m.previous_yaw = m.yaw;
+                m.previous_head_yaw = m.head_yaw;
+                m.previous_head_pitch = m.head_pitch;
+                m.previous_body_yaw = m.body_yaw;
+                m.yaw = self.yaw;
+                m.head_yaw = self.yaw;
+                m.head_pitch = self.pitch;
+                let mut target = m.body_yaw;
+                if dx * dx + dz * dz > 0.0025 {
+                    let walk = (dz.atan2(dx) as f32).to_degrees() - 90.0;
+                    let facing = ((self.yaw - walk + 180.0).rem_euclid(360.0) - 180.0).abs();
+                    target = if 95.0 < facing && facing < 265.0 {
+                        walk - 180.0
+                    } else {
+                        walk
+                    };
+                }
+                let diff = (target - m.body_yaw + 180.0).rem_euclid(360.0) - 180.0;
+                m.body_yaw += diff * 0.3;
+                let body_diff = (self.yaw - m.body_yaw + 180.0).rem_euclid(360.0) - 180.0;
+                if body_diff.abs() > 50.0 {
+                    m.body_yaw += body_diff - body_diff.signum() * 50.0;
+                }
+                m.age = m.age.wrapping_add(1);
+            }
+            self.previous_position = current_pos;
+        }
+    }
+
+    pub(super) fn report_export_replay(&mut self, partial: f32) {
+        self.replay.virtual_tick_ms = partial * 50.0;
+        self.studio_replay_advanced();
+        self.announce_replay_advance();
     }
 
     /// Control socket command handler for `studio`.
@@ -756,6 +823,8 @@ impl Game<'_> {
         match horizon_client::studio::StudioRecorder::start(path.clone(), meta) {
             Ok(recorder) => {
                 self.replay.recording_error_reported = false;
+                // Their own tab entry (the skin) stays in the recording; everyone else's stays out.
+                let recorder = recorder.with_own_player(r.profile);
                 r.session.start_recording(recorder, |recorder| {
                     self.dump_world_snapshot_to_recorder(recorder);
                 });
@@ -829,12 +898,7 @@ impl Game<'_> {
 
         // Validate and index the archive before replacing the title menu or active world. A
         // temp-file, metadata, or protocol error must leave the current screen usable.
-        // The archive is read through one handle, which also says which file it is.
-        let opened = std::fs::File::open(path).and_then(|file| {
-            let identity = super::native_replay::FileIdentity::of(&file).ok();
-            Ok((ReplayDriver::from_file(file, Path::new(path))?, identity))
-        });
-        let (driver, identity) = match opened {
+        let driver = match ReplayDriver::open(Path::new(path)) {
             Ok(opened) => opened,
             Err(error) => {
                 log::error!("Failed to open studio replay '{path}': {error}");
@@ -846,7 +910,6 @@ impl Game<'_> {
             recording: self.recording_id(path),
             request: 0,
             archive: None,
-            identity,
             replacing: None,
         };
         self.start_studio_replay(driver, origin, path)
@@ -862,11 +925,7 @@ impl Game<'_> {
         path: &str,
     ) -> Result<Value> {
         let super::native_replay::ReplayOrigin {
-            recording,
-            request,
-            archive,
-            identity,
-            ..
+            recording, request, ..
         } = origin;
         let mut driver = driver;
         // The first frame is set up from the opening snapshot before mods hear `replay_opened`,
@@ -892,24 +951,22 @@ impl Game<'_> {
 
         let duration_ms = driver.duration_ms();
         let packets = driver.packet_count();
-        self.studio_replay_opened(&driver);
-        if self.replay.driver.is_none() {
-            self.replay.previous_camera_type = Some(self.camera_type);
-            self.replay.standalone = standalone;
-        } else {
+        if let Some(previous) = self
+            .replay
+            .take_replaced_recording(self.export.as_mut(), self.renderer.as_mut())
+        {
             // A replay opened over another: mods hear the old one close before the new one opens.
-            self.replay.driver = None;
-            self.replay.reported_ms = None;
             // The kept synthetic session isn't made anew, so what the old recording set outside
             // it goes here.
             self.ui.chat.clear();
             self.reset_replay_world_extras();
-            let previous = std::mem::take(&mut self.replay.recording);
             self.native_replay_closed(&previous);
+        } else {
+            self.replay.previous_camera_type = Some(self.camera_type);
+            self.replay.standalone = standalone;
         }
+        self.studio_replay_opened(&mut driver);
         self.replay.recording = recording.clone();
-        self.replay.archive = archive;
-        self.replay.identity = identity;
         self.replay.generation += 1;
         self.replay.reported_ms = None;
         self.replay.seek_report = false;
@@ -983,6 +1040,9 @@ impl Game<'_> {
     /// The replay itself ends: its edits saved, its driver dropped, mods told `replay_closed`.
     /// The session it played on is left as it is. False when no replay was installed.
     pub(super) fn end_studio_replay(&mut self) -> bool {
+        if let Some(export) = &mut self.export {
+            export.interrupt_for_replay_close(self.renderer.as_mut());
+        }
         self.studio_replay_closing();
         if self.replay.driver.take().is_none() {
             return false;
@@ -1000,8 +1060,6 @@ impl Game<'_> {
         self.replay.seek_report = false;
         // A part step of the wheel in the replay doesn't carry into the next session.
         self.mouse.scroll = Default::default();
-        self.replay.archive = None;
-        self.replay.identity = None;
         let recording = std::mem::take(&mut self.replay.recording);
         if heard {
             self.native_replay_closed(&recording);
@@ -1015,6 +1073,52 @@ impl Game<'_> {
     pub(super) fn drop_stale_replay(&mut self) {
         if self.replay.driver.is_some() && self.replay.connection != self.replay.connections {
             self.end_studio_replay();
+        }
+    }
+
+    /// What the client holds of the session outside the world's chunks, for the recording's
+    /// snapshot ([`horizon_client::studio::snapshot`]).
+    fn session_snapshot_state(
+        &self,
+        r: &super::remote::Remote,
+    ) -> horizon_client::studio::snapshot::SessionState {
+        use horizon_client::studio::snapshot::SessionState;
+        let held = |slot: i32, stack: &Option<horizon_client::items::ItemStack>| {
+            self.to_network(stack).map(|stack| (slot, stack))
+        };
+        let inventory = self
+            .inventory
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, stack)| held(slot as i32, stack))
+            // Inventory slots 36 to 39 are feet to head; `armor` is head first.
+            .chain(
+                self.armor
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, stack)| held(39 - i as i32, stack)),
+            )
+            .chain(held(40, &self.offhand))
+            .collect();
+        SessionState {
+            game_time: self.world.game_time,
+            // Every clock the connection holds (`ClientClockManager`), each as the tick loop has
+            // advanced it; by id, so a snapshot of the same state is the same bytes.
+            clocks: {
+                let mut clocks: Vec<_> = r.clocks.values().cloned().collect();
+                clocks.sort_by_key(|clock| clock.clock);
+                clocks
+            },
+            rain_level: self.world.weather.rain_level.1,
+            thunder_level: self.world.weather.thunder_level.1,
+            health: r.health,
+            experience: (
+                self.experience.progress,
+                self.experience.level,
+                self.experience.total,
+            ),
+            selected_slot: self.selected,
+            inventory,
         }
     }
 
@@ -1099,6 +1203,16 @@ impl Game<'_> {
         );
         record_cb(player_pos);
 
+        // 2b. The time, weather, inventory and vitals the server sent long before this recording.
+        for packet in horizon_client::studio::snapshot::packets(&self.session_snapshot_state(r)) {
+            record_cb(packet);
+        }
+
+        // 2c. The recording player's own tab entry, so the replay shows their skin.
+        if let Some(entry) = self.remote.as_ref().and_then(|r| r.recorder_tab_entry()) {
+            record_cb(entry);
+        }
+
         // 3. Encode resident loaded chunks into LevelChunkWithLight packets
         let biome_names: Vec<String> = world_biomes!(self)
             .list
@@ -1139,10 +1253,62 @@ impl Game<'_> {
     }
 }
 
+/// Default registries for a standalone studio replay, populated from resource clocks
+/// so `SetTime` packets find the dimension's clock and set `world.day_time`.
+pub(super) fn replay_dynamic_registries(
+    clocks: &[String],
+    builtin: &horizon_protocol::registry::Builtin,
+) -> horizon_protocol::registry::Dynamic {
+    let mut dynamic = horizon_protocol::registry::Dynamic::default();
+    let clock_names: Vec<String> = if !clocks.is_empty() {
+        clocks.to_vec()
+    } else if let Some(builtin_clocks) = builtin.get("minecraft:world_clock") {
+        builtin_clocks.names.clone()
+    } else {
+        vec!["minecraft:overworld".into()]
+    };
+    dynamic.registries.insert(
+        "minecraft:world_clock".into(),
+        clock_names.into_iter().map(|n| (n, None)).collect(),
+    );
+    dynamic
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use horizon_client::net::RecorderStatus;
+
+    /// Vanilla's `world_clock` registry has `minecraft:overworld` and `minecraft:the_end`; a
+    /// recorded `SetTime` names a clock by its id there, and `Remote::resolve_clocks` finds the
+    /// dimension's clock by name.
+    #[test]
+    fn a_replay_without_registry_data_still_names_the_world_clocks() {
+        let builtin = horizon_protocol::registry::Builtin::default();
+        let none = replay_dynamic_registries(&[], &builtin);
+        assert_eq!(
+            none.id("minecraft:world_clock", "minecraft:overworld"),
+            Some(0)
+        );
+        let listed = [
+            "minecraft:overworld".to_owned(),
+            "minecraft:the_end".to_owned(),
+        ];
+        let dynamic = replay_dynamic_registries(&listed, &builtin);
+        assert_eq!(
+            dynamic.id("minecraft:world_clock", "minecraft:overworld"),
+            Some(0)
+        );
+        assert_eq!(
+            dynamic.id("minecraft:world_clock", "minecraft:the_end"),
+            Some(1)
+        );
+        assert_eq!(
+            dynamic.name("minecraft:world_clock", 1),
+            Some("minecraft:the_end")
+        );
+        assert_eq!(dynamic.name("minecraft:world_clock", 2), None);
+    }
 
     #[test]
     fn recording_failure_is_notified_once_and_rearms_for_a_new_session() {

@@ -979,34 +979,30 @@ fn a_material_can_read_hdr_light_sources_and_ray_hit_looks_together() {
     assert!(!report.looks());
 }
 
-/// Ordinary `[[post]]` entries sharing a file are built from the first entry's, `files` and all,
-/// as before compute passes: only compute entries are built per entry.
+/// Ordinary `[[post]]` entries sharing a file are each built with their own `files` ("before
+/// this stage's file", docs/api/shaders.md), in a pack without compute passes too (#16234).
 #[test]
-fn ordinary_post_entries_sharing_a_file_build_as_the_first() {
+fn ordinary_post_entries_sharing_a_file_build_each_with_its_own_files() {
     let manifest = "schema = 1\nid = \"p\"\nname = \"P\"\nversion = \"1\"\napi = \"0.2\"\n\
                     [[post]]\nfile = \"post.wgsl\"\nfiles = [\"first.wgsl\"]\n\
                     [[post]]\nfile = \"post.wgsl\"\nfiles = [\"second.wgsl\"]\n";
     let post = "fn post(input: PostInput) -> vec4<f32> { return input.color * tint(); }\n";
+    let first = "fn tint() -> vec4<f32> { return vec4<f32>(1.0); }\n";
+    let second = "fn tint() -> vec4<f32> { return vec4<f32>(0.5); }\n";
     let files = [
         (MANIFEST, manifest),
         ("post.wgsl", post),
-        (
-            "first.wgsl",
-            "fn tint() -> vec4<f32> { return vec4<f32>(1.0); }\n",
-        ),
-        ("second.wgsl", "fn shade() -> f32 { return 0.5; }\n"),
+        ("first.wgsl", first),
+        ("second.wgsl", second),
     ]
     .map(|(n, t)| (n.to_owned(), t.as_bytes().to_vec()))
     .into();
-    let pack = Pack::from_files(files).unwrap();
-    // The second entry's `files` would leave `tint` undefined.
-    let report = check(&pack).unwrap();
+    let report = check(&Pack::from_files(files).unwrap()).unwrap();
     let [a, b] = &report.stages[..] else {
         panic!("two stages")
     };
-    assert_eq!(format!("{:?}", a.module), format!("{:?}", b.module));
-    let composed = horizon_shader_api::compose(&pack, StageKind::Post, "post.wgsl").text;
-    assert!(composed.contains("fn tint") && !composed.contains("fn shade"));
+    assert!(a.source.contains(first) && !a.source.contains(second));
+    assert!(b.source.contains(second) && !b.source.contains(first));
 }
 
 #[test]
@@ -1377,8 +1373,8 @@ fn a_traced_pack_that_doesn_t_name_ray_entity_composes_as_before() {
     assert_eq!(
         hashes,
         [
-            "1af2ec758e6f343986c676a7df695a1bf820ac9f498840422bbb8ef72df65cc4",
-            "89fcc776fe9b408a89e71fcc10716a5d2744d79e6c1581889de27752c25e4e6a",
+            "799b33836c979da0988245348c9d7ed9bb42b16f499794e7dcfc711b9fadc7cd",
+            "dccdd1f28f0ea7624e8a4c006f80196bf2311c61dc116e29ae33878c97ac0a06",
             "e646501b8bcd9097579a8bcb14e11710439d85617dfc61b044bde4e0490c8681",
             "6c25d87e7bd62b1d8ba9fccc35d6ef6426a845e344e3bf45c197afdf1bdb7db2",
         ]
@@ -1421,8 +1417,8 @@ fn a_traced_pack_that_reads_no_hit_look_composes_as_before() {
     assert_eq!(
         hashes,
         [
-            "63fdd95b1f17608e158dbd7106ec22583c6cf5337f542bf31d6028d436d6e833",
-            "867893c5981df7efb562ecb414a836bed778dbf8323f0e76c2b675f6188227e5",
+            "4f8521322a8e7da2f5eef9345eafa5e0a03329d460e7ccfdb5dc7c30de5e0342",
+            "cf83d4f5161d6cff5cce8e868f0e683533f088620d14a442b154b098c7f77682",
             "dd8aade96c75cdd11a2866b8ab9164c7a7d36355d317dc527de0b1eba4f4880c",
             "1e944762ceee869009feb9a014806d08aa635aa706fb2683cdf1b28e4b325880",
         ]

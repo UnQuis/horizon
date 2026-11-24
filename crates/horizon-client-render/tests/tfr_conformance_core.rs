@@ -94,7 +94,12 @@ fn ready_ctx(cam: CameraSample) -> FrameContext {
     c
 }
 
-fn real_meta(world_key: WorldKey, cam: CameraSample, mode: HistorySourceMode) -> RealFrameMeta {
+fn real_meta(
+    state: &TfrState,
+    world_key: WorldKey,
+    cam: CameraSample,
+    mode: HistorySourceMode,
+) -> RealFrameMeta {
     RealFrameMeta {
         world: world_key,
         scene_size: FrameSize {
@@ -108,11 +113,13 @@ fn real_meta(world_key: WorldKey, cam: CameraSample, mode: HistorySourceMode) ->
         camera: cam,
         history_source_mode: mode,
         prepared_history_ready: true,
+        config_epoch: state.config_epoch(),
     }
 }
 
 fn commit_successful_real(state: &mut TfrState, w: WorldKey, cam: CameraSample) {
-    state.commit_real(real_meta(w, cam, HistorySourceMode::DirectScene));
+    let meta = real_meta(state, w, cam, HistorySourceMode::DirectScene);
+    state.commit_real(meta);
 }
 
 fn assert_real(decision: Decision) -> RealReason {
@@ -136,7 +143,7 @@ fn assert_synthetic(decision: Decision) {
 // C-01: enabled default off
 #[test]
 fn config_defaults_match_spec() {
-    let c = default_config();
+    let c = TfrConfig::default();
     assert!(!c.enabled);
     assert!((c.reprojection_strength - 1.0).abs() <= f32::EPSILON);
     assert!((c.history_stability - 0.06).abs() <= 1e-6);
@@ -435,6 +442,7 @@ fn prepared_required_without_ready_forbids_synthetic() {
     state.on_config_changed(cfg);
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     state.commit_real(real_meta(
+        &state,
         world(1),
         cam,
         HistorySourceMode::PreparedRequired,
@@ -456,6 +464,7 @@ fn prepared_missing_is_transient_when_history_still_valid() {
     state.on_config_changed(cfg);
     let cam = camera([0.0, 64.0, 0.0], 0.0, 0.0);
     state.commit_real(real_meta(
+        &state,
         world(1),
         cam,
         HistorySourceMode::PreparedRequired,

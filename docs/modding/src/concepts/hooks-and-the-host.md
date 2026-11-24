@@ -133,7 +133,10 @@ A few hooks do not run on the thread that ticks the world, and their docs say so
 `register_block_tint_sources`) on its worker threads. The worldgen Part methods (`alter_ground`, `rotate`,
 `on_tree_grow`) run on the worldgen worker threads as well as the server thread, and `block_entity_update_tag` runs on
 another thread for a saved chunk sent past the view distance. These get no `Host` that writes, or none at all, so
-keep no mutable state in them that another thread could reach.
+keep no mutable state in them that another thread could reach. The worldgen Part methods' `WorldgenHost` reads the
+server's registries, mod settings, `state_with_property` and `block_in_tag` (`BlockState.is(TagKey)` over the merged
+block tags of its last resource load, the ones `LevelHost::block_in_tag` reads), so a plant's `may_place_on_v2` can
+pick its ground by tag as vanilla's plants do.
 
 `Hooks` contains global hooks. Scoped hooks belong to `BlockPart`, `BlockEntityPart`,
 `ItemPart`, `MenuPart` or `FluidPart` and run for the registered object.
@@ -143,7 +146,11 @@ keep no mutable state in them that another thread could reach.
 Level hooks use access-specific hosts rather than `Host`. `LevelHost` provides
 `block_state` through `LevelAccess::block_state`, client-side detection and
 `state_with_property`. `state_string(state)` serializes the full name and properties, or returns `None`
-for an unknown state; `min_y()` and `height()` read the level's build range. It also reads light and loaded state, through the game's own queries:
+for an unknown state; `min_y()` and `height()` read the level's build range. `state_block(state)` and
+`state_property(state, key)` are the same registry lookup split into its two cheap parts: the block a
+state belongs to, and one of its properties (a machine's `facing`), without serializing the whole
+state string first — useful from a hook that only gets a `LevelHost` (`block_signal`,
+`is_signal_source`) and wants to answer from its own blockstate. It also reads light and loaded state, through the game's own queries:
 `brightness(LightLayer::Block | Sky, pos)` (`getBrightness`, the stored 0 to 15),
 `raw_brightness(pos, sky_darken)` (`getRawBrightness`, which `CropBlock.randomTick` asks with 0)
 and `is_loaded(pos)` (`Level.isLoaded`: inside the build height and in a loaded chunk),

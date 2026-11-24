@@ -72,7 +72,8 @@ API_MAIN = ROOT / "crates/horizon-client/src/native_main.rs.template"
 RUNTIME = "bin"
 # The required inputs (`horizon_mod_package::sdk::Inputs`): `members` lists what each slice must hold.
 INPUTS = ROOT / "crates/horizon-mod-package/src/sdk/inputs.json"
-# The crates an API-only mod may name; their closure is the `api` archive.
+# The crates an API-only mod may name; their closure is the `api` archive. `horizon-mod-points` is empty since the
+# injection points were removed (#19576); it stays while launchers released before then link it into every native mod.
 API_ROOTS = ("horizon-mod-api", "horizon-mod-points")
 # The game libraries outside the API closure, in the runtime archive.
 GAME_LIBRARIES = ("horizon_mod_host", "horizon_mod_wasm")
@@ -95,7 +96,7 @@ LOOPS = "loops.json"
 # launcher's patch step reads it instead of walking the game's source. Only the engine route patches functions, so it
 # is in the `engine` slice, not with the rest of the build data in `api`.
 FUNCTIONS = "functions.json"
-# The SDK's build data (`point_shape::build_data`): each file opens with `schema` and `build.commit`.
+# The SDK's build data (`mod_surface::build_data`): each file opens with `schema` and `build.commit`.
 BUILD_DATA = (FUNCTIONS, INTERNALS, LOOPS, POINTS)
 # The build data the API route reads, in the `api` slice.
 API_BUILD_DATA = (INTERNALS, LOOPS, POINTS)
@@ -147,6 +148,9 @@ def tracked_blobs(root: Path, commit: str, paths: tuple[str, ...] = ()):
         for member in archive:
             if member.isfile():
                 yield member.name, archive.extractfile(member).read()
+        # Tar parsing stops at the end marker, but Git may still be writing record padding.
+        while stream.read(64 * 1024):
+            pass
     if process.returncode != 0:
         sys.exit(f"git archive {commit} failed in {root}")
 
@@ -942,9 +946,14 @@ def start(out: Path) -> None:
 
 def tar_xz(folder: Path, names: list[str], archive: Path) -> None:
     """A tar of `names` (paths under `folder`, folders included) the same on every OS and run: sorted `./` entries,
-    zero times and owners, GNU format, xz-compressed with no timestamp of its own."""
+    zero times and owners, 0o755 for folders and executables and 0o644 for other files, GNU format, xz-compressed
+    with no timestamp of its own."""
     def clean(info: tarfile.TarInfo) -> tarfile.TarInfo:
         info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+        # Not the modes on disk, which follow the umask: 0002 (Ubuntu's and Fedora's default) gives 0o775 and 0o664,
+        # 0027 gives 0o750 and 0o640, Windows 0o777 and 0o666. What the Rust reader unpacks (horizon-mod-package's
+        # sdk.rs, `extract`) keeps only the executable bits that tell these apart.
+        info.mode = 0o755 if info.isdir() or info.mode & 0o111 else 0o644
         return info
     with lzma.open(archive, "wb", format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=XZ_PRESET) as xz, \
             tarfile.open(fileobj=xz, mode="w", format=tarfile.GNU_FORMAT) as tar:

@@ -389,22 +389,27 @@ mod tests {
         let cur_vp = rotation_vp(10.0, 0.0);
         let matrices = reprojection_matrices(ref_vp, cur_vp, reference.position, current.position);
 
-        // Direction-like sample at sky depth.
-        let source_uv = Vec2::new(0.5, 0.5);
+        // Expected values by hand, from the pinhole model alone: a view-space direction (x, y, z)
+        // lands on NDC (f/aspect * x/-z, f * y/-z) with f = 1/tan(35 deg), and UV is
+        // (0.5 + ndc.x/2, 0.5 - ndc.y/2). The reference view is the identity, so the sky sample
+        // looking along (0.2, 0.1, -1) sits off-centre on both axes. A 10 degree yaw (glam's
+        // rotation about +Y) turns it into (0.2c - s, 0.1, -0.2s - c); the camera's move adds
+        // nothing to a direction.
+        let f = 1.0 / 35.0_f64.to_radians().tan();
+        let aspect = 16.0 / 9.0;
+        let (s, c) = 10.0_f64.to_radians().sin_cos();
+        let source_uv = Vec2::new(
+            (0.5 + 0.5 * f / aspect * 0.2) as f32,
+            (0.5 - 0.5 * f * 0.1) as f32,
+        );
+        let depth_w = 0.2 * s + c;
+        let expected = Vec2::new(
+            (0.5 + 0.5 * f / aspect * (0.2 * c - s) / depth_w) as f32,
+            (0.5 - 0.5 * f * 0.1 / depth_w) as f32,
+        );
+
         let sky = reproject_sample(source_uv, 0.0, matrices);
         assert!(sky.valid, "{sky:?}");
-
-        // Expected: orientation change only (no camera translation).
-        let clip = cur_vp
-            * ref_vp.inverse()
-            * DVec3::new(
-                uv_to_ndc(source_uv).x as f64,
-                uv_to_ndc(source_uv).y as f64,
-                0.0,
-            )
-            .extend(1.0);
-        let ndc = clip.truncate() / clip.w;
-        let expected = ndc_to_uv(Vec2::new(ndc.x as f32, ndc.y as f32));
         approx_vec2(sky.uv, expected, 2.0e-4);
     }
 

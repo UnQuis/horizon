@@ -7,6 +7,23 @@ const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 /// An xz tar the packager wrote, holding `deps/a.rmeta`.
 const SLICE: &[u8] = include_bytes!("../../../crates/horizon-mod-package/src/sdk/fixture.tar.xz");
 
+#[test]
+fn mod_build_age_requires_two_orderable_nightlies() {
+    use crate::native_mods::fit::Age;
+
+    let older = Some("nightly-2026-11-12-aaaaaaa");
+    let newer = Some("nightly-2026-11-13-bbbbbbb");
+    assert_eq!(nightly_age(newer, older), Age::Newer);
+    assert_eq!(nightly_age(older, newer), Age::Older);
+    assert_eq!(nightly_age(None, newer), Age::Unknown);
+    assert_eq!(nightly_age(newer, None), Age::Unknown);
+    assert_eq!(nightly_age(newer, Some("unknown")), Age::Unknown);
+    assert_eq!(
+        nightly_age(newer, Some("nightly-2026-11-13-ccccccc")),
+        Age::Unknown
+    );
+}
+
 fn runtime() -> String {
     Asset::name(Kind::Runtime, TRIPLE, Side::Client)
 }
@@ -590,6 +607,35 @@ fn a_stamp_from_another_index_is_not_trusted() {
     assert!(stamp_holds(&sdk, &runtime(), &package.runtime));
     assert!(!stamp_holds(&other, &runtime(), &package.runtime));
     assert!(!stamp_holds(&sdk, &api(), &package.runtime));
+}
+
+#[test]
+fn a_superseded_nightly_uses_its_archived_signed_index() {
+    let fixture = Fixture::new();
+    let base = fixture.scratch.path().join("base");
+    let kept = fixture.scratch.path().join("versions");
+    let version = "nightly-2026-11-18-0123456";
+    let replacement = "nightly-2026-11-18-abcdef0";
+    let archive = format!("mod-index-{version}");
+    let index = index_of(&[], rust_toolchain::VERSION).to_json();
+    for tag in ["nightly", "nightly-2026-11-18", &archive] {
+        publish(&base, tag, replacement, &fixture.key, index.as_bytes(), &[]);
+    }
+    let read = || build_of_in(&kept, version, &fixture.base(), &fixture.keys());
+    assert!(matches!(read(), Err(Refusal::Unsigned { .. })));
+    assert!(!kept.join(version).exists());
+
+    publish(
+        &base,
+        &archive,
+        version,
+        &fixture.key,
+        index.as_bytes(),
+        &[],
+    );
+    assert_eq!(read().unwrap(), COMMIT);
+    fs::remove_dir_all(base).unwrap();
+    assert_eq!(read().unwrap(), COMMIT);
 }
 
 #[test]

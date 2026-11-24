@@ -244,11 +244,9 @@ pub struct Hooks {
     pub inside_fire: fn(
         &mut DamageLevel<'_>,
         &'static str,
-        i32,
-        &str,
-        BlockStateId,
-        BlockPos,
+        Contact<'_>,
         bool,
+        &mod_api::SweptEntity,
         &mut mod_api::InsideEffects,
         &mut Vec<InsideWrite>,
     ),
@@ -472,6 +470,11 @@ pub fn minecart_pass(entity: i32, state: BlockStateId, position: BlockPos) {
             }));
         });
     }
+}
+
+/// Whether any contact is noted and not taken yet.
+pub fn has_pending() -> bool {
+    PENDING.with_borrow(|pending| !pending.is_empty())
 }
 
 /// The contacts noted since the last call, in the order they happened.

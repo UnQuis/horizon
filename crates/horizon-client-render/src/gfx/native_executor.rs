@@ -15,6 +15,10 @@ impl ExternalPipeline for NativePack {
         Some(NativePack::capabilities(self))
     }
 
+    fn sun_path_rotation(&self) -> f32 {
+        self.sun_path_rotation
+    }
+
     /// A rebuild of the pack that ran keeps its kept resources (`NativePack::carry`); else
     /// they go before this pack's are made (`install_kept`), which may find no room for them.
     fn take_over(
@@ -126,8 +130,12 @@ impl ExternalPipeline for NativePack {
         }
     }
 
+    fn reads_opaque(&self) -> bool {
+        self.frame.reads_opaque
+    }
+
     fn copy_opaque(&self, copy: OpaqueCopy<'_>) {
-        NativePack::copy_opaque(self, copy);
+        self.frame.copy_world_opaque(copy);
     }
 
     fn draw_weather(

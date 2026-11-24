@@ -393,6 +393,38 @@ fn a_horses_unknown_coat_and_markings_wrap() {
     assert_eq!(saved(9, Some(5)), Some(5));
 }
 
+/// `Entity.load`: `setYRot`/`setXRot`, then `setRot`'s `% 360`.
+#[test]
+fn a_loaded_rotation_wraps_and_clamps_as_entity_load_does() {
+    let rot = |r: &str| {
+        let tag = horizon_core::nbt::parse_snbt(&format!("{{Rotation:{r}}}"))
+            .unwrap()
+            .0;
+        loaded_rotation(&tag)
+    };
+    assert_eq!(rot("[-170.5f,-90.0f]"), [-170.5, -90.0]);
+    assert_eq!(rot("[45.0f,135.0f]"), [45.0, 90.0]);
+    assert_eq!(rot("[400.0f,-400.0f]"), [40.0, -40.0]);
+    assert_eq!(rot("[-725.0f,370.0f]"), [-5.0, 10.0]);
+    assert_eq!(rot("[1.0f]"), [0.0, 0.0]);
+    // On a live entity a non-finite angle (only binary NBT holds one; SNBT
+    // has no NaN, and an unreadable Rotation is Vec2.ZERO) keeps the
+    // previous one.
+    let nan = Tag::compound([(
+        "Rotation",
+        Tag::List(vec![
+            Tag::Float(f32::NAN.to_bits()),
+            Tag::Float(135.0_f32.to_bits()),
+        ]),
+    )]);
+    assert_eq!(loaded_rotation_over(&nan, [12.0, 3.0]), [12.0, 90.0]);
+    assert_eq!(rot("[\"NaNf\",135.0f]"), [0.0, 0.0]);
+    let tag = horizon_core::nbt::parse_snbt("{Rotation:[400.0f,135.0f]}")
+        .unwrap()
+        .0;
+    assert_eq!(loaded_rotation_over(&tag, [12.0, 3.0]), [40.0, 90.0]);
+}
+
 /// `LivingEntity.readAdditionalSaveData` reads `HurtTime` and `DeathTime`
 /// with `getShortOr`: an int tag is narrowed (`(short)(value & 65535)`),
 /// so 40000 is -25536 and never counts down.
@@ -436,6 +468,33 @@ fn an_unknown_axolotl_variant_is_lucy_and_a_parrots_is_clamped() {
     let parrot = |saved| variant(crate::mobs::Species::Parrot, "minecraft:parrot", saved);
     assert_eq!([0, 3, 4, 5, 7, -1].map(axolotl), [0, 3, 4, 0, 0, 0]);
     assert_eq!([0, 3, 4, 5, 7, -1].map(parrot), [0, 3, 4, 4, 4, 0]);
+}
+
+/// A content mod's living type that copies an animal (`template`) is an
+/// `Animal`: its `InLove` and `LoveCause` load back as they were saved,
+/// not only for the vanilla id.
+#[test]
+fn a_templated_animal_keeps_its_love_through_a_reload() {
+    let mut kind = crate::mobs::sensor_scan_tests::kind();
+    let ty = Arc::make_mut(&mut kind);
+    ty.id = "example:spotted_cow".into();
+    ty.species = crate::mobs::Species::Cow;
+    let types = [("example:spotted_cow".into(), kind)].into();
+    let raw = Tag::compound([
+        ("id", string("example:spotted_cow")),
+        ("Pos", doubles(&[4.5, 220.0, 4.5])),
+        ("InLove", Tag::Int(400)),
+        ("LoveCause", Tag::IntArray(vec![1, 2, 3, 4])),
+    ]);
+    let m = mob_from_nbt(&raw, &types, 1, None).unwrap();
+    assert_eq!(
+        (m.extra.in_love, m.extra.love_cause),
+        (400, Some([1, 2, 3, 4]))
+    );
+    let saved = mob_to_nbt(&m, [0; 4], None, None, |_| None);
+    assert_eq!(number(saved.get("InLove")), Some(400));
+    let again = mob_from_nbt(&saved, &types, 1, None).unwrap();
+    assert_eq!(again.extra.in_love, 400);
 }
 
 /// A mount keeps its body armour and a helmet (say
@@ -2124,6 +2183,7 @@ fn orbs_save_and_load_their_fire() {
         attachment_lifetime: Default::default(),
         rotation: [0.0, 0.0],
         join: Default::default(),
+        section_order: 0,
         no_gravity: false,
         id: 0,
         position: Vec3::new(1.0, 2.0, 3.0),

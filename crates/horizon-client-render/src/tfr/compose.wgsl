@@ -42,11 +42,18 @@ fn edge_at(uv: vec2<f32>) -> f32 {
     return 0.0;
 }
 
+// Motion is read through a linear sampler, so a footprint that mixes valid and invalid texels
+// would blend a shortened vector (invalid texels store 0) with a validity above 0.5. Accept a
+// filtered sample only when every tap in its footprint is valid (validity filters to 1.0).
+fn all_valid(m: vec4<f32>) -> bool {
+    return m.z >= 0.999;
+}
+
 fn candidate_valid(uv: vec2<f32>) -> bool {
     // A fill candidate is usable only if motion marks it valid and edge is acceptable.
     let m = textureSampleLevel(motion_tex, motion_sampler, clamp_uv(uv), 0.0);
     let e = max(m.w, edge_at(uv));
-    return m.z > 0.5 && e <= 0.95;
+    return all_valid(m) && e <= 0.95;
 }
 
 fn deterministic_fill(dst_uv: vec2<f32>) -> vec4<f32> {
@@ -88,7 +95,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Deterministic backward search: s ~= uv - m(s)*strength.
     // Rule: sample motion at current src; if valid, advance src from it.
     // If invalid on first iteration, try dst-uv motion once as a hint; otherwise stop.
-    // After search, require motion at final src to be valid (no cycling/guessing).
+    // After search, require motion at final src to be valid and to land on uv (no cycling/guessing).
     var src = clamp_uv(uv);
     // Keep the unclamped candidate: clamping hides a pan-revealed strip and would stretch the
     // border texel instead of using the hole fill. Clamp only coordinates used for sampling.
@@ -96,14 +103,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var valid = false;
     for (var i: i32 = 0; i < 3; i = i + 1) {
         let m = textureSampleLevel(motion_tex, motion_sampler, src, 0.0);
-        if (m.z > 0.5) {
+        if (all_valid(m)) {
             src_raw = uv - m.xy * strength;
             src = clamp_uv(src_raw);
             valid = true;
         } else {
             if (i == 0) {
                 let mc = textureSampleLevel(motion_tex, motion_sampler, uv, 0.0);
-                if (mc.z > 0.5) {
+                if (all_valid(mc)) {
                     src_raw = uv - mc.xy * strength;
                     src = clamp_uv(src_raw);
                     valid = true;
@@ -114,7 +121,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (valid) {
         let mfinal = textureSampleLevel(motion_tex, motion_sampler, src, 0.0);
-        valid = mfinal.z > 0.5;
+        // The final source must project back onto this pixel within one texel; a search that
+        // did not converge (or bounced between two regions) takes the hole fill instead.
+        let residual = src_raw + mfinal.xy * strength - uv;
+        let tol = 1.0 / max(params.texel.xy, vec2<f32>(1.0));
+        valid = all_valid(mfinal) && all(abs(residual) <= tol);
     }
 
     var color: vec4<f32>;

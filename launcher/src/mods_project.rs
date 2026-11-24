@@ -11,12 +11,14 @@
 //!   a placeholder stands in until one arrives.
 use super::mods_page::{Checking, Event};
 use super::*;
+use crate::glass_ui::{self as ui, white};
 use gpui::img;
 use horizon_launcher::browser::{
     self,
     details::{self, Details, Environment, Filters, Image, Sort, Tags},
     images, java, Kind as PackKind, Project, SourceId, Support, Version,
 };
+use horizon_theme::glass::{fill, ink, radius};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -165,6 +167,52 @@ pub(super) enum Loaded {
 
 /// Images fetched at once.
 const IMAGE_WORKERS: usize = 4;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FilterSections {
+    loader: bool,
+    game_version: bool,
+    environment: bool,
+    tags: bool,
+    group_categories: bool,
+    hide_modded: bool,
+}
+
+impl FilterSections {
+    fn for_browse(source: SourceId, kind: PackKind, java: bool, everything: bool) -> Self {
+        match (source, kind) {
+            (SourceId::Horizon, _) => Self {
+                tags: true,
+                ..Self::default()
+            },
+            (_, _) if java => Self {
+                environment: kind == PackKind::Mod,
+                group_categories: kind == PackKind::ResourcePack,
+                ..Self::default()
+            },
+            (SourceId::Modrinth, PackKind::ResourcePack) => Self {
+                game_version: everything,
+                group_categories: true,
+                hide_modded: !everything,
+                ..Self::default()
+            },
+            (SourceId::Modrinth, PackKind::Shader) => Self {
+                group_categories: true,
+                ..Self::default()
+            },
+            (SourceId::Modrinth, PackKind::DataPack) => Self {
+                game_version: everything,
+                ..Self::default()
+            },
+            _ => Self {
+                loader: true,
+                game_version: true,
+                environment: true,
+                ..Self::default()
+            },
+        }
+    }
+}
 
 impl Launcher {
     pub(super) fn mods_loaded(&mut self, loaded: Loaded) {
@@ -451,56 +499,116 @@ impl Launcher {
         wrap
     }
 
-    /// The filter bar: sort always (Horizon's registry has its own bar); loader, version,
-    /// environment and categories when shown, only categories and tags for the registry. While
-    /// the panel is closed, what is picked stays in view as chips that each remove theirs.
+    /// The Blocks filter bar. Horizon's registry has its own sort control.
     pub(super) fn mods_filters(&mut self, cx: &mut Context<Self>) -> Div {
-        let t = self.theme;
-        let f = self.mods.browse.filters.clone();
-        let sorts = self.mods_sorts();
-        let source = self.mods.source();
-        let registry = source == SourceId::Horizon;
-        let resource = source == SourceId::Modrinth && self.mods.kind == PackKind::ResourcePack;
-        let shader = source == SourceId::Modrinth && self.mods.kind == PackKind::Shader;
-        let hide_modded = resource && !self.mods.everything && self.mods.java.is_none();
-        let sort = (!t.glass && !registry).then(|| self.mods_sort_dropdown(&sorts, f.sort, cx));
-        let shown = self.mods.browse.show_filters;
-        let active = f.categories.len()
-            + f.tags.len()
-            + f.loader.is_some() as usize
-            + f.game_version.is_some() as usize
-            + f.environment.is_some() as usize;
-        let toggle = button(
-            "mods-filters",
-            if active > 0 {
-                trf("Filters ({count})", &[("count", &active.to_string())])
-            } else {
-                tr("Filters").to_string()
-            },
-            if shown { Kind::Secondary } else { Kind::Ghost },
-            &t,
+        let sort = (self.mods.source() != SourceId::Horizon).then(|| {
+            self.mods_sort_dropdown(&self.mods_sorts(), self.mods.browse.filters.sort, cx)
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(12.))
+                    .children(sort)
+                    .child(self.mods_filters_trigger(cx)),
+            )
+            .children(self.mods_filters_body(cx))
+    }
+
+    pub(super) fn glass_mods_control(&self, id: &'static str, open: bool) -> Stateful<Div> {
+        keyboard(
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.))
+                .h(px(44.))
+                .px(px(14.))
+                .rounded(px(radius::ROW))
+                .bg(white(if open { fill::FIELD_FOCUS } else { fill::FIELD }))
+                .hover(|s| s.bg(white(fill::FIELD_FOCUS)))
+                .cursor_pointer()
+                .font_family(horizon_theme::glass::FONT)
+                .text_size(px(14.))
+                .text_color(white(ink::FULL)),
+            &self.theme,
         )
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+    }
+
+    pub(super) fn mods_filters_trigger(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let t = self.theme;
+        let active = self.mods.browse.filters.picked();
+        let shown = self.mods.browse.show_filters;
+        let toggle = if t.glass {
+            let icon = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(20.));
+            let icon = if active == 0 {
+                icon.child(ui::icon("sliders-horizontal", 16., white(ink::NOTE)))
+            } else {
+                icon.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(20.))
+                        .h(px(20.))
+                        .rounded_full()
+                        .bg(white(fill::ACTIVE))
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(active.to_string()),
+                )
+            };
+            self.glass_mods_control("mods-filters", shown)
+                .child(icon)
+                .child(tr("Filters"))
+        } else {
+            button(
+                "mods-filters",
+                if active > 0 {
+                    trf("Filters ({count})", &[("count", &active.to_string())])
+                } else {
+                    tr("Filters").to_string()
+                },
+                if shown { Kind::Secondary } else { Kind::Ghost },
+                &t,
+            )
+        };
+        toggle.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
             this.mods.browse.show_filters = !this.mods.browse.show_filters;
             cx.notify();
-        }));
-        let mut bar = div().flex().flex_col().gap(px(12.)).child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(12.))
-                .children(sort)
-                .child(toggle),
-        );
-        if !shown {
-            if active > 0 {
-                bar = bar.child(self.mods_picked_filters(&f, cx));
-            }
-            return bar;
+        }))
+    }
+
+    /// The open drawer, or the removable chips for picked filters when closed.
+    pub(super) fn mods_filters_body(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let t = self.theme;
+        let f = &self.mods.browse.filters;
+        let active = f.picked();
+        if !self.mods.browse.show_filters {
+            return (active > 0).then(|| self.mods_picked_filters(f, cx));
         }
+        let f = f.clone();
+        let kind = self.mods.kind;
+        let sections = FilterSections::for_browse(
+            self.mods.source(),
+            kind,
+            self.mods.java_for(kind).is_some(),
+            self.mods.everything,
+        );
         let Some(tags) = self.mods_tags().cloned() else {
-            return bar.child(caps(tr("Loading filters")).text_color(t.muted));
+            return Some(caps(tr("Loading filters")).text_color(t.muted));
         };
         // A chip: on or off, one value of a filter.
         let chip = |id: String, label: String, on: bool| {
@@ -563,7 +671,7 @@ impl Launcher {
                 ),
             );
         }
-        let grouped = resource || shader;
+        let grouped = sections.group_categories;
         let mut category_rows = Vec::new();
         for group in tags
             .categories
@@ -573,13 +681,13 @@ impl Launcher {
                 "features" if grouped => tr("Features"),
                 "resolutions" if grouped => tr("Resolutions"),
                 "performance impact" if grouped => tr("Performance"),
-                "categories" if shader => tr("Style"),
+                "categories" if grouped && kind == PackKind::Shader => tr("Style"),
                 _ => tr("Categories"),
             };
             let mut categories = div().flex().flex_wrap().gap(px(4.));
             for c in group
                 .iter()
-                .filter(|c| !(hide_modded && c.name == "modded"))
+                .filter(|c| !(sections.hide_modded && c.name == "modded"))
             {
                 let on = f.categories.contains(&c.name);
                 let value = c.name.clone();
@@ -629,24 +737,23 @@ impl Launcher {
         }
         let clear = button("mods-clear", "Clear filters", Kind::Ghost, &t).on_click(cx.listener(
             |this, _: &ClickEvent, _, cx| {
-                this.mods_filter(|f| *f = Filters::default());
+                this.mods_filter(Filters::clear_picked);
                 cx.notify();
             },
         ));
-        if !registry {
-            bar = bar
-                .children((!resource && !tags.loaders.is_empty()).then_some(loaders))
-                .children((!shader).then_some(versions))
-                .children((!grouped).then_some(environment));
-        }
-        bar = bar.children(category_rows);
-        if registry && !tags.tags.is_empty() {
-            bar = bar.child(tag_row);
-        }
+        let mut bar = div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .children((sections.loader && !tags.loaders.is_empty()).then_some(loaders))
+            .children(sections.game_version.then_some(versions))
+            .children(sections.environment.then_some(environment))
+            .children(category_rows)
+            .children((sections.tags && !tags.tags.is_empty()).then_some(tag_row));
         if active > 0 {
             bar = bar.child(div().flex().child(clear));
         }
-        bar
+        Some(bar)
     }
 
     /// What the filters pick, each a chip with a cross that removes it, then Clear filters.
@@ -712,13 +819,7 @@ impl Launcher {
         row.child(
             button("mods-picked-clear", "Clear filters", Kind::Ghost, &t).on_click(cx.listener(
                 |this, _: &ClickEvent, _, cx| {
-                    // The sort has its own control: only what filters goes.
-                    this.mods_filter(|f| {
-                        *f = Filters {
-                            sort: f.sort,
-                            ..Filters::default()
-                        }
-                    });
+                    this.mods_filter(Filters::clear_picked);
                     cx.notify();
                 },
             )),
@@ -1167,6 +1268,60 @@ impl Opened {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_sections_match_each_browse_context() {
+        let registry = FilterSections {
+            tags: true,
+            ..FilterSections::default()
+        };
+        let external = FilterSections {
+            loader: true,
+            game_version: true,
+            environment: true,
+            ..FilterSections::default()
+        };
+        for everything in [false, true] {
+            let grouped = FilterSections {
+                group_categories: true,
+                ..FilterSections::default()
+            };
+            let resource_packs = FilterSections {
+                game_version: everything,
+                hide_modded: !everything,
+                ..grouped
+            };
+            let data_packs = FilterSections {
+                game_version: everything,
+                ..FilterSections::default()
+            };
+            let java_mods = FilterSections {
+                environment: true,
+                ..FilterSections::default()
+            };
+            for (kind, modrinth, java_instance) in [
+                (PackKind::Mod, &external, &java_mods),
+                (PackKind::Modpack, &external, &FilterSections::default()),
+                (PackKind::ResourcePack, &resource_packs, &grouped),
+                (PackKind::Shader, &grouped, &FilterSections::default()),
+                (PackKind::DataPack, &data_packs, &FilterSections::default()),
+            ] {
+                for (source, horizon, java_instance) in [
+                    (SourceId::Horizon, &registry, &registry),
+                    (SourceId::Modrinth, modrinth, java_instance),
+                    (SourceId::CurseForge, &external, java_instance),
+                ] {
+                    for (java, expected) in [(false, horizon), (true, java_instance)] {
+                        assert_eq!(
+                            &FilterSections::for_browse(source, kind, java, everything),
+                            expected,
+                            "{source:?} {kind:?}, Java={java}, Show everything={everything}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn reopening_the_same_project_rejects_the_old_versions_response() {

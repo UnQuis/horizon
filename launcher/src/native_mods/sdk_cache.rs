@@ -197,6 +197,30 @@ fn nightly_of(commit: &str) -> Option<String> {
         })
 }
 
+/// How the mod's pinned build compares to the instance's build, using locally known Nightlies.
+pub(super) fn age(made_for: &str, build: &str) -> super::fit::Age {
+    let made_for = nightly_of(made_for);
+    let build = nightly_of(build);
+    nightly_age(made_for.as_deref(), build.as_deref())
+}
+
+fn nightly_age(made_for: Option<&str>, build: Option<&str>) -> super::fit::Age {
+    use super::fit::Age;
+    use std::cmp::Ordering;
+
+    let (Some(made_for), Some(build)) = (made_for, build) else {
+        return Age::Unknown;
+    };
+    if crate::nightly::date_of(made_for).is_none() || crate::nightly::date_of(build).is_none() {
+        return Age::Unknown;
+    }
+    match crate::backend::compare_versions(made_for, build) {
+        Ordering::Greater => Age::Newer,
+        Ordering::Less => Age::Older,
+        Ordering::Equal => Age::Unknown,
+    }
+}
+
 /// Build `commit`'s name as the Versions page gives it, when it is known here (a kept index, or
 /// an installed version). `commit` may come from a mod's manifest: anything but a build id is
 /// never looked up.
@@ -897,11 +921,14 @@ fn build_of_in(
     // The Nightly being served is published as `nightly` and renamed `nightly-<date>` when the
     // next one goes out: the current tag is tried first. Its v2 signature binds the exact
     // version, so whichever tag serves it, only that version's index is accepted. A snapshot is
-    // served under its version alone.
+    // served under its version alone. When rotation replaces an earlier Nightly of the same
+    // date, its three signed metadata files stay under a tag named for that exact version.
+    let archive = format!("mod-index-{version}");
     let tags: Vec<String> = match (channel, horizon_release_sign::nightly_date(version)) {
         (Some(horizon_release_sign::Channel::Nightly), Some(date)) => vec![
             horizon_release_sign::NIGHTLY.to_owned(),
             format!("nightly-{date}"),
+            archive.clone(),
         ],
         _ => vec![version.to_owned()],
     };
@@ -917,6 +944,8 @@ fn build_of_in(
             }
             // Offline is offline whichever tag: no use trying the next.
             Err(refusal @ Refusal::Offline { .. }) => return Err(refusal),
+            // Most builds have no archive. Keep the dated release's reason in that case.
+            Err(Refusal::NoSdk { .. }) if tag == &archive => {}
             Err(refusal) => last = refusal,
         }
     }

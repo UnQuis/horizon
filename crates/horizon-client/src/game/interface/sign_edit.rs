@@ -191,10 +191,12 @@ impl Game<'_> {
     fn run_sign_command(&mut self, pos: [i32; 3], command: &str) {
         let source = self.sign_command_source(pos);
         let line = command.strip_prefix('/').unwrap_or(command);
-        self.exec = Default::default();
         let permission = std::mem::replace(&mut self.ui.registries.permission, 2);
-        let _ = self.execute_line(line, source);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_command_frame(|game| game.execute_line(line, source))
+        }));
         self.ui.registries.permission = permission;
+        let _ = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         // InventoryChangeTrigger fires as slots change, not on the next tick.
         if self.player.is_some() {
             self.check_inventory_trigger();
@@ -534,7 +536,7 @@ impl Game<'_> {
     /// `AbstractSignEditScreen.removed`: a server's client sends what it
     /// wrote (ServerboundSignUpdatePacket); the window's own world keeps it
     /// and sends it to its guests (`sendBlockUpdated`).
-    pub(super) fn close_sign_editor(&mut self) {
+    pub(in crate::game) fn close_sign_editor(&mut self) {
         if let Some(edit) = self.sign_edit.take() {
             if self.remote.is_some() {
                 self.send(S::SignUpdate(play::SignUpdate {
@@ -584,6 +586,16 @@ impl Game<'_> {
         };
         let (uuid, name) = (g.uuid, g.name.clone());
         let key = (p.pos[0], p.pos[1], p.pos[2]);
+        // SignBlockEntity.updateSignText: only the sign's allowed editor may write on it. This
+        // comes before the filter, whose refusal closes the editor: another player's rejected
+        // text must not close the editor of the player who is writing.
+        let Some(BlockEntity::Sign(sign)) = self.world.block_entities.get(&key) else {
+            return;
+        };
+        if sign.waxed || sign.allowed_editor != Some(uuid) {
+            log::warn!("{name} just tried to change non-editable sign");
+            return;
+        }
         let lines = p.lines.join(" ");
         if !self.chat_filter_text(
             conn,
@@ -594,13 +606,6 @@ impl Game<'_> {
             self.world.block_entities.set_sign_editor(key, None);
             // The player's client shows the text it sent: the sign as it is, again.
             self.mark_block_entity_updated(key);
-            return;
-        }
-        let Some(BlockEntity::Sign(sign)) = self.world.block_entities.get(&key) else {
-            return;
-        };
-        if sign.waxed || sign.allowed_editor != Some(uuid) {
-            log::warn!("{name} just tried to change non-editable sign");
             return;
         }
         // Everything vanilla checks has passed: the mods hear what is about to
@@ -1011,7 +1016,23 @@ impl Game<'_> {
             }
             horizon_client::preedit::report_caret(caret_x, ly, line_height);
         }
+        // The four lines are fields (a click picks one, as `sign_edit_click` does) and Done is a
+        // button, so `ui` lists them and `click-button Done` presses it, as on the book screen.
+        let max_width = sign.max_line_width();
+        for i in 0..text.lines.len() {
+            horizon_client::widgets::target_as(
+                [
+                    cx - max_width / 2.0,
+                    y - midpoint + i as f32 * line_height,
+                    max_width,
+                    line_height,
+                ],
+                horizon_client::widgets::Kind::Field,
+            );
+        }
         let (bx, by) = done_button(w, h);
+        horizon_client::widgets::record(&done_label(), [bx, by, 200.0, 20.0], true);
+        horizon_client::widgets::target([bx, by, 200.0, 20.0]);
         horizon_client::widgets::declare_action(
             horizon_client::widgets::Action::Done,
             [bx, by, 200.0, 20.0],

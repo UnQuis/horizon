@@ -6,12 +6,17 @@ use horizon_world::registry::BlockStateId;
 use mod_api::{BlockSoundCause, BlockSoundType};
 use std::sync::OnceLock;
 
+type CanSwimInFluid = fn(&LoopContext, u32, &str, &str, bool, &mut bool);
+type LivingFluidTravel = fn(crate::motion::LivingFluidTravelCall<'_>);
+
 /// Client-library hooks, installed before any menu, entity or recipe is used.
 pub struct NativeClientHooks {
     pub menu_still_valid: fn(&LoopContext, u128, &str, [i32; 3], [f64; 3], &mut bool),
     pub menu_still_valid_listens: fn(&str) -> bool,
     pub item_stacked_on_other: fn(&LoopContext, &mut crate::menu::StackedOnOther<'_>, &mut bool),
     pub living_heal: fn(&LoopContext, u32, &mut f32, &mut bool),
+    /// `living_heal_cause`: the entity, the cause name and the amount applied.
+    pub living_heal_cause: fn(&LoopContext, u32, &str, f32),
     pub living_breathe: fn(&LoopContext, u32, &str, &mut bool, &mut i32, &mut i32),
     /// `player_login_profile`: a login's UUID, name and profile properties, before the login
     /// success sends them. The login thread calls it, so the callback has no host.
@@ -26,6 +31,10 @@ pub struct NativeClientHooks {
     pub living_jump_power: fn(&LoopContext, u32, &str, &mut f32),
     pub living_speed: fn(&LoopContext, u32, &str, &mut f32),
     pub living_flying_speed: fn(&LoopContext, u32, &str, &mut f32),
+    pub can_swim_in_fluid_listened: fn() -> bool,
+    pub can_swim_in_fluid: CanSwimInFluid,
+    pub living_fluid_travel_listened: fn() -> bool,
+    pub living_fluid_travel: LivingFluidTravel,
     pub block_jump_factor: fn(&LoopContext, BlockStateId, &mut f32),
     pub block_speed_factor: fn(&LoopContext, BlockStateId, &mut f32),
     pub is_ladder: fn(&LoopContext, u32, BlockPos, BlockStateId, &mut bool),
@@ -99,6 +108,12 @@ pub(crate) fn item_stacked_on_other(
 pub(crate) fn living_heal(context: &LoopContext, entity: u32, amount: &mut f32, cancel: &mut bool) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.living_heal)(context, entity, amount, cancel);
+    }
+}
+
+pub(crate) fn living_heal_cause(context: &LoopContext, entity: u32, cause: &str, amount: f32) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.living_heal_cause)(context, entity, cause, amount);
     }
 }
 
@@ -220,6 +235,26 @@ pub(crate) fn living_flying_speed(context: &LoopContext, entity: u32, kind: &str
     if let Some(hooks) = HOOKS.get() {
         (hooks.living_flying_speed)(context, entity, kind, speed);
     }
+}
+
+pub(crate) fn can_swim_in_fluid_listened() -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|hooks| (hooks.can_swim_in_fluid_listened)())
+}
+
+pub(crate) fn can_swim_in_fluid() -> Option<CanSwimInFluid> {
+    HOOKS.get().map(|hooks| hooks.can_swim_in_fluid)
+}
+
+pub(crate) fn living_fluid_travel_listened() -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|hooks| (hooks.living_fluid_travel_listened)())
+}
+
+pub(crate) fn living_fluid_travel() -> Option<LivingFluidTravel> {
+    HOOKS.get().map(|hooks| hooks.living_fluid_travel)
 }
 
 pub(crate) fn block_jump_factor(context: &LoopContext, state: BlockStateId, factor: &mut f32) {

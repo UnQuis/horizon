@@ -38,6 +38,14 @@ maintainers' vanilla data.
   machines have newer ones), Windows on `windows-latest` (no Windows machine). macOS builds already run on the Mac
   mini.
 
+- **Native Clippy**: `checks` lints `horizon-client --no-default-features`, `horizon-threads`, `horizon-perf-format`,
+  `horizon-perf-share` and `horizon-server` on `windows-latest` and `macos-latest`, with all targets and warnings denied.
+  These two jobs start only after Linux `verify-lint` passes, skip documentation-only pull requests and run no tests or
+  release builds. Their result feeds the required `verify` aggregate: a failure or cancellation blocks it, while a
+  skipped job passes. Main and manual runs also lint; main saves the per-OS Rust caches that pull requests read. Hosted
+  runners keep untrusted builds away from the Mac mini's game files and signing setup; their tokens are read-only.
+  The merge queue skips `verify-lint` and therefore its native jobs too; each queued pull request was already linted.
+
 ## verify on Blacksmith
 
 `checks`' `verify` runs on Blacksmith's runners (blacksmith.sh sponsors our minutes) for every pull request, forks'
@@ -136,18 +144,47 @@ Cargo's settings (the build folder, mold, `HORIZON_NO_AUDIO`, `HORIZON_TELEMETRY
 would restore the dates of the checkout over files a session had edited, and the next session could reuse what
 someone else's unpushed code built.
 
+A session ends after its idle timeout or at the job's 120-minute limit, whichever comes first. The idle timeout
+(`--idle-timeout`) counts minutes with neither a `testbox run` nor an open SSH connection to the runner: a command
+still running, a copy over SSH or a forgotten interactive session keeps the session alive, and billed, until the limit.
+Billing stops with the session, so the limit costs nothing in normal use and only caps a session that keeps running.
+It is 120 rather than 60 because a new session starts with an empty build folder: a cold release build
+of the game, the server and the bots took 9 minutes on 2026-11-22, and comparing a branch with its base builds twice.
+
 ## Hosted parity
 
 `.github/workflows/parity-hosted.yml` runs vanilla harnesses on Blacksmith's 16-vCPU runners, outside the Mac mini.
-For now a maintainer starts it by hand (`workflow_dispatch` only). It is advisory: no required check waits for it,
-and its jobs are named `hosted parity …` so nobody mistakes them for the Mac's `parity / parity`. The job to read is
+A push to main starts it for every harness hosted runners can run, that commit alone (not merged with a newer
+main), at most every 3 hours, and a maintainer can start it by hand. It is advisory: no required check waits for
+it, and its jobs are named `hosted parity …` so nobody mistakes them for the Mac's `parity / parity`. The job to read is
 `hosted parity (advisory)`: it fails when a shard failed, when the plan failed, and when the run had no access to
 the data ("hosted parity did not run: no access to the data"). It passes only when every shard passed, or when the
 plan had nothing to run.
 
+- **Main's runs, one at a time.** Pushes to main share one concurrency group that never cancels a run in progress.
+  Of the runs waiting, GitHub keeps only the newest. A hand-started run has a group of its own. There is no
+  schedule: a scheduled event carries no repository object, which the cache gate and the trusted commit read.
+- **Spacing.** A push runs in full only when main's last full push run started at least 3 hours ago, about 8 a day.
+  Otherwise its first job, `hosted parity spacing`, ends it: `hosted parity (advisory)` passes with one line saying
+  when the last full run started and after when the next push runs in full, and leaves no verdict. A full push run
+  uploads a `parity-hosted-full-start` artifact (kept a day). The spacing job reads the newest one whose run the
+  runs API names as this workflow file's, on a push to main of this repository (another workflow's marker holds
+  nothing back), with `actions: read`, the only permission any job has beyond `contents: read`; it checks nothing
+  out, restores nothing and holds no secret. What it cannot read skips the run. A hand start (`-f full=true`, as the
+  Nightly cut uses) is never spaced.
+- **The verdict.** `hosted parity (advisory)` ends with the tested commit, the harnesses planned, passed and failed
+  (by name), those that passed only on retry, did not finish, or were left out (with why, as one escaped line), and
+  the known failing ones that failed again, passed in every harness or shard they cover (those can come off
+  `known_failing` once parity-main agrees, shards left out of the plan included), or passed where run but not in all
+  of them. When shards ran, it passes only with every shard's results downloaded and a result for every planned
+  harness; otherwise it fails as incomplete, naming what is missing. The same is in the `parity-hosted-verdict`
+  artifact (`verdict.json`, kept 30 days) and on one `parity-hosted-verdict {...}` line of the job's log. Main's
+  verdict is the run whose `event` is `push` and `selection` is `full`.
+
 ```sh
 gh workflow run parity-hosted.yml --ref <branch> -f harnesses="food light spawn_loot"   # these, by name
 gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>                       # what the branch's changes reach
+gh workflow run parity-hosted.yml --ref <branch> -f full=true                           # everything, as main's pushes
 ```
 
 - **The game's data.** Horizon's code never downloads the game. The data comes from `horizon-rust/vanilla-data`, a
@@ -183,7 +220,7 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
   - The dataset's encrypted chunks, as they are. The fetch script takes them only when they are plain files that
     match the MANIFEST it reads from `horizon-rust/vanilla-data` each run, and downloads the dataset otherwise.
   - Sealed by `tools/ci/sealed-cache.sh`: the build folders (`.local/parity-target`, `target/`, one entry per probe
-    group, keyed by the toolchain and `Cargo.lock`), the prepared resources, and the oracle results with the
+    group, keyed by the toolchain and the UTC week), the prepared resources, and the oracle results with the
     parity state. Sealing is tar, zstd, the dataset's own encryption (AES-256-CBC, PBKDF2), then HMAC-SHA256 with
     a second key derived from the passphrase, over the entry's kind, its full cache key and the ciphertext.
     Sealing takes folders and regular files only: symbolic links stay out (each run makes its own again: the
@@ -218,13 +255,23 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
     compared with it, as in `parity.yml`.
   - Each shard runs on a `run` runner with Xvfb and Mesa's software Vulkan (lavapipe), as playhorizon has. The oracle
     cache is created before the harnesses start, since shims that create it at once can fail.
-  - `hosted parity (advisory)` states the result and lists what was not run. It lists a harness as passed on its
-    retry only when its saved record says so; a first log without one (a shard stopped mid-retry) is listed as a
-    retry not finished.
+  - Each shard uploads `results-<shard>.json`: whether each harness passed and whether it was retried, from the
+    records its own run finished (the restored state holds main's earlier ones). A harness without one, a shard
+    stopped mid-run or mid-retry included, is listed as not finished, never as passed.
 - **Not run on hosted runners.** These are listed with their reason, never counted as passed:
   - the harnesses the `hosted` entry of `tools/parity_hosts.json` excludes: sounds, other languages, sources, older
     servers' worlds, the network;
-  - `known_failing` and `named_only` ones.
+  - `named_only` and `local_only` ones, and `known_failing` ones except in a full run.
+- **A full run (main's pushes), 2026-11-23.** 659 harnesses (17 of them known failing; 42 left out), in 14 shards
+  of about 50, then about 20-30 min a shard (a 50-harness shard took 29 min on 2026-11-22): about 280-420 minutes
+  of 16-vCPU runner time and 30-35 min of wall time per run. With the spacing, about 8 a day: about 2,200-3,400
+  16-vCPU minutes a day, plus a minute or two of 2-vCPU time for each push that is skipped.
+- **Cache entries by the week.** A key is never overwritten, and the runners' cache can be pruned only from its
+  dashboard or with an account token no workflow holds. So the build and oracle keys name the UTC week instead of
+  the commit: main's first full run of a week saves the build (about 15 GB) and one oracle entry per shard (about
+  0.2 GB each); later runs that week restore them and save nothing. Last week's entries go unused and are evicted 7
+  days after their last use: about 18 GB current, up to about 36 GB in the week after a change of week. During a
+  week, a run rebuilds what changed since the week's first run (Cargo's fingerprints, with the sources' dates).
 - **Cost, measured 2026-11-19 (cold).**
   - About a minute of setup and data per runner.
   - Cold probe builds: world 40 s; client 530 s (two profiles); the game 480 s.
@@ -232,6 +279,34 @@ gh workflow run parity-hosted.yml --ref <branch> -f base=<commit>               
   - From main's caches, the builds take seconds, or what a change touches. The cached state serves the probes'
     prebuild and the oracle results' reuse, not the selection: the plan job holds no secret, and its dependency
     lists are still to come from a hosted full run on main.
+
+### The fuzzer's workflow
+
+`.github/workflows/parity-fuzz.yml` runs the scenario fuzzer (docs/parity-workflow.md, "Fuzzing scenarios") on the same
+runners, started by hand only (`gh workflow run parity-fuzz.yml --ref <branch> -f family=commands -f seed=1 -f count=200
+-f runners=2` for a wide search, or `-f seeds=1017,1325 -f shrink_rounds=4` for those seeds again, one slice each,
+shrunk). It takes the data by the rules above and adds none:
+
+- **Same access.** Only a commit on a branch of this repository; the fetch script comes from the default branch's
+  commit; the one step that holds a secret is hosted parity's fetch step, line for line, and ends before the first
+  checkout. It is a copy, not a shared step: an action or a reusable workflow would be one more file whose ref a
+  run has to trust. `tests/test_ci_parity_fuzz.py` compares the two files instead, so a change to one that is not
+  made in the other fails. Without the secrets the plan job fails: no green run that fuzzed nothing.
+- **No cache.** No job restores or saves a cache entry, and the file says `cache-mode: none` for a cache service
+  that honours it. A hand start may write to its branch's cache scope, so an entry restored before the step with a
+  secret could be one the same run's build job wrote. Each fuzz job therefore downloads the dataset and prepares
+  the resources itself; the sealed entries stay hosted parity's.
+- **No Cargo beside the data.** The game and the preparer (`horizon-prepare`) are built once, in a job with no
+  secret, no data and no cache. The fuzz jobs run those two programs (`HORIZON_PREPARE_BINARY` tells
+  `tools/ci/vanilla-data.sh` to use the built preparer), so no build script of the tested commit runs on a runner
+  that holds the data. The tested commit's game, preparer and Python tools do run there, as in hosted parity.
+- **What leaves the runner.** Each fuzz job uploads a folder made new after its slices ended: each slice's output,
+  and `found.json` and `report.json` (compared values and commands, as hosted parity's logs) parsed as JSON and
+  written again. Only regular files are read, through no link (`staged` in `tools/parity_fuzz_probe.py`). A
+  step that runs only when the slices step ran checks that folder against the exact names the slices step
+  writes, and against the digest the slices step gives as its output once it has staged (also when it then fails for a lost slice); the upload runs only when that check passed and found results, so never a folder the slices step did not finish. The summary job uploads its merged
+  table. All are kept 3 days.
+- **Cost.** One 16-vCPU runner per 8 slices, plus one for the build.
 
 ## Which jobs, and when
 

@@ -45,8 +45,10 @@ impl WorldKey {
 
 /// Numeric id for a dimension identifier, for `WorldKey::dimension`.
 ///
-/// Vanilla dimensions get stable small ids; other dimensions get a stable hash of their id so a
-/// custom dimension cannot be mistaken for one of the vanilla ones.
+/// Vanilla dimensions get stable small ids; other dimensions get a 64-bit FNV-1a hash of their id,
+/// masked to a non-negative `i32` (so `WorldKey::is_known` accepts it) and kept out of `0..=2` so a
+/// custom dimension cannot be mistaken for one of the vanilla ones. FNV-1a is fixed, unlike
+/// `DefaultHasher`, so the id stays the same across Rust versions.
 #[must_use]
 pub fn dimension_id(id: &str) -> i32 {
     match id {
@@ -54,10 +56,12 @@ pub fn dimension_id(id: &str) -> i32 {
         "minecraft:the_nether" | "the_nether" | "nether" => 1,
         "minecraft:the_end" | "the_end" | "end" => 2,
         other => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            other.hash(&mut hasher);
-            let hashed = hasher.finish() as i32;
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in other.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let hashed = (hash & 0x7fff_ffff) as i32;
             if (0..=2).contains(&hashed) { 3 } else { hashed }
         }
     }
@@ -216,6 +220,8 @@ pub enum FrameKind {
 pub enum RealReason {
     Disabled,
     NoActiveWorld,
+    /// The frame's `WorldKey` is not known (`WorldKey::unknown()`).
+    UnknownWorld,
     InvalidSize,
     UnsupportedPack,
     NoHistory,
@@ -247,6 +253,9 @@ pub struct RealFrameMeta {
     pub history_source_mode: HistorySourceMode,
     /// Whether prepared history was produced and is valid for this snapshot.
     pub prepared_history_ready: bool,
+    /// `TfrState::config_epoch()` when this frame started. A commit from an earlier epoch (the
+    /// config was replaced while the frame was in flight) is dropped.
+    pub config_epoch: u64,
 }
 
 /// Meaningful-motion thresholds (fixed, below cut ranges). Recompute-only, never block synthetic.
@@ -309,6 +318,8 @@ pub struct TfrState {
     synthetics_since_real: u8,
     /// History invalidated and unusable until a successful real commit.
     invalidated: bool,
+    /// Advances each time a different config replaces the current one.
+    config_epoch: u64,
 }
 
 impl TfrState {
@@ -330,8 +341,15 @@ impl TfrState {
         let new_cfg = new_cfg.sanitized();
         if self.cfg != new_cfg {
             self.invalidate("config changed");
+            self.config_epoch = self.config_epoch.wrapping_add(1);
         }
         self.cfg = new_cfg;
+    }
+
+    /// The current config's epoch, for `RealFrameMeta::config_epoch`.
+    #[must_use]
+    pub fn config_epoch(&self) -> u64 {
+        self.config_epoch
     }
 
     /// Source/size/mode-affecting change: invalidate before next decision.
@@ -349,6 +367,7 @@ impl TfrState {
         // Config change invalidates history before decision.
         if self.cfg != cfg {
             self.invalidate("config mismatch");
+            self.config_epoch = self.config_epoch.wrapping_add(1);
             self.cfg = cfg;
         }
 
@@ -362,6 +381,13 @@ impl TfrState {
             self.invalidate("no active world");
             return Decision::Real {
                 reason: RealReason::NoActiveWorld,
+            };
+        }
+        if !ctx.world.is_known() {
+            // Two unknown keys compare equal without naming the same world.
+            self.invalidate("unknown world");
+            return Decision::Real {
+                reason: RealReason::UnknownWorld,
             };
         }
         if !ctx.scene_size.valid() || !ctx.present_size.valid() {
@@ -447,7 +473,13 @@ impl TfrState {
     }
 
     /// Commit a fully successful real frame with atomic history update.
+    ///
+    /// A frame that started under a config since replaced (a stale `meta.config_epoch`) is
+    /// dropped: its history belongs to the old config and must not become valid for the new one.
     pub fn commit_real(&mut self, meta: RealFrameMeta) {
+        if meta.config_epoch != self.config_epoch {
+            return;
+        }
         debug_assert!(
             !self.invalidated || self.cfg.enabled,
             "commit_real after invalidation is only valid as part of a successful real recovery path"
@@ -550,6 +582,7 @@ mod tests {
                 ctx.history_source_mode,
                 HistorySourceMode::DirectScene
             ) || ctx.prepared_history_ready,
+            config_epoch: s.config_epoch(),
         });
     }
 
@@ -682,6 +715,45 @@ mod tests {
                 reason: RealReason::WorldMismatch
             }
         ));
+        assert!(!s.has_valid_history());
+    }
+
+    #[test]
+    fn unknown_world_never_goes_synthetic() {
+        let mut s = TfrState::new();
+        let cfg = enabled_cfg();
+        s.on_config_changed(cfg);
+        let mut ctx = base_ctx();
+        ctx.world = WorldKey::unknown();
+        commit_base(&mut s, ctx);
+        assert_eq!(
+            s.begin_frame(cfg, ctx),
+            Decision::Real {
+                reason: RealReason::UnknownWorld
+            }
+        );
+    }
+
+    #[test]
+    fn commit_started_under_replaced_config_is_dropped() {
+        let mut s = TfrState::new();
+        let cfg = enabled_cfg();
+        s.on_config_changed(cfg);
+        let ctx = base_ctx();
+        let stale_epoch = s.config_epoch();
+        s.on_config_changed(TfrConfig {
+            cut_angle_deg: 30.0,
+            ..cfg
+        });
+        s.commit_real(RealFrameMeta {
+            world: ctx.world,
+            scene_size: ctx.scene_size,
+            present_size: ctx.present_size,
+            camera: ctx.camera,
+            history_source_mode: ctx.history_source_mode,
+            prepared_history_ready: true,
+            config_epoch: stale_epoch,
+        });
         assert!(!s.has_valid_history());
     }
 
@@ -891,6 +963,14 @@ mod tests {
         assert!(!(0..=2).contains(&custom));
         assert_eq!(custom, dimension_id("modded:dim"));
         assert_ne!(custom, dimension_id("modded:other"));
+        // Every custom id is non-negative, so a world in it can be known. 64-bit FNV-1a of
+        // "a" is the published 0xaf63dc4c8601ec8c; its low 31 bits are 0x0601ec8c.
+        assert_eq!(dimension_id("a"), 0x0601_ec8c);
+        for id in ["modded:dim", "modded:other", "x:y", "aether:the_aether"] {
+            let mut epoch = WorldEpoch::unknown();
+            epoch.observe(dimension_id(id));
+            assert!(epoch.key().is_known(), "{id}");
+        }
         assert!(!WorldKey::unknown().is_known());
     }
 

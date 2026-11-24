@@ -127,6 +127,19 @@ unavailable and `Some(None)` for an empty slot. Each read checks the world epoch
 so a handle cannot read a replacement, reopened or respawned menu. These methods do not click or
 change slots.
 
+A client mod reads the trades of an open villager or wandering trader screen with
+`menu.merchant_offers(host)`: a copy of the offers the server last sent for that menu
+(`ClientboundMerchantOffersPacket`, which vanilla's `MerchantMenu.setOffers` keeps), in the order
+the merchant screen lists them. Each `MerchantOffer` has the first payment, the optional second
+one, the result with its components, and the stock and price data; an offer the server sent out
+of stock has its uses at its maximum, so `offer.out_of_stock()` is true, and
+`offer.cost_a_count(host)` is the first payment's count after demand and discounts. `Ok(None)`
+means the handle is no longer current, isn't the local player's, or isn't a merchant menu; an
+open merchant menu reads `Ok(Some(vec![]))` until its offers arrive; `Err(LevelReadError::Unavailable)`
+means the copy couldn't be read. Reading selects nothing, buys nothing and sends nothing; the
+server still decides every trade. The villager's own profession and level are on its
+`MerchantRef` ([Villager professions](../../how-to/entities/villager-professions.md#reading-a-villager-on-the-client)).
+
 Mutable client hooks can submit a vanilla click with
 `menu.click(host, &[mod_api::MenuClick::QuickMove { slot }])`. The slot is the same menu-order
 index used by `slot`, not a hotbar index or a GUI slot id. For example:
@@ -227,7 +240,7 @@ one's place and the mouse stays where it is. Opening from the player's inventory
 `player.open_mod_menu` takes the same `replace` for a content mod's menu type
 ([machine menu data](../../how-to/world/machine-menu-data.md)).
 
-## Slots backed by a held item or an entity's handler
+## Slots backed by a held item, a mod place or an entity's handler
 
 A menu opened with no block (`player.open_mod_menu`, or `open_menu`'s chest menu) can show storage that is not a block
 entity, as NeoForge's `StackCopySlot` and `ResourceHandlerSlot` do. Right after the open, back its first container
@@ -236,6 +249,10 @@ slots with `player.back_mod_menu_slots(host, window, places)`, one `MenuSlotPlac
 - `MenuSlotPlace::HeldItem { hand, slot }`: slot `slot` of the container inside the stack in the player's `hand`, through
   its `ITEM_ITEMS` handler (a backpack's contents). While the menu is open, the hotbar slot holding a main-hand stack takes
   no click, so the backpack can't go into itself.
+- `MenuSlotPlace::ModItem { provider, key, slot }`: slot `slot` of the container inside the stack at the mod place
+  `ItemPlace::Mod { provider, key }` (a `PlaceProvider`'s, such as an accessory slot), through its `ITEM_ITEMS` handler: a
+  backpack worn on the back. A click that would take that stack out of its place (when the provider keeps it in one of
+  the menu's slots, such as an inventory slot) is undone whole, so the backpack can't go into itself.
 - `MenuSlotPlace::EntityItems { entity, slot }`: slot `slot` of `entity`'s `ENTITY_ITEMS` handler, as a mod's provider
   answers it.
 
@@ -247,8 +264,9 @@ a container held there, the menu's slots), and only the slots that changed are w
 notice, deduplicated per menu; there is no next-tick scan. A handler changed independently of an `ItemPlace` write
 is checked and mirrored at the next click, not automatically on the next tick. Before each click and at each
 change notice the menu checks its places: it closes once one stops resolving (the backpack left the hand, the entity is
-gone), or once a `HeldItem` hand no longer holds the stack bound when the slots were backed (another stack put in its
-place, another hotbar slot selected). Stacks are values, so the bound stack is told apart by its item and components
+gone), or once a `HeldItem` hand or a `ModItem` place no longer holds the stack bound when the slots were backed
+(another stack put in its place, another hotbar slot selected). A provider that changes its place by its own means,
+not through an `ItemPlace` write, is seen at the next click; back the slots again to show it at once. Stacks are values, so the bound stack is told apart by its item and components
 other than its contents. Slots past `places` stay the mod's own (`menu_clicked`). A drag, a number-key swap, a
 double-click collect or a throw on a backed menu is still the mod's to answer.
 
@@ -271,6 +289,13 @@ if let Some(window) = window {
     }
 }
 ```
+
+For a blockless content menu, register a `MenuPart` with `Registrar::menu_part` using the menu's id
+and return a `Screen` from `MenuPart::menu_screen`. Provide a finite coordinate pair for every
+container slot declared by the menu type, in slot order. Choose positions that make the slots
+usable on the screen. Use the screen render and input hooks for custom controls, matching
+`ScreenView::menu` to the same menu id. A block's own menu still uses its block screen, including
+any registered recipe-book layout.
 
 A vanilla menu and a menu no mod backed never take this path: their slots keep the backing they had.
 

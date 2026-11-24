@@ -187,15 +187,25 @@ pub(crate) fn describe_adapter(adapter: &wgpu::Adapter) {
     );
 }
 /// Whether an adapter's texture arrays hold the block textures Horizon puts
-/// in one array.
-pub(crate) fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<u32> {
+/// in one array: the arrays terrain.wgsl binds for them, and the layers per array.
+pub(crate) fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<(u32, u32)> {
     let info = adapter.get_info();
-    Ok(layer_split(
-        adapter.limits().max_texture_array_layers,
-        info.backend == wgpu::Backend::Gl,
-        adapter_requested_split(&info, requested_split(), layers),
-        layers,
-    )?)
+    let limits = adapter.limits();
+    let max = limits.max_texture_array_layers;
+    let gl = info.backend == wgpu::Backend::Gl;
+    let requested = adapter_requested_split(&info, requested_split(), layers);
+    // A pack past the arrays terrain.wgsl binds takes more, where the GPU samples enough.
+    match super::layer_split(max, gl, requested, layers) {
+        Ok(split) => Ok((super::SPRITE_ARRAYS, split)),
+        Err(_) if super::sprite_arrays_for(&limits) == super::MORE_SPRITE_ARRAYS => {
+            let more = super::MORE_SPRITE_ARRAYS;
+            Ok((
+                more,
+                super::layer_split_in(max, gl, requested, layers, more)?,
+            ))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 /// Whether the swapchain can take a window of `width` x `height`: each side from 1 to the
 /// device's `max_texture_dimension_2d` (`max`), else `Surface::configure` panics. 0 is a
@@ -574,16 +584,24 @@ async fn open_backend(
             adapter.get_info().name
         )));
     }
-    // An integrated GPU on DirectX 12 compiles with DXC: the same request
-    // again, on an instance that loads the DLL beside the game. Anything that
-    // goes wrong keeps the FXC instance.
+    // An integrated GPU on DirectX 12 compiles with DXC, and so does a discrete
+    // one asked for ray queries or mesh shaders, which FXC can't compile: the
+    // same request again, on an instance that loads the DLL beside the game.
+    // Anything that goes wrong keeps the FXC instance.
     let forced = dx12_compiler::forced();
-    let dxc = if dx12_compiler::wants_dxc(&adapter.get_info(), forced) {
+    let sm_6_5 = needs.shader_model_6_5();
+    let dxc = if dx12_compiler::wants_dxc(&adapter.get_info(), forced, sm_6_5) {
         open_dxc(&adapter.get_info(), window, offscreen, open).await
     } else {
         None
     };
     let dxc_found = dxc.is_some();
+    dx12_compiler::note_fxc_until_asked(dx12_compiler::dxc_on_request(
+        &adapter.get_info(),
+        forced,
+        sm_6_5,
+        dx12_compiler::bundled_dll().is_some(),
+    ));
     let (instance, surface, adapter) = dxc.unwrap_or((instance, surface, adapter));
     if adapter.get_info().backend == wgpu::Backend::Dx12 {
         crate::crash::set_detail(
@@ -718,8 +736,9 @@ async fn open_dxc(
     let why = match surface_and_adapter(&instance, window, offscreen).await {
         Ok((surface, adapter)) if dx12_compiler::same_adapter(fxc, &adapter.get_info()) => {
             log::info!(
-                "Horizon renderer: DirectX 12 compiles shaders with DXC ({}) on this integrated GPU",
-                dll.display()
+                "Horizon renderer: DirectX 12 compiles shaders with DXC ({}) on this {:?}",
+                dll.display(),
+                fxc.device_type
             );
             return Some((instance, surface, adapter));
         }

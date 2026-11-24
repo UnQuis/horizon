@@ -55,6 +55,7 @@ pub struct Release {
     pub nightly: Option<String>,
 }
 
+pub mod api_fallback;
 mod look_settings;
 mod play_log;
 mod release_assets;
@@ -1109,13 +1110,42 @@ pub fn installed() -> Vec<String> {
 }
 
 fn installed_in(versions: &Path) -> Vec<String> {
-    let mut tags: Vec<String> = fs::read_dir(versions)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().join(COMPLETE).exists())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
+    installed_checked_in(versions).unwrap_or_default()
+}
+
+pub(crate) fn installed_checked() -> Result<Vec<String>, String> {
+    installed_checked_in(&versions_dir())
+}
+
+fn installed_checked_in(versions: &Path) -> Result<Vec<String>, String> {
+    let read = || -> std::io::Result<Vec<String>> {
+        let entries = match fs::read_dir(versions) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !versions.is_symlink() => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let mut tags = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let Ok(tag) = entry.file_name().into_string() else {
+                continue;
+            };
+            if entry.path().join(COMPLETE).try_exists().or_else(|e| {
+                // The versions folder can also hold temporary files from installation.
+                if e.kind() == std::io::ErrorKind::NotADirectory {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })? {
+                tags.push(tag);
+            }
+        }
+        Ok(tags)
+    };
+    let mut tags = read().map_err(|e| format!("{}: {e}", versions.display()))?;
     // Read once: a later release list notes the times itself.
     static READ_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !newest_first(&mut tags, crate::nightly::published_at)
@@ -1128,7 +1158,7 @@ fn installed_in(versions: &Path) -> Vec<String> {
         }
         newest_first(&mut tags, crate::nightly::published_at);
     }
-    tags
+    Ok(tags)
 }
 
 /// Sorts `tags` newest first: by [`release_order`], then Nightlies of one day by when they came
@@ -1360,13 +1390,25 @@ pub use developer_play::client_as;
 mod installation;
 pub(crate) use installation::install_as;
 
-/// Removes the installed version `tag` unless a program runs from it or a native build takes its
-/// resources. A build that predates runtime leases takes none, so no lease can ever prove its
+/// Removes `tag` unless an instance or program uses it, or a native build takes its resources.
+/// A build that predates runtime leases takes none, so no lease can ever prove its
 /// folder unused: the check [`in_use`] makes here is that proof, and it stands beside the removal
 /// it justifies. Both vetoes belong to this path, so every caller inherits them; the dependency
 /// one runs inside the removal's exclusive publication lock, so an install that finishes in
 /// between cannot lose the base it started from.
-pub fn remove(tag: &str) -> Result<(), String> {
+pub(crate) fn remove(tag: &str) -> Result<(), String> {
+    // Hold the instance store lock through the deletion so a pin cannot land after the check.
+    let _store_lock = crate::instances::lock_store(&data_dir())?;
+    let installed = installed_checked()?;
+    if !installed.iter().any(|t| t == tag) {
+        return Err(format!("{tag} is not installed."));
+    }
+    if let Some(instance) = crate::instances::version_user(&installed, tag)? {
+        return Err(crate::i18n::trf(
+            "In use by {names}. Pick another version for it first.",
+            &[("names", &instance)],
+        ));
+    }
     if in_use(tag) {
         return Err(format!("{tag} is running. Quit it first."));
     }
@@ -2907,18 +2949,33 @@ pub fn native_crash_exit(status: std::process::ExitStatus) -> bool {
 
 /// Switches the crashed run's home from Auto to `api`, and only when it was on Auto the game home
 /// too: the GPU is the same for every profile, while an instance that chose its own API keeps
-/// every home as it is. True when the run's home changed.
+/// every home as it is. True when the run's home changed. Each home that changed to DirectX 12
+/// records the switch and the game version `build` that crashed (`api_fallback`), so its
+/// instance can show it and offer the way back; a record that can't be written changes nothing
+/// else.
 pub fn switch_after_start_crash(
     run_home: &Path,
     game_home: &Path,
     api: &str,
+    build: &str,
 ) -> Result<bool, String> {
     if !switch_from_auto(run_home, api)? {
         return Ok(false);
     }
+    let record = |home: &Path| {
+        if api != "dx12" {
+            return;
+        }
+        if let Err(e) = api_fallback::record_switch(home, "auto", api, build) {
+            eprintln!("Horizon launcher: could not record the switch to {api}: {e}");
+        }
+    };
+    record(run_home);
     if game_home != run_home {
-        if let Err(e) = switch_from_auto(game_home, api) {
-            eprintln!("Horizon launcher: could not switch the game home to {api}: {e}");
+        match switch_from_auto(game_home, api) {
+            Ok(true) => record(game_home),
+            Ok(false) => {}
+            Err(e) => eprintln!("Horizon launcher: could not switch the game home to {api}: {e}"),
         }
     }
     Ok(true)
@@ -3149,7 +3206,7 @@ pub fn agree_eula(folder: &Path) -> Result<(), String> {
 
 // ----- Shared steps for the front ends -----------------------------------------------------------
 
-/// The installed version to use: the one asked for, else the selected one, else the newest.
+/// A requested installed version, or the launcher's default Nightly resolution.
 pub fn resolve_version(requested: Option<&str>) -> Result<String, String> {
     let installed = installed();
     if let Some(tag) = requested {
@@ -3159,10 +3216,13 @@ pub fn resolve_version(requested: Option<&str>) -> Result<String, String> {
             .cloned()
             .ok_or_else(|| format!("{tag} is not installed."));
     }
-    let selected = Settings::load().selected.filter(|s| installed.contains(s));
-    selected
-        .or_else(|| installed.first().cloned())
-        .ok_or_else(no_version_installed)
+    let settings = Settings::load();
+    crate::nightly::latest_for(
+        crate::instances::Channel::Nightly,
+        &installed,
+        settings.selected.as_deref(),
+    )
+    .ok_or_else(no_version_installed)
 }
 
 /// What a command that needs an installed version says when there is none: the way to get one.
@@ -3175,18 +3235,17 @@ pub fn no_version_installed() -> String {
     )
 }
 
-/// Removes an installed version, unless a program runs from it, and moves the selection to the
-/// newest one left if needed. [`remove`] refuses a version a native build takes its resources
-/// from, under the exclusive publication lock a check here could not hold.
+/// Removes an installed version unless an instance or program uses it. Refreshes the compatibility
+/// selection if it pointed at the removed build.
 pub fn remove_version(tag: &str) -> Result<(), String> {
-    if !installed().iter().any(|t| t == tag) {
-        return Err(format!("{tag} is not installed."));
-    }
     remove(tag)?;
     crate::storage::eviction::request_cleanup();
-    let mut settings = Settings::load();
-    if settings.selected.as_deref() == Some(tag) {
-        settings.keep_installed_selection(&installed());
+    let mut settings = Settings::load_checked()?;
+    if [settings.selected.as_deref(), settings.following.as_deref()].contains(&Some(tag)) {
+        let newest =
+            crate::nightly::latest_for(crate::instances::Channel::Nightly, &installed(), None);
+        settings.selected = newest.clone();
+        settings.following = newest;
         settings.save()?;
     }
     Ok(())
@@ -3212,7 +3271,7 @@ pub fn mark_auto_installed(tag: &str) -> Result<(), String> {
 }
 
 /// Keep the newest releases and automatically installed Nightlies separately. Manual and legacy
-/// Nightlies are outside the quota; selected and instance-pinned versions are always protected.
+/// Nightlies are outside the quota. Instance versions stay protected.
 fn stale_versions(
     installed: &[String],
     keep: usize,
@@ -3270,27 +3329,33 @@ pub(crate) fn in_use(_tag: &str) -> bool {
 }
 
 /// Deletes the release versions nothing needs after an install or update, unless the player
-/// turned that off: all but the newest few (`Settings::keep_newest`), the selected version, the
-/// ones instances pin and the ones a program is running from. A version that does not delete
-/// is logged and the rest still go. Returns the versions deleted. They install again from GitHub.
-pub fn prune_old_versions() -> Vec<String> {
+/// turned that off, keeping the just-installed version, the newest few, and the builds in use.
+/// Failed removals are logged. Returns the versions deleted.
+pub fn prune_old_versions(just_installed: &str) -> Vec<String> {
     let settings = Settings::load();
     if !settings.auto_prune() {
         return Vec::new();
     }
-    let mut protected: Vec<String> = settings.selected.iter().cloned().collect();
-    protected.extend(
-        crate::instances::list()
-            .into_iter()
-            .filter_map(|i| i.version),
-    );
-    let mut gone = Vec::new();
-    for tag in stale_versions(
-        &installed(),
+    let installed = installed();
+    let mut protected = match crate::instances::protected_versions(&installed, &settings) {
+        Ok(protected) => protected,
+        Err(e) => {
+            eprintln!("Could not check instance versions before pruning: {e}");
+            return Vec::new();
+        }
+    };
+    protected.push(just_installed.to_owned());
+    prune_versions(stale_versions(
+        &installed,
         settings.keep_newest(),
         &protected,
         auto_installed,
-    ) {
+    ))
+}
+
+fn prune_versions(candidates: Vec<String>) -> Vec<String> {
+    let mut gone = Vec::new();
+    for tag in candidates {
         if crate::native_mods::resource_dependents(&tag) {
             eprintln!("Keeping old version {tag}: a native build uses its resources.");
             continue;
@@ -3581,10 +3646,8 @@ fn architecture_update(releases: &[Release], installed: &[String]) -> Option<Rel
         return None;
     }
     let settings = Settings::load();
-    let tag = settings
-        .selected
-        .filter(|tag| installed.contains(tag))
-        .or_else(|| installed.iter().find(|tag| is_game_tag(tag)).cloned())?;
+    let tag = crate::instances::selected_with(&settings)
+        .installed_version(installed, settings.selected.as_deref())?;
     if !is_game_tag(&tag) {
         return None;
     }
@@ -3600,10 +3663,32 @@ pub fn check_updates() -> Result<Updates, String> {
 mod update_selection;
 pub use update_selection::{select_after_update, selection_after_install, InstallCause};
 
-/// Installs `tag` (or with "latest" the newest release, pre-releases left out), then updates the selection as
-/// `select_after_update` says when `as_update`, or always selects it otherwise.
+/// Installs `tag` (or with "latest" the newest release, pre-releases left out). A manual install
+/// uses it for the instance Play starts. Updates maintain the old launcher's compatibility fields.
 pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result<String, String> {
-    let releases = [releases()?, release_selection::snapshot(tag)?].concat();
+    install_tag_with(
+        tag,
+        as_update,
+        || Ok([releases()?, release_selection::snapshot(tag)?].concat()),
+        |release| install(release, progress),
+    )
+}
+
+fn install_tag_with(
+    tag: &str,
+    as_update: bool,
+    releases: impl FnOnce() -> Result<Vec<Release>, String>,
+    download: impl FnOnce(&Release) -> Result<(), String>,
+) -> Result<String, String> {
+    let target = if as_update {
+        None
+    } else {
+        let id = Settings::load_checked()?
+            .instance
+            .unwrap_or_else(|| crate::instances::DEFAULT.into());
+        Some(crate::instances::manual_install_target(id)?)
+    };
+    let releases = releases()?;
     let release = if tag == "latest" {
         releases
             .iter()
@@ -3621,37 +3706,34 @@ pub fn install_tag(tag: &str, as_update: bool, progress: impl Fn(f32)) -> Result
     if let Some(warning) = &downgrade {
         eprintln!("{warning}");
     }
-    install(release, progress)?;
+    download(release)?;
     if as_update && release.nightly.is_some() {
         if let Err(e) = mark_auto_installed(&release.tag) {
             eprintln!("Could not mark updated Nightly {}: {e}", release.tag);
         }
     }
-    let mut settings = Settings::load_for_install(&before);
-    // An older Nightly is a deliberate rollback: installed, but an update never moves the selection back.
-    let changed = match (as_update, &downgrade) {
-        (false, _) => {
-            settings.pick(release.tag.clone());
-            true
+    if as_update {
+        let mut settings = Settings::load_for_install(&before);
+        if downgrade.is_none()
+            && settings.apply_install(
+                &release.tag,
+                &before,
+                &installed(),
+                InstallCause {
+                    update: true,
+                    instance: None,
+                },
+            )
+        {
+            settings.save()?;
         }
-        (true, Some(_)) => false,
-        (true, None) => settings.apply_install(
-            &release.tag,
-            &before,
-            &installed(),
-            InstallCause {
-                update: true,
-                instance: None,
-            },
-        ),
-    };
-    if changed {
-        settings.save()?;
+    } else if let Some(target) = target {
+        crate::instances::finish_manual_install(&target, &release.tag)?;
     }
     if as_update && release.nightly.is_some() {
         crate::nightly::after_update(&release.tag);
     }
-    prune_old_versions();
+    prune_old_versions(&release.tag);
     Ok(release.tag.clone())
 }
 
@@ -4531,418 +4613,8 @@ pub fn spawn(job: Job, cmd: Command, tx: Sender<Msg>) -> Result<Running, String>
     })
 }
 
-/// The launcher's appearance, as older launchers saved it: a theme is one look now, and a saved
-/// `light` opens on the Taiga theme (`Settings::parse`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Appearance {
-    #[default]
-    Dark,
-    Light,
-    /// Follow the system's light or dark.
-    System,
-}
-
-/// What the launcher's window does while the game runs, as the player picks it in Settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WhilePlaying {
-    /// The window stays where it is.
-    #[default]
-    Stay,
-    /// The window goes to the Dock or the taskbar, and comes back when the game closes.
-    Minimize,
-    /// The launcher hides (macOS only: elsewhere it minimises), and comes back when the game
-    /// closes.
-    Hide,
-}
-
-impl WhilePlaying {
-    pub const ALL: [WhilePlaying; 3] = [Self::Stay, Self::Minimize, Self::Hide];
-
-    /// Its name in `settings.json` and on the command line.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Stay => "stay",
-            Self::Minimize => "minimize",
-            Self::Hide => "hide",
-        }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        let name = name.trim().to_ascii_lowercase();
-        let name = match name.as_str() {
-            "minimise" => "minimize",
-            "keep" | "open" | "off" => "stay",
-            n => n,
-        };
-        Self::ALL.into_iter().find(|w| w.name() == name)
-    }
-
-    /// What this computer does for it: only macOS can hide a whole app.
-    pub fn here(self) -> Self {
-        match self {
-            Self::Hide if !cfg!(target_os = "macos") => Self::Minimize,
-            w => w,
-        }
-    }
-}
-
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct Settings {
-    pub selected: Option<String>,
-    /// The version the launcher itself selected (an update, or a newer Nightly installed for an
-    /// instance): while `selected` is this one, it follows each newer Nightly. A person's pick
-    /// leaves it behind, and a settings file from before it has none: neither follows
-    /// ([`selection_after_install`]). Always written, `null` for a pick, so a file from before
-    /// it is told apart ([`Settings::load`]).
-    #[serde(default)]
-    pub following: Option<String>,
-    /// Game asset architecture. Auto preserves the launcher's process-architecture behavior.
-    #[serde(default)]
-    pub game_architecture: GameArchitecture,
-    /// The instance Play starts (`instances`), by id. Unset means Horizon, the game's home.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<String>,
-    pub minecraft_dir: Option<PathBuf>,
-    pub server_dir: Option<PathBuf>,
-    /// Unset means on: only a player who turned it off has `false` here. 0.1.1 wrote its
-    /// `auto_install` (off by default) for everyone, so this is a new key and that one is ignored.
-    #[serde(default)]
-    pub install_new_versions: Option<bool>,
-    /// Unset means on: after an install the launcher deletes the release versions nothing needs
-    /// (`prune_old_versions`). Only a player who turned it off has `false` here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prune_old_versions: Option<bool>,
-    /// How many of the newest release versions pruning keeps. Unset means [`KEEP_NEWEST`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep_versions: Option<usize>,
-    /// Off by default, so the opening animation shows unless the player turns it off.
-    #[serde(default)]
-    pub skip_opening: bool,
-    /// Linux: whether the launcher keeps its entry in the applications menu (`desktop`). Unset
-    /// means yes; removing the entry stores `false`, so it doesn't come back on the next start.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub desktop_entry: Option<bool>,
-    /// Extra arguments for the game's command line, as one line (see [`split_args`]). Empty by
-    /// default. Appended after the launcher's own arguments, so they can add to or override them.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub game_args: String,
-    /// The proxy every download goes through (`proxy`), such as `http://127.0.0.1:7890` or
-    /// `socks5://127.0.0.1:1080`.
-    /// Unset means none: the environment's `HTTPS_PROXY` and `HTTP_PROXY` apply instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    /// Only read to move an old light appearance to the Taiga theme (`parse`): always dark now,
-    /// a theme being one look.
-    #[serde(default)]
-    pub appearance: Appearance,
-    /// The player has read what the "I'm playing" ping holds (`telemetry::PING`): on the
-    /// first-run question, or on the Play page once if they answered that before it existed.
-    #[serde(default)]
-    pub ping_notice_seen: bool,
-    /// The player turned the anonymous "I'm playing" ping off (`telemetry::PING`): the game is
-    /// started with `HORIZON_NO_HEARTBEAT`. On by default, as upstream sends it.
-    #[serde(default)]
-    pub ping_off: bool,
-    /// The look's flourishes, each on or off (`effects`): glow, gradients, the hover shine.
-    #[serde(default)]
-    pub effects: crate::effects::Effects,
-    /// The player has been through the first-run welcome (theme, accent, effects).
-    #[serde(default)]
-    pub welcomed: bool,
-    /// The player without an account that owns the game has read, once, why the launcher needs
-    /// one now (the owner gate's screen).
-    #[serde(default)]
-    pub owner_notice_seen: bool,
-    /// Seconds a partner banner (the sidebar's card or the Servers page's banner) has been on
-    /// screen, over every start, up to `partner::SEEN_BEFORE_HIDE`: only then can the player hide it.
-    #[serde(default)]
-    pub partner_seen_secs: u64,
-    /// The player hid a partner banner: the sidebar's card and the Servers page's banner are both gone for good.
-    #[serde(default)]
-    pub partner_hidden: bool,
-    /// What the window does while the game runs. Stays by default.
-    #[serde(default)]
-    pub while_playing: WhilePlaying,
-    /// The accent colour on top of the appearance (`themes::Accent`). Horizon's violet by default.
-    #[serde(default)]
-    pub accent: crate::themes::Accent,
-    /// How much white the glass look's plates take, in percent (the mockup's Glass, 0 to 16).
-    /// Unset is the mockup's 6.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub glass: Option<f32>,
-    /// How much the glass look's plates blur the scene behind them, in px (0 to 48). Unset is
-    /// the mockup's 24.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blur: Option<f32>,
-    /// The launcher theme (`themes::theme`): its sky behind the light appearance. Unset is
-    /// Horizon's own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<String>,
-    /// The cheaper scene for older computers (a lower-resolution sky, a box blur, the scene
-    /// following the mouse less often and resizes baked in the background). Unset is off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance: Option<bool>,
-    /// Home's background: a picture the player picked, kept in the data folder under this name
-    /// (`themes::keep_background`). Unset shows Horizon's landscape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background: Option<String>,
-    /// The window's language. Unset follows the system's (`i18n::Language::system`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<crate::i18n::Language>,
-    /// Whether what the browser installed from Horizon's registry updates by itself, at start
-    /// and before Play (`browser::horizon::auto`). Unset is on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mods_auto_update: Option<bool>,
-    /// First-use native code permission for this launcher install, Unix seconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_mods_allowed_at: Option<u64>,
-    /// Managed cache limit in GiB (unset: 25; zero: no automatic cleanup). Player data isn't cache.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_limit_gib: Option<u64>,
-    /// The accent picked under each launcher theme, by its id (`themes::HORIZON` for Horizon's
-    /// own), so going back to a theme brings back its colour. A launcher older than this map
-    /// drops it when it saves: the themes then only start from their own accents again.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub theme_accents: std::collections::BTreeMap<String, crate::themes::Accent>,
-    /// Reduced motion: unset follows the system's, true keeps the launcher still, false lets it
-    /// move even when the system asks for less.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reduce_motion: Option<bool>,
-}
-
-impl Settings {
-    /// Takes the selection (`selected`, `following`) as `saved` has it: what the command line,
-    /// or another window, saved meanwhile.
-    pub fn selection_from(&mut self, saved: &Settings) {
-        self.selected = saved.selected.clone();
-        self.following = saved.following.clone();
-    }
-
-    /// A person picks `tag` (Use, an import, the command line): it stays until a person picks
-    /// another, or an update finds it the newest ([`selection_after_install`]).
-    pub fn pick(&mut self, tag: String) {
-        self.selected = Some(tag);
-        self.following = None;
-    }
-
-    /// Remember an explicit approval; merely finding an installed toolchain never grants it.
-    pub fn allow_native_mods(&mut self) -> Result<(), String> {
-        self.native_mods_allowed_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| error.to_string())?
-                .as_secs(),
-        );
-        self.save()
-    }
-
-    /// The saved settings. Only reads: a file from before `following` is migrated in memory
-    /// ([`Settings::adopt_legacy_selection`] against what is installed now), and written as such
-    /// at the next save.
-    pub fn load() -> Self {
-        Self::load_from(&data_dir().join("settings.json"))
-    }
-
-    fn load_from(path: &Path) -> Self {
-        let text = fs::read_to_string(path).unwrap_or_default();
-        Self::from_saved(&text, installed).0
-    }
-
-    /// The saved settings when an install of a version just ended, `before` being what was
-    /// installed before it. A file from before `following` is judged against `before`, as the
-    /// update rule of launchers before it judged it before moving the selection: against the list
-    /// with the new version in it, a follower would read as a pick. [`Settings::apply_install`]
-    /// then decides, and the caller's save writes `following` from then on.
-    pub fn load_for_install(before: &[String]) -> Self {
-        Self::load_for_install_from(&data_dir().join("settings.json"), before)
-    }
-
-    fn load_for_install_from(path: &Path, before: &[String]) -> Self {
-        let text = fs::read_to_string(path).unwrap_or_default();
-        Self::from_saved(&text, || before.to_vec()).0
-    }
-
-    /// The settings saved as `text`, and whether it is a file from before `following`, whose
-    /// selection is then judged against `installed` (read only for such a file).
-    fn from_saved(text: &str, installed: impl FnOnce() -> Vec<String>) -> (Self, bool) {
-        let mut settings = Self::parse(text);
-        let legacy = serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|v| v.as_object().map(|o| !o.contains_key("following")))
-            .unwrap_or(false);
-        if legacy
-            && settings
-                .selected
-                .as_deref()
-                .is_some_and(|s| crate::nightly::date_of(s).is_some())
-        {
-            settings.adopt_legacy_selection(&installed());
-        }
-        (settings, legacy)
-    }
-
-    /// Settles the selection after `tag` was installed for `cause`, `installed` being every
-    /// installed version newest first and `before` the same without `tag`
-    /// ([`selection_after_install`]). True when it changed; the caller saves.
-    pub fn apply_install(
-        &mut self,
-        tag: &str,
-        before: &[String],
-        installed: &[String],
-        cause: InstallCause,
-    ) -> bool {
-        let Some(follow) = selection_after_install(
-            self.selected.as_deref(),
-            self.following.as_deref(),
-            tag,
-            before,
-            installed,
-            cause,
-        ) else {
-            return false;
-        };
-        self.selected = Some(tag.to_owned());
-        self.following = follow.then(|| tag.to_owned());
-        true
-    }
-
-    /// A settings file from before `following`: its selection follows when it is the newest
-    /// installed Nightly. That is exactly when the update rule of launchers before it moved the
-    /// selection on ([`select_after_update`]), so those players keep the behaviour they had; it
-    /// can't tell a pick of the newest from following, and doesn't need to. An older one stays a
-    /// pick.
-    fn adopt_legacy_selection(&mut self, installed: &[String]) {
-        let newest = installed
-            .iter()
-            .find(|t| crate::nightly::date_of(t).is_some());
-        if self.following.is_none() && newest.is_some() && newest == self.selected.as_ref() {
-            self.following = self.selected.clone();
-        }
-    }
-
-    /// Keeps the selection if `installed` (newest first) still has it; else the newest, which
-    /// the launcher chose and so follows. Both fields change together, so a save in between never
-    /// writes one without the other.
-    pub fn keep_installed_selection(&mut self, installed: &[String]) {
-        if self
-            .selected
-            .as_ref()
-            .is_none_or(|s| !installed.contains(s))
-        {
-            self.selected = installed.first().cloned();
-            self.following = self.selected.clone();
-        }
-    }
-    pub fn parse(text: &str) -> Self {
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Self::default();
-        };
-        if let Some(fields) = value.as_object_mut() {
-            // An appearance from a newer launcher is Dark, not a reason to lose every setting.
-            if fields
-                .get("appearance")
-                .is_some_and(|a| serde_json::from_value::<Appearance>(a.clone()).is_err())
-            {
-                fields.remove("appearance");
-            }
-            if fields
-                .get("while_playing")
-                .is_some_and(|w| serde_json::from_value::<WhilePlaying>(w.clone()).is_err())
-            {
-                fields.remove("while_playing");
-            }
-            if fields
-                .get("game_architecture")
-                .is_some_and(|a| serde_json::from_value::<GameArchitecture>(a.clone()).is_err())
-            {
-                fields.remove("game_architecture");
-            }
-            if fields.get("accent").is_some_and(|a| {
-                serde_json::from_value::<crate::themes::Accent>(a.clone()).is_err()
-            }) {
-                fields.remove("accent");
-            }
-            // A glass or blur that isn't a number is the default, not a reason to lose the rest.
-            for key in ["glass", "blur"] {
-                if fields.get(key).is_some_and(|v| !v.is_number()) {
-                    fields.remove(key);
-                }
-            }
-            look_settings::tidy(fields);
-            // A language this launcher doesn't have yet follows the system's.
-            if fields.get("language").is_some_and(|l| {
-                serde_json::from_value::<Option<crate::i18n::Language>>(l.clone()).is_err()
-            }) {
-                fields.remove("language");
-            }
-        }
-        let mut settings: Self = serde_json::from_value(value).unwrap_or_default();
-        look_settings::settle(&mut settings);
-        settings
-    }
-    /// Whether the launcher keeps its entry in the applications menu (Linux).
-    pub fn desktop_entry(&self) -> bool {
-        self.desktop_entry.unwrap_or(true)
-    }
-    /// The window's language: the one picked, else the system's.
-    pub fn language(&self) -> crate::i18n::Language {
-        self.language.unwrap_or_else(crate::i18n::Language::system)
-    }
-    /// Whether new Horizon versions are installed automatically.
-    pub fn auto_install(&self) -> bool {
-        self.install_new_versions.unwrap_or(true)
-    }
-    /// Whether old versions are deleted after an install.
-    pub fn auto_prune(&self) -> bool {
-        self.prune_old_versions.unwrap_or(true)
-    }
-    /// The plates' white as a fraction (0 to 0.16): [`glass`](Self::glass) in percent.
-    pub fn glass_tint(&self) -> f32 {
-        self.glass
-            .filter(|v| v.is_finite())
-            .map_or(horizon_theme::glass::TINT, |v| v.clamp(0., 16.) / 100.)
-    }
-    /// The plates' blur in px (0 to 48).
-    pub fn glass_blur(&self) -> f32 {
-        self.blur
-            .filter(|v| v.is_finite())
-            .map_or(horizon_theme::glass::BLUR, |v| v.clamp(0., 48.))
-    }
-    /// Whether the cheaper scene is on ([`performance`](Self::performance)).
-    pub fn performance(&self) -> bool {
-        self.performance.unwrap_or(false)
-    }
-    /// Registry mods update by themselves ([`Settings::mods_auto_update`]): on unless turned off.
-    pub fn auto_updates_mods(&self) -> bool {
-        self.mods_auto_update.unwrap_or(true)
-    }
-    /// How many of the newest release versions pruning keeps: at least the newest.
-    pub fn keep_newest(&self) -> usize {
-        self.keep_versions.unwrap_or(KEEP_NEWEST).max(1)
-    }
-    pub fn save(&self) -> Result<(), String> {
-        // The window and background jobs share the process's temporary file.
-        static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // A write that stops halfway leaves settings.json unreadable, and `load` answers
-        // defaults for it: the file is replaced only once it is whole.
-        let dir = data_dir();
-        let path = dir.join("settings.json");
-        let tmp = dir.join(format!("settings.{}.tmp", std::process::id()));
-        let json =
-            serde_json::to_vec_pretty(self).map_err(|e| format!("{}: {e}", path.display()))?;
-        let written = fs::create_dir_all(&dir)
-            .and_then(|()| fs::write(&tmp, json))
-            .and_then(|()| fs::rename(&tmp, &path));
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(format!("{}: {e}", path.display()));
-        }
-        Ok(())
-    }
-}
+mod settings;
+pub use settings::{Appearance, Settings, WhilePlaying};
 
 #[cfg(test)]
 #[path = "backend/release_loading_tests.rs"]
@@ -4982,6 +4654,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::failed_removal_is_incomplete_and_can_be_retried"
                 ])
@@ -5039,6 +4712,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_version_whose_client_predates_runtime_leases_is_removed"
                 ])
@@ -5074,9 +4748,13 @@ mod tests {
             Err(crate::native_cache::Error::UnprovenExclusion)
         ));
         assert_eq!(fs::read(cache.join("pack.hpack")).unwrap(), b"whole pack");
+        // Latest now resolves to a different installation.
+        let newer = versions.join("v0.2.0");
+        fs::create_dir(&newer).unwrap();
+        fs::write(newer.join(COMPLETE), b"").unwrap();
         remove_version("v0.1.0").unwrap();
         assert!(!dir.exists());
-        assert!(installed_in(&versions).is_empty());
+        assert_eq!(installed_in(&versions), ["v0.2.0"]);
     }
 
     /// [#18393](https://github.com/horizon-rust/horizon/issues/18393): the proof is the check that
@@ -5091,6 +4769,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_running_legacy_version_is_refused_whole_and_removed_once_it_closes"
                 ])
@@ -5115,6 +4794,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(COMPLETE), b"").unwrap();
         fs::write(dir.join(CLIENT), b"pre-holder game").unwrap();
+        let newer = versions.join("v0.2.0");
+        fs::create_dir(&newer).unwrap();
+        fs::write(newer.join(COMPLETE), b"").unwrap();
         // A running image refuses writes the way the loader's own handle does, which is what the
         // check standing in for the missing lease looks at.
         let running = fs::File::options()
@@ -5127,11 +4809,11 @@ mod tests {
             dir.join(COMPLETE).exists(),
             "the version stays whole for the retry"
         );
-        assert_eq!(installed_in(&versions), vec!["v0.1.0".to_owned()]);
+        assert_eq!(installed_in(&versions), ["v0.2.0", "v0.1.0"]);
         drop(running);
         remove_version("v0.1.0").unwrap();
         assert!(!dir.exists());
-        assert!(installed_in(&versions).is_empty());
+        assert_eq!(installed_in(&versions), ["v0.2.0"]);
     }
 
     /// [#18393](https://github.com/horizon-rust/horizon/issues/18393): the dependency veto belongs
@@ -5143,6 +4825,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::a_version_a_native_build_takes_its_resources_from_is_kept"
                 ])
@@ -5178,6 +4861,9 @@ mod tests {
             ),
         )
         .unwrap();
+        let newer = versions.join("nightly-2026-11-14-aaaaaaa");
+        fs::create_dir(&newer).unwrap();
+        fs::write(newer.join(COMPLETE), b"").unwrap();
         let refused = remove_version("nightly-2026-11-13-9f42064").unwrap_err();
         assert!(refused.contains("native-phone"), "{refused}");
         assert!(
@@ -5480,6 +5166,7 @@ pub fn {f}("
             let home = tempfile::tempdir().unwrap();
             assert!(Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "backend::tests::native_resources_resolve_to_the_base_and_prevent_its_removal",
                     "--nocapture"
@@ -6101,19 +5788,56 @@ pub fn {f}("
         fs::create_dir_all(&game).unwrap();
         fs::write(run.join(GRAPHICS_FILE), "graphicsApi:opengl\n").unwrap();
         fs::write(game.join(GRAPHICS_FILE), "graphicsApi:auto\n").unwrap();
-        assert_eq!(switch_after_start_crash(&run, &game, "dx12"), Ok(false));
+        assert_eq!(
+            switch_after_start_crash(&run, &game, "dx12", "nightly-1"),
+            Ok(false)
+        );
         assert_eq!(
             fs::read_to_string(game.join(GRAPHICS_FILE)).unwrap(),
             "graphicsApi:auto\n"
         );
+        assert!(!run.join(api_fallback::FILE).exists());
+        assert!(!game.join(api_fallback::FILE).exists());
         // On Auto, the run's home and the game home both switch.
         fs::write(run.join(GRAPHICS_FILE), "graphicsApi:auto\n").unwrap();
-        assert_eq!(switch_after_start_crash(&run, &game, "dx12"), Ok(true));
+        assert_eq!(
+            switch_after_start_crash(&run, &game, "dx12", "nightly-1"),
+            Ok(true)
+        );
         for home in [&run, &game] {
             assert_eq!(
                 fs::read_to_string(home.join(GRAPHICS_FILE)).unwrap(),
                 "graphicsApi:dx12\n"
             );
+            // Each home that switched says so, and asks its instance's player about it.
+            let switch = api_fallback::read(home).switch.unwrap();
+            assert_eq!(
+                (
+                    switch.from.as_str(),
+                    switch.to.as_str(),
+                    switch.build.as_str()
+                ),
+                ("auto", "dx12", "nightly-1")
+            );
+            assert!(api_fallback::notice(home, "windows").is_some());
+        }
+        // Linux's switch to OpenGL stays as it was: no record and no notice.
+        for home in [&run, &game] {
+            fs::write(
+                home.join(GRAPHICS_FILE),
+                "graphicsApi:auto
+",
+            )
+            .unwrap();
+            fs::remove_file(home.join(api_fallback::FILE)).unwrap();
+        }
+        assert_eq!(
+            switch_after_start_crash(&run, &game, "opengl", "nightly-1"),
+            Ok(true)
+        );
+        for home in [&run, &game] {
+            assert!(!home.join(api_fallback::FILE).exists());
+            assert_eq!(api_fallback::notice(home, "linux"), None);
         }
         let _ = fs::remove_dir_all(&root);
     }
@@ -7067,20 +6791,19 @@ pub fn {f}("
     }
 
     #[test]
-    fn a_selection_set_on_the_command_line_during_a_download_stays() {
+    fn an_older_launchers_selection_changed_during_a_download_stays() {
         let (n17, n18, n19) = (
             "nightly-2026-11-17-1234567",
             "nightly-2026-11-18-dd67b76",
             "nightly-2026-11-19-f00125f",
         );
-        // The window saw a follower on n18. While n19 downloaded for a pinned instance,
-        // `settings selected-version` saved n17.
+        // The window saw a follower on n18. While n19 downloaded for a pinned instance, an older
+        // launcher saved n17 in the compatibility fields.
         let window = Settings {
             selected: Some(n18.into()),
             following: Some(n18.into()),
             ..Settings::default()
         };
-        // The command saves only `selected`.
         let mut saved = Settings::parse(&serde_json::to_string(&window).unwrap());
         saved.selected = Some(n17.into());
         let mut window = window;
@@ -7102,43 +6825,6 @@ pub fn {f}("
             None
         );
         assert_eq!(window.selected.as_deref(), Some(n17));
-    }
-
-    #[test]
-    fn a_followed_build_picked_again_stays_picked() {
-        let (n18, n19, n20, n21) = (
-            "nightly-2026-11-18-dd67b76",
-            "nightly-2026-11-19-f00125f",
-            "nightly-2026-11-20-0a875da",
-            "nightly-2026-11-21-1111111",
-        );
-        // A follower on n19 picks n18, n20 arrives, then it picks n19 again, now older.
-        let mut settings = Settings {
-            selected: Some(n19.into()),
-            following: Some(n19.into()),
-            ..Settings::default()
-        };
-        settings.pick(n18.into());
-        settings.pick(n19.into());
-        let now = [n21, n20, n19, n18].map(String::from);
-        for instance in [None, Some(true)] {
-            let cause = InstallCause {
-                update: instance.is_none(),
-                instance,
-            };
-            assert_eq!(
-                selection_after_install(
-                    settings.selected.as_deref(),
-                    settings.following.as_deref(),
-                    n21,
-                    &now[1..],
-                    &now,
-                    cause
-                ),
-                None,
-                "{cause:?}"
-            );
-        }
     }
 
     #[test]
@@ -7172,10 +6858,8 @@ pub fn {f}("
         older.adopt_legacy_selection(&[n19.into(), n18.into()]);
         assert_eq!(older.following, None);
         assert_eq!(after(&older), None);
-        // Once saved, a pick reads back as a pick, not as a file from before `following`.
-        let mut picked = Settings::default();
-        picked.pick(n19.into());
-        let text = serde_json::to_string(&picked).unwrap();
+        // An explicit null distinguishes a legacy pick from a file from before `following`.
+        let text = serde_json::to_string(&older).unwrap();
         assert!(text.contains(r#""following":null"#), "{text}");
     }
 
@@ -7247,15 +6931,19 @@ pub fn {f}("
     #[test]
     fn a_removed_selection_moves_to_the_newest_left_which_follows() {
         let left = ["v0.2.49".to_string(), "v0.2.48".to_string()];
-        let mut kept = Settings::default();
-        kept.pick("v0.2.48".into());
+        let mut kept = Settings {
+            selected: Some("v0.2.48".into()),
+            ..Settings::default()
+        };
         kept.keep_installed_selection(&left);
         assert_eq!(
             (kept.selected.as_deref(), kept.following.as_deref()),
             (Some("v0.2.48"), None)
         );
-        let mut gone = Settings::default();
-        gone.pick("v0.2.47".into());
+        let mut gone = Settings {
+            selected: Some("v0.2.47".into()),
+            ..Settings::default()
+        };
         gone.keep_installed_selection(&left);
         assert_eq!(
             (gone.selected.as_deref(), gone.following.as_deref()),
@@ -7264,8 +6952,10 @@ pub fn {f}("
         let mut none = Settings::default();
         none.keep_installed_selection(&left);
         assert_eq!(none.selected.as_deref(), Some("v0.2.49"));
-        let mut empty = Settings::default();
-        empty.pick("v0.2.47".into());
+        let mut empty = Settings {
+            selected: Some("v0.2.47".into()),
+            ..Settings::default()
+        };
         empty.keep_installed_selection(&[]);
         assert_eq!((empty.selected, empty.following), (None, None));
     }
@@ -7465,7 +7155,7 @@ pub fn {f}("
     fn links_fall_back_to_the_built_in_ones() {
         let defaults = Links::default();
         assert_eq!(defaults.discord, "https://discord.gg/playhorizon");
-        assert_eq!(defaults.sponsor, "https://github.com/sponsors/ludovic111");
+        assert_eq!(defaults.sponsor, "https://opencollective.com/horizonrust");
         assert_eq!(defaults.website, "https://playhorizon.dev");
         assert_eq!(
             Links::parse(r#"{"roadmap":"https://example.org/tasks","docs":" "}"#),
@@ -8187,6 +7877,7 @@ pub fn {f}("
         assert!(
             // Lists no test and runs none.
             Command::new(&bin)
+                // reexec_include_ignored: skip, `--list` names no real test and runs none
                 .args(["--list", "--exact", "no test has this name"])
                 .stdout(std::process::Stdio::null())
                 .status()
@@ -8255,6 +7946,8 @@ pub fn {f}("
         fs::write(&exe, "old").unwrap();
         // Another update swaps the file under the running launcher.
         fs::write(dir.join("other"), "other update").unwrap();
+        // Set, not left to the umask: under 0002 the write makes it 0664 (#19730).
+        fs::set_permissions(dir.join("other"), fs::Permissions::from_mode(0o644)).unwrap();
         fs::rename(dir.join("other"), &exe).unwrap();
         fs::write(dir.join("new"), "new").unwrap();
         replace_binary(&dir.join("new"), &exe).unwrap();
@@ -8299,6 +7992,130 @@ pub fn {f}("
             tags(&["v0.2.88", "v0.2.85", "v0.2.80"])
         );
         assert!(stale_versions(&installed, 9, &[], |_| false).is_empty());
+    }
+
+    #[test]
+    fn manual_install_changes_only_the_instance_selected_when_it_started() {
+        use crate::instances;
+        if std::env::var_os("HORIZON_TEST_MANUAL_INSTALL").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args(["--include-ignored", "--exact", "backend::tests::manual_install_changes_only_the_instance_selected_when_it_started"])
+                .env("HORIZON_TEST_MANUAL_INSTALL", "1")
+                .env("HORIZON_LAUNCHER_HOME", root.path().join("launcher"))
+                .env("HORIZON_HOME", root.path().join("game"))
+                .env("HORIZON_LAUNCHER_LOCATION_FILE", root.path().join("location.json"))
+                .status().unwrap().success());
+            return;
+        }
+        let (old, newer, newest) = ("v0.2.90", "v0.2.97", "v0.3.0");
+        let marker = |tag: &str| -> std::io::Result<()> {
+            let dir = version_dir(tag);
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join(CLIENT), b"pre-holder game")?;
+            fs::write(dir.join(COMPLETE), "")
+        };
+        marker(newer).unwrap();
+        marker(newest).unwrap();
+        let first = instances::create("First", None).unwrap();
+        let second = instances::create("Second", None).unwrap();
+        instances::pin_installed_version(&second.id, Some(newest)).unwrap();
+        let install = |tag: &str, while_downloading: &dyn Fn()| {
+            instances::select(&first.id).unwrap();
+            let release = Release {
+                tag: tag.into(),
+                name: tag.into(),
+                body: String::new(),
+                date: String::new(),
+                time: String::new(),
+                asset: Some(("fixture".into(), 1)),
+                prerelease: false,
+                nightly: None,
+            };
+            install_tag_with(
+                tag,
+                false,
+                || Ok(vec![release]),
+                |release| {
+                    instances::select(&second.id)?;
+                    while_downloading();
+                    marker(&release.tag).map_err(|e| e.to_string())
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(install(old, &|| {}), old);
+        assert_eq!(
+            instances::find(&first.id).unwrap().version.as_deref(),
+            Some(old)
+        );
+        assert_eq!(instances::selected().version.as_deref(), Some(newest));
+        assert_eq!(install(newest, &|| {}), newest);
+        assert_eq!(instances::find(&first.id).unwrap().version, None);
+        assert_eq!(instances::selected().version.as_deref(), Some(newest));
+
+        // The old build was eligible for pruning once the original instance stopped playing it.
+        assert!(!is_installed(old));
+        let delete_first = || fs::remove_dir_all(&first.home).unwrap();
+        let replace_first = || {
+            delete_first();
+            let replacement = instances::create("First", None).unwrap();
+            assert_eq!(replacement.id, first.id);
+            instances::manual_install_target(replacement.id).unwrap();
+        };
+        assert_eq!(install(old, &replace_first), old);
+        assert_eq!(instances::find(&first.id).unwrap().version, None);
+        assert_eq!(instances::selected().version.as_deref(), Some(newest));
+        assert!(is_installed(old));
+
+        assert_eq!(install(old, &delete_first), old);
+        assert!(instances::find(&first.id).is_err());
+        assert_eq!(instances::selected().version.as_deref(), Some(newest));
+        assert!(is_installed(old));
+    }
+
+    #[test]
+    fn pruning_rechecks_candidates_after_an_instance_pins_one() {
+        let Some(root) = std::env::var_os("PRUNE_INSTANCE_TEST_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            assert!(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--include-ignored",
+                    "--exact",
+                    "backend::tests::pruning_rechecks_candidates_after_an_instance_pins_one"
+                ])
+                .env("PRUNE_INSTANCE_TEST_ROOT", root.path())
+                .env("HORIZON_LAUNCHER_HOME", root.path())
+                .env("HORIZON_HOME", root.path().join("game"))
+                .env(
+                    "HORIZON_LAUNCHER_LOCATION_FILE",
+                    root.path().join("location.json")
+                )
+                .status()
+                .unwrap()
+                .success());
+            return;
+        };
+        let latest = "nightly-2026-11-22-aaaaaaa";
+        let newly_pinned = "nightly-2026-11-21-bbbbbbb";
+        let unused = "nightly-2026-11-20-ccccccc";
+        for tag in [latest, newly_pinned, unused] {
+            let dir = version_dir(tag);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(COMPLETE), b"").unwrap();
+            fs::write(dir.join(CLIENT), b"pre-holder game").unwrap();
+            mark_auto_installed(tag).unwrap();
+        }
+        let installed = installed();
+        let protected =
+            crate::instances::protected_versions(&installed, &Settings::default()).unwrap();
+        let candidates = stale_versions(&installed, 1, &protected, auto_installed);
+        assert_eq!(candidates, [newly_pinned, unused]);
+
+        crate::instances::use_version_for(crate::instances::DEFAULT, newly_pinned).unwrap();
+        assert_eq!(prune_versions(candidates), [unused]);
+        assert!(version_dir(newly_pinned).join(COMPLETE).is_file());
+        assert!(!PathBuf::from(root).join("versions").join(unused).exists());
     }
 
     #[test]

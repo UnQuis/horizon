@@ -18,6 +18,8 @@ pub enum CustomArgumentKind {
     Word,
     /// The rest of the line, spaces included.
     Greedy,
+    /// One token: every character up to the next space or the end of the line, at least one.
+    Token,
 }
 
 /// One completion a registered custom argument offers.
@@ -219,6 +221,8 @@ pub enum ArgType {
     SlotSource,
     /// ResourceOrIdArgument over a registry: an id or an inline SNBT value.
     ResourceOrId(&'static str),
+    /// A received loot table argument: the server owns the registry and codec lookup.
+    ServerLootTable,
     /// ResourceSelectorArgument: a `*`/`?` pattern over a registry's ids.
     ResourceSelector(&'static str),
     /// A registered argument type: the mod's parser and suggestions.
@@ -698,11 +702,29 @@ pub fn read_double_bounds(reader: &mut Reader) -> CmdResult<DoubleRange> {
 }
 /// MinMaxBounds.FloatDegrees.fromReader (no swap check).
 pub fn read_float_bounds(reader: &mut Reader) -> CmdResult<(Option<f32>, Option<f32>)> {
-    read_bounds(
-        reader,
-        |s| java_parse_double(s).map(|v| v as f32),
-        "parsing.float.invalid",
-    )
+    read_bounds(reader, parse_float_bound, "parsing.float.invalid")
+}
+/// Java float parsing (`Float.parseFloat`) in a single IEEE-754 rounding over the
+/// characters `read_bounds` admits (`[0-9.-]`).
+fn parse_float_bound(s: &str) -> Option<f32> {
+    let body = s.strip_prefix('-').unwrap_or(s);
+    let mut chars = body.chars().peekable();
+    let mut digits = 0;
+    while chars.peek().is_some_and(char::is_ascii_digit) {
+        chars.next();
+        digits += 1;
+    }
+    if chars.peek() == Some(&'.') {
+        chars.next();
+        while chars.peek().is_some_and(char::is_ascii_digit) {
+            chars.next();
+            digits += 1;
+        }
+    }
+    if digits == 0 || chars.next().is_some() {
+        return None;
+    }
+    s.parse::<f32>().ok()
 }
 /// Java integer parsing over number characters.
 pub fn java_parse_int(s: &str) -> Option<i32> {
@@ -1887,6 +1909,10 @@ impl ArgType {
                 super::codec::resource_or_id(reader, reg, registry)?;
                 Arg::Resource(reader.string[start..reader.cursor].to_owned())
             }
+            ArgType::ServerLootTable => {
+                super::codec::resource_or_id_syntax(reader)?;
+                Arg::Resource(reader.string[start..reader.cursor].to_owned())
+            }
             ArgType::NbtPath => {
                 parse_nbt_path(reader)?;
                 Arg::Str(reader.string[start..reader.cursor].to_owned())
@@ -1917,6 +1943,17 @@ impl ArgType {
                         let text = reader.remaining().to_owned();
                         reader.cursor = reader.string.len();
                         text
+                    }
+                    CustomArgumentKind::Token => {
+                        let token = reader.read_token().to_owned();
+                        if token.is_empty() {
+                            return Err(CommandError::tr_at(
+                                "parsing.expected",
+                                &[&"a token"],
+                                reader,
+                            ));
+                        }
+                        token
                     }
                 };
                 match (custom.parse)(&text) {
@@ -2105,7 +2142,7 @@ impl ArgType {
             }
             ArgType::Anchor => builder.suggest_matching(["eyes", "feet"]),
             ArgType::Component | ArgType::Style | ArgType::NbtTag => super::snbt::suggest(builder),
-            ArgType::Swizzle | ArgType::Message | ArgType::Nbt => {}
+            ArgType::Swizzle | ArgType::Message | ArgType::Nbt | ArgType::ServerLootTable => {}
             ArgType::Custom(custom) => {
                 let prefix = builder.remaining().to_owned();
                 for suggestion in (custom.suggest)(reg, &prefix) {
@@ -2132,5 +2169,31 @@ impl ArgType {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_float_bounds_avoids_double_rounding() {
+        // Strictly below the f32 midpoint 16777219.0 (between 16777218 and 16777220):
+        // f64 rounds up to 16777219.0 and casting to f32 then ties-to-even up to 16777220.0,
+        // whereas single-rounding Float.parseFloat lands on 16777218.0.
+        let boundary = "16777218.9999999999";
+        assert_eq!(
+            java_parse_double(boundary).map(|v| v as f32),
+            Some(16_777_220.0)
+        );
+        let mut reader = Reader::new(boundary);
+        assert_eq!(
+            read_float_bounds(&mut reader).unwrap(),
+            (Some(16_777_218.0), Some(16_777_218.0))
+        );
+        // Reject malformed bound tokens that read_bounds can slice.
+        assert_eq!(parse_float_bound("."), None);
+        assert_eq!(parse_float_bound("-."), None);
+        assert_eq!(parse_float_bound("1.2.3"), None);
     }
 }

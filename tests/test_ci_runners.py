@@ -10,11 +10,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,7 +29,8 @@ FORK_GUARD = "github.event.pull_request.head.repo.full_name == github.repository
 VERIFY_PARTS = ("verify-scope", "verify-tree", "verify-lint", "verify-server", "verify-launcher", "verify-test",
                 "verify-mod-api")
 WINDOWS_WASM_JOB = "verify-windows-wasm-cache"
-VERIFY_NEEDS = (*VERIFY_PARTS, WINDOWS_WASM_JOB)
+# native-clippy runs on hosted Windows/macOS, so verify judges it alongside the pooled parts above.
+VERIFY_NEEDS = (*VERIFY_PARTS, WINDOWS_WASM_JOB, "native-clippy")
 # On Windows the bash on PATH is Git's; a bare "bash" there would be WSL's (tests/test_pr_ready.py).
 BASH = shutil.which("bash")
 # verify's parts: our checks runners only with SELF_HOSTED_CI=all, Blacksmith's otherwise.
@@ -221,7 +225,10 @@ class HostedParityTests(unittest.TestCase):
         # Sealing comes after the harnesses: on main only, whose code it is.
         self.assertGreater(self.names.index("Seal for the caches"), self.names.index("The shard's harnesses"))
         self.assertIn("needs.plan.outputs.saves == 'true'", self.step("Seal for the caches")["if"])
-        self.assertEqual(set(self.workflow[True]), {"workflow_dispatch"})
+        # Pushes to main and hand starts; never a pull request's event, which would run another's code beside the
+        # secrets (pull_request_target reports main's ref).
+        self.assertEqual(set(self.workflow[True]), {"workflow_dispatch", "push"})
+        self.assertEqual(self.workflow[True]["push"], {"branches": ["main"]})
         # The default branch's commit, resolved in the plan job, where no cache entry is restored.
         trusted = self.step("The commit of the trusted scripts", self.plan)
         self.assertEqual(trusted["env"]["DEFAULT"], "${{ github.event.repository.default_branch }}")
@@ -380,8 +387,8 @@ class HostedParityTests(unittest.TestCase):
     def test_the_plans_key_values_are_checked_before_they_name_anything(self):
         # They come from the tested tree (the plan job): the step's own check, run with good and bad values.
         script = self.step("Cache keys")["run"].split("\nh() {", 1)[0]
-        good = {"GROUP": "game+client", "JAVA_MAJOR": "25", "LOCK": "0123456789ab", "PREPARE": "0123456789abcdef"}
-        bad = [("GROUP", "game/../x"), ("GROUP", ""), ("JAVA_MAJOR", "25 x"), ("LOCK", "0123456789aB"),
+        good = {"GROUP": "game+client", "JAVA_MAJOR": "25", "PREPARE": "0123456789abcdef"}
+        bad = [("GROUP", "game/../x"), ("GROUP", ""), ("JAVA_MAJOR", "25 x"),
                ("PREPARE", "0123456789abcdef0"), ("PREPARE", "../../etc")]
         def run(values):
             return subprocess.run([BASH, "-c", script], env={**os.environ, **values}, capture_output=True).returncode
@@ -417,12 +424,15 @@ class HostedParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "output"
             env = {**os.environ, "DIGEST": "0123456789abcdef", "BUILD": "parity-build-v2-other-r-l-",
-                   "ORACLE": "j-r-f-other-", "PREPARE": "fedcba9876543210", "COMMIT": "c" * 40, "SHARD": "2",
+                   "ORACLE": "j-r-f-other-", "PREPARE": "fedcba9876543210", "SHARD": "2",
                    "GITHUB_OUTPUT": str(output)}
             subprocess.run([BASH, "-c", self.step("Keys of the sealed entries")["run"]], env=env, check=True)
             keys = dict(line.split("=", 1) for line in output.read_text().splitlines())
-        self.assertEqual(keys["oracle"], keys["oracle_prefix"] + "c" * 40 + "-2")
-        self.assertEqual(keys["build"], keys["build_prefix"] + "c" * 40)
+        # The week, not the commit: one entry per week, never one per commit (a key is never overwritten).
+        self.assertRegex(keys["oracle"], "^" + re.escape(keys["oracle_prefix"]) + r"\d{4}-w\d{2}-2$")
+        self.assertRegex(keys["build"], "^" + re.escape(keys["build_prefix"]) + r"\d{4}-w\d{2}$")
+        self.assertEqual(keys["build"].rsplit("-", 1)[1], keys["oracle"].rsplit("-", 2)[1])
+        self.assertNotIn("github.sha", repr(self.step("Keys of the sealed entries")))
 
     @unittest.skipUnless(BASH, "needs bash")
     def test_only_mains_runs_save(self):
@@ -519,6 +529,272 @@ class HostedParityTests(unittest.TestCase):
             if name.name != "parity-hosted.yml":
                 self.assertNotIn("PARITY_REPAIR_ORACLE_HASHES", name.read_text(encoding="utf-8"), name.name)
 
+    def test_mains_runs_queue_one_at_a_time_and_hand_runs_stay_apart(self):
+        # GitHub keeps one run in progress and one waiting per group (the newest); cancelling a run in progress would
+        # leave main without a verdict while it merges every few minutes.
+        concurrency = self.workflow["concurrency"]
+        self.assertIs(concurrency["cancel-in-progress"], False)
+        self.assertEqual(concurrency["group"], "${{ github.event.inputs && format('parity-hosted-dispatch-{0}', "
+                                               "github.run_id) || 'parity-hosted-main' }}")
+        for name, job in self.workflow["jobs"].items():
+            self.assertNotIn("concurrency", job, name)
+
+    @unittest.skipUnless(BASH, "needs bash")
+    def test_a_push_plans_every_harness_and_tests_its_own_commit(self):
+        # The plan step's selection, with tools/parity_plan.py replaced by a stub that prints its arguments.
+        run = self.step("The harnesses, in shards by probe", self.plan)["run"].split("\npython3 - <<'EOF'", 1)[0]
+        with tempfile.TemporaryDirectory() as folder:
+            stub = Path(folder) / "python3"
+            stub.write_text('#!/bin/sh\necho "$@"\n')
+            stub.chmod(0o755)
+            def plan(**values):
+                output = Path(folder) / "output"
+                output.write_text("")
+                env = {**os.environ, "PATH": f"{folder}{os.pathsep}{os.environ['PATH']}", "RUNNER_TEMP": folder,
+                       "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": f"{folder}/summary", "HARNESSES": "",
+                       "BASE_SHA": "", "FULL": "", "EVENT": "workflow_dispatch", **values}
+                result = subprocess.run([BASH, "-c", run], env=env, capture_output=True, text=True)
+                return result.returncode, result.stdout.strip(), output.read_text()
+            hosted = "tools/parity_plan.py --hosted"
+            self.assertEqual(plan(EVENT="push"),
+                             (0, f"{hosted} --known-failing --plan {folder}/plan.json -- --all", "full=true\n"))
+            self.assertEqual(plan(FULL="true")[1], f"{hosted} --known-failing --plan {folder}/plan.json -- --all")
+            self.assertEqual(plan(HARNESSES="food light", FULL="true"),
+                             (0, f"{hosted} --plan {folder}/plan.json -- food light", "full=false\n"))
+            self.assertEqual(plan(BASE_SHA="abc")[1], f"{hosted} --plan {folder}/plan.json -- --changed abc")
+            self.assertEqual(plan()[0], 1)
+        merge = self.step("The head merged into main (what merging it would land)", self.plan)
+        self.assertEqual(merge["env"]["EVENT"], "${{ github.event_name }}")
+        self.assertIn('if [ "$EVENT" = push ]; then\n  { echo "base="; echo "main="; }', merge["run"])
+
+    def result_program(self):
+        steps = self.workflow["jobs"]["result"]["steps"]
+        return re.search(r"<<'EOF'.*?\n(.*)\nEOF", self.step("Passed or failed, and what was not run here", steps)["run"],
+                         re.S).group(1)
+
+    KNOWN = {"datafix": ["datafix#1", "datafix#2"], "sculk": ["sculk"], "crafter": ["crafter"]}
+
+    def verdict(self, results, **values):
+        """The result job's program over results-<shard>.json files: (exit code, summary, verdict record)."""
+        matrix = {"include": [{"shard": 1, "harnesses": "food light datafix#1"},
+                              {"shard": 2, "harnesses": "sculk datafix#2 crafter"}]}
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "logs").mkdir()
+            for shard, records in results.items():
+                (Path(folder) / "logs" / f"results-{shard}.json").write_text(json.dumps(records))
+            env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+                   "RUNNER_TEMP": folder, "GITHUB_RUN_ID": "7", "PLAN": "success", "DATA": "true", "RUN": "success",
+                   "SHARDS": "2", "LEFT_OUT": json.dumps({"music": "needs the vanilla sounds"}),
+                   "MATRIX": json.dumps(matrix), "KNOWN_FAILING": json.dumps(self.KNOWN),
+                   "FULL": "true", "HEAD_SHA": "a" * 40, "MAIN_SHA": "", "EVENT": "push", "REF": "refs/heads/main",
+                   "LOGS": "success", "SPACING": "success", "DUE": "true", "WHY": "", **values}
+            result = subprocess.run([sys.executable, "-c", self.result_program()], env=env, capture_output=True,
+                                    text=True, encoding="utf-8")
+            path = Path(folder) / "verdict" / "verdict.json"
+            record = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        line = [line for line in result.stderr.splitlines() if line.startswith("parity-hosted-verdict ")]
+        self.assertEqual([json.loads(line[0].split(" ", 1)[1])] if line else [None], [record])
+        return result.returncode, result.stdout, record
+
+    PASS = {"status": "pass", "retried": False}
+
+    def test_the_verdict_names_what_failed_retried_did_not_finish_and_can_come_off(self):
+        code, summary, record = self.verdict({
+            1: {"food": {"status": "pass", "retried": True}, "light": {"status": "fail", "retried": True},
+                "datafix#1": self.PASS},
+            2: {"sculk": self.PASS, "crafter": {"status": "fail", "retried": False}, "stray": self.PASS}})
+        self.assertEqual(code, 1)
+        self.assertEqual({key: record[key] for key in ("run", "event", "commit", "merged_into_main", "selection",
+                                                       "passed", "planned", "harnesses_passed", "failed",
+                                                       "passed_on_retry", "known_failing_failed",
+                                                       "known_failing_passed", "known_failing_passed_where_run",
+                                                       "did_not_finish", "left_out")},
+                         {"run": "7", "event": "push", "commit": "a" * 40, "merged_into_main": None,
+                          "selection": "full", "passed": False, "planned": 6, "harnesses_passed": 3,
+                          "failed": ["light"], "passed_on_retry": ["food"], "known_failing_failed": ["crafter"],
+                          # datafix#2 did not finish: datafix cannot come off on half its shards.
+                          "known_failing_passed": ["sculk"], "known_failing_passed_where_run": ["datafix"],
+                          "did_not_finish": ["datafix#2"], "left_out": {"music": "needs the vanilla sounds"}})
+        self.assertEqual(record["verdict"], "FAILED: incomplete: no result for 1 planned harnesses (datafix#2)")
+        self.assertIn(f"Commit: `{'a' * 40}`", summary)
+        self.assertIn("- failed: light\n", summary)
+        self.assertIn("- music: needs the vanilla sounds\n", summary)
+        self.assertNotIn("stray", summary)
+
+    def every(self):
+        return {1: {name: self.PASS for name in ("food", "light", "datafix#1")},
+                2: {name: self.PASS for name in ("sculk", "datafix#2", "crafter")}}
+
+    def test_a_clean_full_run_passes_and_unknown_lists_are_never_empty_ones(self):
+        code, summary, record = self.verdict(self.every())
+        self.assertEqual((code, record["passed"], record["known_failing_passed"]), (0, True,
+                                                                                  ["crafter", "datafix", "sculk"]))
+        self.assertIn("Hosted parity passed: 2 shards.", summary)
+        code, _, record = self.verdict({}, RUN="failure", LOGS="failure")
+        self.assertEqual((code, record["passed"]), (1, False))
+        code, summary, record = self.verdict({}, DATA="false", PLAN="success", MATRIX="")
+        self.assertEqual((code, record["planned"]), (1, 0))
+        self.assertIn("no access to the data", summary)
+
+    def test_every_shard_green_is_not_a_pass_without_every_planned_result(self):
+        # The shards' files did not download: nothing is known, so the verdict is incomplete, never a pass.
+        code, summary, record = self.verdict(self.every(), LOGS="failure")
+        self.assertEqual((code, record["passed"], record["failed"], record["did_not_finish"]), (1, False, None, None))
+        self.assertEqual(record["verdict"], "FAILED: incomplete: the shards' results could not be downloaded")
+        self.assertIn("could not be downloaded", summary)
+        # Downloaded, but one planned harness has no record: incomplete, naming it.
+        results = self.every()
+        del results[2]["crafter"]
+        code, summary, record = self.verdict(results)
+        self.assertEqual((code, record["passed"], record["did_not_finish"]), (1, False, ["crafter"]))
+        self.assertEqual(record["verdict"], "FAILED: incomplete: no result for 1 planned harnesses (crafter)")
+
+    def test_a_known_failing_row_comes_off_only_when_every_shard_it_covers_passed(self):
+        # datafix#3 was left out of the plan (as hosted excludes leave shards out): passing #1 and #2 is not enough.
+        known = {**self.KNOWN, "datafix": ["datafix#1", "datafix#2", "datafix#3"]}
+        code, summary, record = self.verdict(self.every(), KNOWN_FAILING=json.dumps(known))
+        self.assertEqual((code, record["known_failing_passed"], record["known_failing_passed_where_run"]),
+                         (0, ["crafter", "sculk"], ["datafix"]))
+        self.assertIn("- known failing, passed where run, not all shards: datafix\n", summary)
+
+    def test_left_out_reasons_are_one_escaped_line_in_the_summary_and_kept_in_the_json(self):
+        reason = "line one\n- **fake**: <b>x</b> `y` [z](https://example.invalid)"
+        code, summary, record = self.verdict(self.every(), LEFT_OUT=json.dumps({"music": reason}))
+        self.assertEqual(code, 0)
+        self.assertEqual(record["left_out"], {"music": reason})
+        lines = [line for line in summary.splitlines() if "fake" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("- music: line one\\\\n\\- \\*\\*fake\\*\\*: \\<b\\>x\\</b\\>"), lines[0])
+        for raw in ("<b>", "**fake**", "`y`", "[z]"):
+            self.assertNotIn(raw, summary)
+
+    def test_a_shard_reports_only_the_records_its_own_run_finished(self):
+        # The restored state holds main's earlier records: one finished before this run's harnesses started is not
+        # this run's, and a harness with none does not appear (the verdict says it did not finish).
+        program = re.search(r"<<'EOF'\n(.*)\nEOF", self.step("The logs to keep")["run"], re.S).group(1)
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            (folder / ".local/parity-runner/logs").mkdir(parents=True)
+            marker = folder / "harnesses-started"
+            marker.touch()
+            started = marker.stat().st_mtime
+            def at(offset):
+                return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started + offset))
+            records = {"food": {"status": "pass", "finished": at(5), "retried": "known flaky"},
+                       "light": {"status": "fail", "finished": at(5)},
+                       "sculk": {"status": "pass", "finished": at(-3600)},
+                       "other": {"status": "pass", "finished": at(5)}}
+            (folder / ".local/parity-runner/state.json").write_text(json.dumps({"harnesses": records}))
+            env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+                   "RUNNER_TEMP": str(folder), "HARNESSES": "food light sculk crafter", "SHARD": "3"}
+            subprocess.run([sys.executable, "-c", program], cwd=folder, env=env, check=True)
+            written = json.loads((folder / "parity-hosted-logs/results-3.json").read_text())
+            self.assertEqual(written, {"food": {"status": "pass", "retried": True},
+                                       "light": {"status": "fail", "retried": False}})
+            marker.unlink()
+            subprocess.run([sys.executable, "-c", program], cwd=folder, env=env, check=True)
+            self.assertEqual(json.loads((folder / "parity-hosted-logs/results-3.json").read_text()), {})
+
+    def test_a_run_the_spacing_job_skips_passes_with_one_line_and_leaves_no_verdict(self):
+        why = "skipped: the last full run on main started at 2026-11-23T10:00:00Z, less than 3 h ago"
+        code, summary, record = self.verdict({}, DUE="false", WHY=why, PLAN="skipped", RUN="skipped", DATA="")
+        self.assertEqual((code, record, summary.strip()), (0, None, f"Hosted parity not run: {why}"))
+        code, summary, record = self.verdict({}, SPACING="failure", DUE="", PLAN="skipped", RUN="skipped", DATA="")
+        self.assertEqual((code, record["passed"]), (1, False))
+        self.assertIn("the spacing job ended failure", summary)
+
+    def test_the_spacing_job_holds_no_secret_and_reads_only_the_run_list(self):
+        job = self.workflow["jobs"]["spacing"]
+        self.assertEqual(job["permissions"], {"actions": "read"})
+        self.assertNotIn("secrets.", repr(job))
+        for step in job["steps"]:
+            self.assertFalse(re.match(r"actions/(checkout|cache)", step.get("uses", "")), step)
+        self.assertEqual(self.workflow["jobs"]["plan"]["needs"], "spacing")
+        self.assertEqual(self.workflow["jobs"]["plan"]["if"], "needs.spacing.outputs.go == 'true'")
+        # The other jobs keep the workflow's contents: read alone.
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        self.assertEqual([name for name, body in self.workflow["jobs"].items() if "permissions" in body], ["spacing"])
+        marker = self.step("Mark this full run's start", job["steps"])
+        self.assertEqual(marker["with"]["name"], "parity-hosted-full-start")
+        self.assertEqual(marker["if"], "steps.spacing.outputs.marker == 'true'")
+
+    @unittest.skipUnless(BASH, "needs bash")
+    def test_a_push_runs_in_full_only_three_hours_after_the_last_full_push(self):
+        step = self.step("Whether this run is due", self.workflow["jobs"]["spacing"]["steps"])
+        run = step["run"]
+        literal = {name: str(value) for name, value in step["env"].items() if "${{" not in str(value)}
+        self.assertEqual(literal, {"SPACING_HOURS": "3", "MARKER": "parity-hosted-full-start",
+                                   "WORKFLOW": ".github/workflows/parity-hosted.yml"})
+        # The marker's own run is asked for: this workflow file, a push, main, this repository.
+        for check in ('.workflow_run.head_branch == \\"main\\"', ".workflow_run.head_repository_id == $REPO_ID",
+                      '.path == \\"$WORKFLOW\\"', '.event == \\"push\\"', '.head_branch == \\"main\\"',
+                      ".repository.id == $REPO_ID", ".head_repository.id == $REPO_ID",
+                      'gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1"'):
+            self.assertIn(check, run)
+        now = time.time()
+        def stamp(offset):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + offset))
+        # `gh api` answering the artifact list with GH_LIST and a run with "ours" when its id is in GH_OURS; FAIL
+        # makes that call fail.
+        stub_text = ('#!/bin/sh\ncase "$2" in\n'
+                     '  *actions/artifacts*) [ "$GH_LIST" = FAIL ] && exit 1; printf \'%s\\n\' "$GH_LIST" ;;\n'
+                     '  *actions/runs/*) [ "$GH_OURS" = FAIL ] && exit 1\n'
+                     '    case " $GH_OURS " in *" ${2##*/} "*) echo ours ;; esac ;;\nesac\n')
+        with tempfile.TemporaryDirectory() as folder:
+            stub = Path(folder) / "gh"
+            stub.write_text(stub_text)
+            stub.chmod(0o755)
+            def due(markers, ours="", **values):
+                """(go, marker, why) with these "<created> <run id>" markers, of which the runs OURS are this
+                workflow's pushes to main."""
+                output = Path(folder) / "output"
+                output.write_text("")
+                env = {**os.environ, "PATH": f"{folder}{os.pathsep}{os.environ['PATH']}", "RUNNER_TEMP": folder,
+                       "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": f"{folder}/summary",
+                       "GITHUB_REPOSITORY": "owner/repo", "GITHUB_SHA": "a" * 40, "GH_TOKEN": "token",
+                       "EVENT": "push", "REPO_ID": "123", "RUN_ID": "456", **literal,
+                       "GH_LIST": markers if isinstance(markers, str) else "\n".join(markers), "GH_OURS": ours,
+                       **values}
+                subprocess.run([BASH, "-c", run], env=env, check=True, capture_output=True)
+                lines = dict(line.split("=", 1) for line in output.read_text().splitlines())
+                return lines["go"], lines["marker"], lines["why"]
+            self.assertEqual(due("FAIL", EVENT="workflow_dispatch")[:2], ("true", "false"))
+            self.assertEqual(due("")[:2], ("true", "true"))
+            self.assertEqual(due([f"{stamp(-4 * 3600)} 11"], "11")[:2], ("true", "true"))
+            go, marker, why = due([f"{stamp(-4 * 3600)} 11", f"{stamp(-3600)} 12"], "11 12")
+            self.assertEqual((go, marker), ("false", "false"))
+            self.assertIn(f"the first push after {stamp(2 * 3600)[:13]}", why)
+            # A newer marker from a run that is not this workflow's push to main (another workflow) holds nothing back.
+            self.assertEqual(due([f"{stamp(-3600)} 99", f"{stamp(-4 * 3600)} 11"], "11")[:2], ("true", "true"))
+            self.assertEqual(due([f"{stamp(-3600)} 99"], "")[:2], ("true", "true"))
+            # Whatever cannot be read skips the run: never towards running.
+            for markers, ours, values in (("FAIL", "", {}), ([f"{stamp(-3600)} 12"], "FAIL", {}),
+                                          (["yesterday 11"], "11", {}), ([f"{stamp(-3600)} go=true"], "", {}),
+                                          ("", "", {"REPO_ID": ""}), ("", "", {"RUN_ID": "1 or 1"})):
+                with self.subTest(markers=markers, ours=ours, **values):
+                    self.assertEqual(due(markers, ours, **values)[:2], ("false", "false"))
+
+    def test_solo_harnesses_run_alone_on_the_cpu_drawn_hosted_runners(self):
+        # The runners have 16 CPUs, past tools/parity.py's own solo threshold, but draw game windows on the CPU.
+        self.assertEqual(self.workflow["jobs"]["run"]["env"]["PARITY_SOLO"], "1")
+        sys.path.insert(0, str(ROOT / "tools"))
+        import parity
+        with mock.patch.dict(os.environ, {"PARITY_SOLO": "1"}):
+            self.assertEqual(parity.solo_harnesses({"solo": {"remote_fireball": "two windows"}}), {"remote_fireball"})
+
+    def test_the_crates_are_fetched_before_any_harness_and_after_the_secret_steps(self):
+        # A fresh runner has no crates: a harness running cargo --offline failed in a second when it ran before any
+        # other had fetched them (mob_discard, 2026-11-23). Fetching runs no build script and holds no secret.
+        fetch = self.names.index("The crates, before the harnesses")
+        checkout = next(index for index, name in enumerate(self.names) if name.startswith("actions/checkout@"))
+        self.assertLess(checkout, fetch)
+        self.assertLess(fetch, self.names.index("The shard's harnesses"))
+        for name in self.SECRET_STEPS[:2]:
+            self.assertLess(self.names.index(name), fetch, name)
+        step = self.steps[fetch]
+        self.assertEqual(step["run"], "cargo fetch --locked")
+        self.assertNotIn("env", step)
+
     def test_no_required_check_waits_for_it(self):
         for path in sorted(WORKFLOWS.glob("*.yml")):
             if path.name != "parity-hosted.yml":
@@ -531,9 +807,9 @@ class VerifyGateTests(unittest.TestCase):
     """verify, the check main requires, when verify-scope leaves a part out (#18843): a part left out passes, and one
     that failed, was cancelled or was never decided for fails."""
 
-    PASSED = {"SCOPE": "success", "TREE": "success", "LINT": "success", "SERVER": "success", "LAUNCHER": "success",
-              "TEST": "success", "MODAPI": "success", "EVENT": "pull_request", "RUST_ANSWER": "true",
-              "LAUNCHER_ANSWER": "true", "MODAPI_ANSWER": "true",
+    PASSED = {"SCOPE": "success", "TREE": "success", "LINT": "success", "NATIVE": "success", "SERVER": "success",
+              "LAUNCHER": "success", "TEST": "success", "MODAPI": "success", "EVENT": "pull_request",
+              "RUST_ANSWER": "true", "LAUNCHER_ANSWER": "true", "MODAPI_ANSWER": "true",
               "WINDOWS_WASM_CACHE": "success", "WINDOWS_WASM_CACHE_ANSWER": "true"}
     # Each part verify-scope can leave out: its result's variable, its job, the answer that decides it, that answer's
     # output, and whether the merge queue leaves the part out too.
@@ -566,7 +842,8 @@ class VerifyGateTests(unittest.TestCase):
         # Without always() a failed or skipped part would skip verify, which GitHub counts as passed.
         self.assertEqual(self.jobs["verify"]["if"], "always()")
         for name, part in [("SCOPE", "verify-scope"), ("TREE", "verify-tree"), ("LINT", "verify-lint"),
-                           ("SERVER", "verify-server"), ("LAUNCHER", "verify-launcher"), ("TEST", "verify-test"),
+                           ("NATIVE", "native-clippy"), ("SERVER", "verify-server"),
+                           ("LAUNCHER", "verify-launcher"), ("TEST", "verify-test"),
                            ("MODAPI", "verify-mod-api"), ("WINDOWS_WASM_CACHE", WINDOWS_WASM_JOB)]:
             self.assertEqual(self.gate["env"][name], "${{ needs.%s.result }}" % part)
         self.assertEqual(self.gate["env"]["EVENT"], "${{ github.event_name }}")
@@ -663,8 +940,8 @@ class VerifyGateTests(unittest.TestCase):
             with self.subTest(part=name):
                 self.assertTrue(self.passes(**{name: "skipped", answer: "false"}))
         # All of them at once: a pull request that changes only documentation.
-        self.assertTrue(self.passes(LINT="skipped", SERVER="skipped", LAUNCHER="skipped", TEST="skipped",
-                                    MODAPI="skipped", RUST_ANSWER="false", LAUNCHER_ANSWER="false",
+        self.assertTrue(self.passes(LINT="skipped", NATIVE="skipped", SERVER="skipped", LAUNCHER="skipped",
+                                    TEST="skipped", MODAPI="skipped", RUST_ANSWER="false", LAUNCHER_ANSWER="false",
                                     MODAPI_ANSWER="false", WINDOWS_WASM_CACHE="skipped",
                                     WINDOWS_WASM_CACHE_ANSWER="false"))
 
@@ -707,7 +984,8 @@ class VerifyGateTests(unittest.TestCase):
                                                  MODAPI_ANSWER=""))
 
     def test_the_merge_queue_shape_passes(self):
-        self.assertTrue(self.passes(EVENT="merge_group", LINT="skipped", SERVER="skipped", LAUNCHER="skipped"))
+        self.assertTrue(self.passes(EVENT="merge_group", LINT="skipped", NATIVE="skipped", SERVER="skipped",
+                                    LAUNCHER="skipped"))
 
     def test_the_merge_queue_still_runs_the_rust_tests_and_mod_api(self):
         # Their `if`s don't leave the merge queue out and verify-scope answers true there, so a skip is no decision.
@@ -854,6 +1132,71 @@ class TryRunTests(unittest.TestCase):
         self.assertIn("retention-days: 3", block)
         # Not the workflow's actions: read.
         self.assertIn("    permissions:\n      contents: read\n", block)
+
+
+class NativeClippyTests(unittest.TestCase):
+    """native-clippy lints the platform-specific crates on hosted Windows and macOS. It follows verify-lint's Rust
+    answer, and the required verify aggregate judges it like the other parts that may be left out."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "tools/ci/vendor/pyyaml-6.0.3.zip"))
+        import yaml
+        cls.jobs = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())["jobs"]
+
+    def test_native_lint_coverage_and_host_isolation(self):
+        # The workflow is a machine-consumed contract: both platforms must check every requested crate.
+        workflow = dict(jobs((WORKFLOWS / "ci.yml").read_text()))
+        native = workflow["native-clippy"]
+        parsed = self.jobs["native-clippy"]
+        # verify-scope decides once; verify-lint passes its answer on to the dependent native job.
+        self.assertEqual(self.jobs["verify-lint"]["outputs"], {"rust": "${{ needs.verify-scope.outputs.rust }}"})
+        self.assertNotIn("outputs:", workflow["verify"])
+        self.assertIn("needs: verify-lint", native)
+        self.assertIn("if: needs.verify-lint.outputs.rust != 'false'", native)
+        self.assertEqual(parsed["runs-on"], "${{ matrix.os }}")
+        self.assertEqual(set(parsed["strategy"]["matrix"]["os"]), {"windows-latest", "macos-latest"})
+        self.assertIn("contents: read", native)
+        self.assertIn("persist-credentials: false", native)
+        self.assertNotRegex(native, r":\s*write|secrets\.|self-hosted")
+        lint = next(step["run"] for step in parsed["steps"] if step.get("name") == "Lint the server build and "
+                    "platform-specific crates")
+        command = shlex.split(lint)
+        packages = {command[i + 1] for i, arg in enumerate(command) if arg == "-p"}
+        self.assertEqual(packages, {"horizon-client", "horizon-threads", "horizon-perf-format",
+                                    "horizon-perf-share", "horizon-server"})
+        for flag in ("--all-targets", "--locked", "--no-default-features"):
+            self.assertIn(flag, command)
+        self.assertEqual(command[-3:], ["--", "-D", "warnings"])
+
+    def test_verify_judges_native_lint(self):
+        # The required aggregate fails on a failed or cancelled native job, and passes a skipped one only where its
+        # own gate could have left it out: a documentation-only pull request or the merge queue.
+        verify = self.jobs["verify"]
+        self.assertIn("native-clippy", verify["needs"])
+        gate = verify["steps"][0]
+        self.assertEqual(gate["env"]["NATIVE"], "${{ needs.native-clippy.result }}")
+        base = {"SCOPE": "success", "TREE": "success", "LINT": "success", "NATIVE": "success",
+                "SERVER": "success", "LAUNCHER": "success", "TEST": "success", "MODAPI": "success",
+                "EVENT": "pull_request", "RUST_ANSWER": "true", "LAUNCHER_ANSWER": "true",
+                "MODAPI_ANSWER": "true", "WINDOWS_WASM_CACHE": "success", "WINDOWS_WASM_CACHE_ANSWER": "true"}
+        if not BASH:
+            self.skipTest("no bash")
+
+        def passes(**changes):
+            return subprocess.run([BASH, "--noprofile", "--norc", "-eo", "pipefail", "-c", gate["run"]],
+                                  env={**os.environ, **base, **changes}, capture_output=True, text=True).returncode == 0
+
+        self.assertTrue(passes())
+        for result in ("failure", "cancelled"):
+            with self.subTest(result=result):
+                self.assertFalse(passes(NATIVE=result))
+                self.assertFalse(passes(NATIVE=result, EVENT="merge_group"))
+        self.assertTrue(passes(NATIVE="skipped", RUST_ANSWER="false"))
+        self.assertTrue(passes(NATIVE="skipped", EVENT="merge_group", LINT="skipped", SERVER="skipped",
+                               LAUNCHER="skipped"))
+        self.assertFalse(passes(NATIVE="skipped"))
+        self.assertFalse(passes(NATIVE="skipped", RUST_ANSWER="FALSE"))
 
 
 if __name__ == "__main__":

@@ -1,30 +1,28 @@
-//! A client mod reading and driving the platform's replay playback (#19247): the state read,
-//! open, close, pause, resume, speed and seek. Opening reads the recording off the game's thread
+//! A client mod reading and driving the platform's replay playback (#19247), with markers
+//! and owned archive data (#19246). Opening reads the recording off the game's thread
 //! and installs it at a frame's end; close and seek leave a world or apply the recording's
 //! packets, so they too run at the end of the frame, outside every hook, as `disconnect` does.
 //! Pause, resume and speed only set the clock and apply at once.
 use super::{ClientQuit, Game, PendingWorldEntry};
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
-use horizon_client::studio::ReplayDriver;
-use mod_api::{REPLAY_MAX_SPEED, REPLAY_MIN_SPEED, ReplayError, ReplayState};
+use horizon_client::file_id::{FileIdentity, reparse_point, valid_id};
+use horizon_client::studio::{
+    ReplayDriver,
+    mcpr::{Marker, REPLAY_STUDIO_OWNER},
+};
+use mod_api::content::crash::current_native_mod;
+use mod_api::{
+    REPLAY_EDIT_MAX_BYTES, REPLAY_MAX_SPEED, REPLAY_MIN_SPEED, ReplayEditError, ReplayError,
+    ReplayMarker, ReplayState,
+};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::JoinHandle;
-
-/// The longest recording id, in bytes: a file name most file systems still take with `.mcpr`.
-const MAX_RECORDING_ID: usize = 250;
-
-/// Names Windows gives to devices in every folder, whatever follows them after a dot.
-const DEVICE_NAMES: [&str; 30] = [
-    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
-    "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
-    "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
-];
 
 /// A fresh request id for `replay_open`: never zero, never given twice while the game runs; none
 /// once every `u32` has been given (then `replay_open` is `Unavailable`).
@@ -62,36 +60,14 @@ pub(super) enum ReplayScope {
     Session { connections: u64, connected: bool },
 }
 
-/// A file as the system knows it (its volume or device, and its index or inode), whatever path
-/// names it now.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(in crate::game) struct FileIdentity {
-    device: u64,
-    index: u64,
-}
-
-impl FileIdentity {
-    /// `file`'s identity, read from its open handle.
-    pub(in crate::game) fn of(file: &File) -> io::Result<Self> {
-        use cap_fs_ext::MetadataExt;
-        let metadata = cap_std::fs::File::from_std(file.try_clone()?).metadata()?;
-        Ok(Self {
-            device: metadata.dev(),
-            index: metadata.ino(),
-        })
-    }
-}
-
 /// Who a replay was opened for: its id, the mod request that asked for it (0 for none: the
 /// replays list, `/studio replay`, the control socket), and for a mod's, the archive it opened.
 pub(in crate::game) struct ReplayOrigin {
     pub(in crate::game) recording: String,
     pub(in crate::game) request: u32,
     pub(in crate::game) archive: Option<FileIdentity>,
-    /// The archive file read, taken from the handle it was read through (any route).
-    pub(in crate::game) identity: Option<FileIdentity>,
-    /// For a mod's open asked while a replay played, the archive file that replay read when the
-    /// open was accepted: an editor save into it since makes the copy read stale.
+    /// For a mod's open asked while a replay played, the archive file that replay read when
+    /// the open was accepted: a save into it since makes the copy read stale.
     pub(in crate::game) replacing: Option<FileIdentity>,
 }
 
@@ -119,32 +95,6 @@ impl Drop for ReplayOpening {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
-}
-
-/// Whether `id` can name a recording, judged as text alone: one plain file name, 1 to 250 bytes,
-/// without a separator, drive, stream, `..`, NUL or control character, not ending in a dot or a
-/// space (Windows drops those, so two ids would name one file), and not a Windows device name.
-fn valid_id(id: &str) -> bool {
-    let mut components = Path::new(id).components();
-    let base = id
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(' ');
-    !id.is_empty()
-        && id.len() <= MAX_RECORDING_ID
-        && !id.contains("..")
-        && !id.ends_with(['.', ' '])
-        && !id
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
-        && !DEVICE_NAMES
-            .iter()
-            .any(|device| device.eq_ignore_ascii_case(base))
-        && matches!(
-            (components.next(), components.next()),
-            (Some(Component::Normal(_)), None)
-        )
 }
 
 /// The recording file a mod names by `id` in `dir`: `<dir>/<id>.mcpr`. The id is checked as text
@@ -251,17 +201,19 @@ pub(super) fn open_recording(
     Ok((dir.join(format!("{id}.mcpr")), file, identity))
 }
 
-/// A Windows reparse point (a link, a junction, a cloud placeholder) that `is_file` may not show.
-#[cfg(windows)]
-fn reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+fn replay_edit_error(error: io::Error) -> ReplayEditError {
+    match error.kind() {
+        io::ErrorKind::FileTooLarge => ReplayEditError::TooLarge,
+        io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound => ReplayEditError::Stale,
+        _ => {
+            log::warn!("Replay archive edit: {error}");
+            ReplayEditError::Io
+        }
+    }
 }
 
-#[cfg(not(windows))]
-fn reparse_point(_: &std::fs::Metadata) -> bool {
-    false
+fn replay_marker(marker: &Marker) -> ReplayMarker {
+    ReplayMarker::new(marker.time_ms, marker.label.clone())
 }
 
 impl Game<'_> {
@@ -338,6 +290,86 @@ impl Game<'_> {
         ))
     }
 
+    pub(super) fn replay_markers(&self) -> Result<Vec<ReplayMarker>, ReplayEditError> {
+        if !self.replay.playing() {
+            return Err(ReplayEditError::NotOpen);
+        }
+        let driver = self
+            .replay
+            .export_driver()
+            .ok_or(ReplayEditError::Unavailable)?;
+        Ok(driver.markers().iter().map(replay_marker).collect())
+    }
+
+    fn replay_edit_driver(&mut self) -> Result<&mut ReplayDriver, ReplayEditError> {
+        if !self.replay.playing() {
+            return Err(ReplayEditError::NotOpen);
+        }
+        self.replay
+            .edit_driver()
+            .ok_or(ReplayEditError::Unavailable)
+    }
+
+    pub(super) fn replay_add_marker(
+        &mut self,
+        label: &str,
+    ) -> Result<ReplayMarker, ReplayEditError> {
+        let driver = self.replay_edit_driver()?;
+        if label.len() > REPLAY_EDIT_MAX_BYTES {
+            return Err(ReplayEditError::TooLarge);
+        }
+        let marker = driver
+            .add_marker(label.to_owned())
+            .map_err(replay_edit_error)?;
+        self.studio.timeline.markers = driver.markers().to_vec();
+        Ok(ReplayMarker::new(marker.time_ms, marker.label))
+    }
+
+    pub(super) fn replay_replace_markers(
+        &mut self,
+        markers: Vec<ReplayMarker>,
+    ) -> Result<(), ReplayEditError> {
+        let driver = self.replay_edit_driver()?;
+        driver
+            .replace_markers(
+                markers
+                    .into_iter()
+                    .map(|marker| Marker {
+                        time_ms: marker.time_ms,
+                        label: marker.label,
+                    })
+                    .collect(),
+            )
+            .map_err(replay_edit_error)?;
+        self.studio.timeline.markers = driver.markers().to_vec();
+        Ok(())
+    }
+
+    pub(super) fn replay_read_mod_data(&mut self) -> Result<Option<Vec<u8>>, ReplayEditError> {
+        let driver = self.replay_edit_driver()?;
+        let owner = current_native_mod().ok_or(ReplayEditError::NoCallingMod)?;
+        driver.read_mod_data(owner).map_err(replay_edit_error)
+    }
+
+    pub(super) fn replay_write_mod_data(
+        &mut self,
+        data: Option<Vec<u8>>,
+    ) -> Result<(), ReplayEditError> {
+        let camera_track_dirty = self.studio.camera_track_dirty;
+        let driver = self.replay_edit_driver()?;
+        let owner = current_native_mod().ok_or(ReplayEditError::NoCallingMod)?;
+        if owner == REPLAY_STUDIO_OWNER && camera_track_dirty {
+            return Err(ReplayEditError::Stale);
+        }
+        driver
+            .write_mod_data(owner, data.as_deref())
+            .map_err(replay_edit_error)?;
+        if owner == REPLAY_STUDIO_OWNER {
+            self.studio.set_camera_data(data.as_deref());
+        }
+        Ok(())
+    }
+
     /// Accepts a mod's request to open a recording by id: checks it and opens its file once,
     /// through the recordings folder's handle. One thread reads recordings at a time: the
     /// request waits for it, and a later request takes the place of one not yet ready, which
@@ -359,7 +391,6 @@ impl Game<'_> {
                 recording: recording.to_owned(),
                 request,
                 archive: Some(archive),
-                identity: Some(archive),
                 replacing,
             },
             scope: self.replay_scope(),
@@ -597,14 +628,14 @@ impl Game<'_> {
         let saving = self.studio.camera_track_dirty && self.replay.playing();
         let playing = self.playing_archive_identity();
         let same_archive = saving && origin.archive.is_some() && playing == origin.archive;
-        // The same archive asked for again, and the editor saved into it (a marker) after the
-        // open was accepted: the copy read holds what was there before, so it isn't installed.
+        // The same archive asked for again, and a save reached it after the open was
+        // accepted: the copy read holds what was there before, so it isn't installed.
         if origin.archive.is_some()
             && origin.replacing == origin.archive
             && playing != origin.replacing
         {
             log::warn!(
-                "Replay {:?} not opened: the editor saved into it after it was asked for",
+                "Replay {:?} not opened: the archive changed after it was asked for",
                 origin.recording
             );
             return self.replay_open_failed(&origin, ReplayError::Unavailable);
@@ -660,10 +691,11 @@ impl Game<'_> {
         self.start_prepared_replay(driver, origin);
     }
 
-    /// The archive file the replay playing read, as of the editor's last save into it: kept in
-    /// memory from the handles that read and wrote it, so nothing is opened to tell.
+    /// The archive file the replay playing read, as of the last successful edit.
     fn playing_archive_identity(&self) -> Option<FileIdentity> {
-        self.replay.identity.filter(|_| self.replay.playing())
+        self.replay
+            .export_driver()
+            .map(ReplayDriver::archive_identity)
     }
 
     fn start_prepared_replay(&mut self, driver: ReplayDriver, origin: ReplayOrigin) {

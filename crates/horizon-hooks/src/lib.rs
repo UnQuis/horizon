@@ -17,6 +17,7 @@
 //! pages, [`hud`] for what it draws on the HUD, [`lang`] for the lang files with its text.
 #![forbid(unsafe_code)]
 
+pub mod actions;
 pub mod hud;
 pub mod lang;
 pub mod mod_links;
@@ -110,6 +111,14 @@ pub trait Hooks: Sync {
     /// before that screen's window opens.
     fn get_the_game(&self) -> Option<GetTheGame> {
         None
+    }
+
+    /// Whether the player whose turn it is sees their own name over their head in third person,
+    /// as other players see it (Horizon's own name tag). Asked each frame name tags are drawn;
+    /// the engine shows it when any hook says so, and still never in first person, asleep, as a
+    /// spectator or while invisible.
+    fn own_name_tag(&self) -> bool {
+        false
     }
 }
 
@@ -250,6 +259,7 @@ pub mod engine {
     /// registration ends.
     pub fn seal() {
         all();
+        crate::actions::all();
         crate::settings::all();
         crate::pages::engine::all();
         crate::hud::engine::all();
@@ -374,6 +384,11 @@ pub mod engine {
     /// [`Hooks::get_the_game`]: the first registered hook's answer.
     pub fn get_the_game() -> Option<GetTheGame> {
         all().iter().find_map(|hooks| hooks.get_the_game())
+    }
+
+    /// [`Hooks::own_name_tag`]: whether any hook says so.
+    pub fn own_name_tag() -> bool {
+        all().iter().any(|hooks| hooks.own_name_tag())
     }
 }
 

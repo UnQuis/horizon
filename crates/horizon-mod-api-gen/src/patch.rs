@@ -742,7 +742,9 @@ fn defined(items: &[Item]) -> Vec<(syn::Ident, Vec<syn::Attribute>)> {
             Item::Struct(item) => Some((item.ident.clone(), cfg(&item.attrs))),
             Item::Enum(item) => Some((item.ident.clone(), cfg(&item.attrs))),
             Item::Union(item) => Some((item.ident.clone(), cfg(&item.attrs))),
-            Item::Const(item) => Some((item.ident.clone(), cfg(&item.attrs))),
+            // An unnamed constant (`const _: () = assert!(..);`) can't be named, so it isn't
+            // re-exported: `pub use path::_;` is not Rust (#19505).
+            Item::Const(item) if item.ident != "_" => Some((item.ident.clone(), cfg(&item.attrs))),
             Item::Static(item) => Some((item.ident.clone(), cfg(&item.attrs))),
             Item::Type(item) => Some((item.ident.clone(), cfg(&item.attrs))),
             Item::Trait(item) => Some((item.ident.clone(), cfg(&item.attrs))),
@@ -808,6 +810,8 @@ struct Tree {
     copies: Vec<proc_macro2::TokenStream>,
     /// Names the copies define, which the mirror must not also re-export.
     own: BTreeSet<String>,
+    /// Names this build's stager made public for a marked trait method.
+    staged_exports: BTreeSet<String>,
 }
 
 /// The patch crate for `targets` (as `[[native.mixin]]` rows write them), from the pinned game source
@@ -991,6 +995,7 @@ pub fn generate(
                     };
                     quote! {
                         #[doc(hidden)]
+                        #[allow(non_snake_case)]
                         pub fn #install() -> bool {
                             <#elided>::#constructor(<#elided as #trait_ref>::#method)
                         }
@@ -1075,6 +1080,18 @@ pub fn generate(
     }
     if !refusals.is_empty() {
         return Err(refusals);
+    }
+    for export in &index.staged_exports {
+        let Some((module, name)) = export.rsplit_once("::") else {
+            continue;
+        };
+        let mut segments = module.split("::");
+        let Some(root) = segments.next().and_then(|name| trees.get_mut(name)) else {
+            continue;
+        };
+        if let Some(node) = segments.try_fold(root, |node, part| node.children.get_mut(part)) {
+            node.staged_exports.insert(name.to_owned());
+        }
     }
     let mut libs = Vec::new();
     for (source_crate, tree) in &mut trees {
@@ -1635,7 +1652,8 @@ fn mirror_rooted(
         .cloned()
         .chain(tree.own.iter().cloned())
         .collect();
-    // The crate root is not widened: only its public items are there to re-export.
+    // The root and lower-crate ancestors re-export public items, including names the
+    // stager widened for a copied trait method.
     let public: BTreeSet<String> = items
         .iter()
         .filter_map(|item| match item {
@@ -1675,7 +1693,11 @@ fn mirror_rooted(
     let explicit = defined(&items)
         .into_iter()
         .filter(|(ident, _)| !reserved.contains(&ident.to_string()))
-        .filter(|(ident, _)| !only_public || public.contains(&ident.to_string()))
+        .filter(|(ident, _)| {
+            !only_public
+                || public.contains(&ident.to_string())
+                || tree.staged_exports.contains(&ident.to_string())
+        })
         .map(|(ident, cfg)| quote!(#(#cfg)* pub use #original::#ident;));
     let mut uses = Vec::new();
     for item in self::uses(&items) {
@@ -2217,6 +2239,21 @@ fn collect_names(tree: &syn::UseTree, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module with `const _` (`game/modding/payload_transport.rs`) re-exports its named items
+    /// only: `pub use path::_;` would not build the patch workspace (#19505).
+    #[test]
+    fn an_unnamed_constant_is_not_re_exported() {
+        let file = syn::parse_file(
+            "const _: () = assert!(true);\npub const LIMIT: usize = 256;\npub fn receive() {}\n",
+        )
+        .unwrap();
+        let names: Vec<String> = defined(&file.items)
+            .into_iter()
+            .map(|(ident, _)| ident.to_string())
+            .collect();
+        assert_eq!(names, ["LIMIT", "receive"]);
+    }
 
     #[test]
     fn a_lower_crate_is_mirrored_through_its_library_name() {

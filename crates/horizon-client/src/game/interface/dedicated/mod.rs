@@ -428,7 +428,7 @@ thread_local! {
 }
 
 /// Runs `f` and returns the lines it logged.
-fn capture_log(f: impl FnOnce()) -> Vec<String> {
+pub(in crate::game) fn capture_log(f: impl FnOnce()) -> Vec<String> {
     CAPTURE.set(Some(Vec::new()));
     f();
     CAPTURE.take().unwrap_or_default()
@@ -742,8 +742,10 @@ impl Lists {
         if !self.whitelisted(user) {
             return Some(translatable("multiplayer.disconnect.not_whitelisted", &[]));
         }
-        let ip = address.ip().to_string();
-        if self.ip_bans.contains(&ip)
+        let entries = self.ip_bans.entries();
+        let key =
+            ip_ban_key(entries.iter().map(|e| e.user.as_str()), address.ip()).map(str::to_owned);
+        if let Some(ip) = key
             && let Some(ban) = self.ip_bans.get(&ip).cloned()
         {
             let mut reason = translatable_tag(
@@ -763,6 +765,20 @@ impl Lists {
         }
         None
     }
+}
+
+/// The `banned-ips.json` key that bans `ip`: its own text or another spelling of the same address, as a
+/// file written by vanilla has it (Java writes `::1` as `0:0:0:0:0:0:0:1`) or an IPv4 address in its
+/// `::ffff:` form. Keys that are not addresses never match.
+fn ip_ban_key<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    ip: std::net::IpAddr,
+) -> Option<&'a str> {
+    let ip = ip.to_canonical();
+    keys.into_iter().find(|key| {
+        key.parse::<std::net::IpAddr>()
+            .is_ok_and(|k| k.to_canonical() == ip)
+    })
 }
 
 /// DedicatedServerProperties.LEGACY_PRESET_NAMES: the old `level-type`
@@ -951,9 +967,9 @@ fn save_all_reply(saved: bool) -> Text {
 }
 
 /// `BanIpCommands.banIp`'s `commands.banip.info`: the count of affected players and
-/// `EntitySelector.joinNames` of them (a gray ", " between names). None when no one is affected,
-/// as vanilla sends no line then.
-fn ban_ip_info(names: &[&str]) -> Option<Text> {
+/// `EntitySelector.joinNames` of them (their `Player.getDisplayName`, a gray ", " between
+/// them). None when no one is affected, as vanilla sends no line then.
+fn ban_ip_info(names: &[Text]) -> Option<Text> {
     if names.is_empty() {
         return None;
     }
@@ -961,12 +977,7 @@ fn ban_ip_info(names: &[&str]) -> Option<Text> {
         "commands.banip.info",
         &[
             Text::literal(names.len().to_string()),
-            horizon_client::scoreboard_cmd::format_list(
-                names
-                    .iter()
-                    .map(|n| Text::literal((*n).to_owned()))
-                    .collect(),
-            ),
+            horizon_client::scoreboard_cmd::format_list(names.to_vec()),
         ],
     ))
 }
@@ -1185,6 +1196,9 @@ impl Game<'_> {
         // Read before the levels are made: each one's block ticks take it (`Levels::new_ticks`).
         self.levels
             .set_max_chained_neighbor_updates(props.max_chained_neighbor_updates);
+        // `max-world-size` limits every level's border (`MinecraftServer.createLevels`): set before
+        // the world's levels read their borders.
+        self.levels.set_absolute_max_size(props.max_world_size);
         let prepared = self.prepare_world_and_rules(WorldRequest::new(
             &folder,
             Some(&level_name),
@@ -2222,7 +2236,10 @@ impl Game<'_> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let names: Vec<&str> = banned.iter().map(|(_, n)| n.as_str()).collect();
+                let names: Vec<Text> = banned
+                    .iter()
+                    .map(|(uuid, name)| self.player_text(name, *uuid))
+                    .collect();
                 if let Some(info) = ban_ip_info(&names) {
                     self.console_reply(info);
                 }
@@ -2309,10 +2326,11 @@ impl Game<'_> {
                     translatable("multiplayer.disconnect.kicked", &[])
                 };
                 self.kick_uuid(user.id, reason);
+                // `KickCommand.kickPlayers` names them by `Player.getDisplayName`.
                 self.console_reply(Text::translate(
                     "commands.kick.success",
                     &[
-                        lit(&user.name),
+                        self.player_text(&user.name, user.id),
                         if rest.len() > 1 {
                             lit(&rest[1..].join(" "))
                         } else {
@@ -2324,7 +2342,15 @@ impl Game<'_> {
             "say" if !rest.is_empty() => {
                 // SayCommand from the console: an unsigned system chat
                 // message of type say_command, logged as not secure.
-                let message = rest.join(" ");
+                let message = match self.console_say_message(line) {
+                    Ok(message) => message,
+                    Err(replies) => {
+                        for text in replies {
+                            self.console_reply(text);
+                        }
+                        return;
+                    }
+                };
                 // An RCON client's `say` is `[Rcon] message`, and its reply stays empty: the line is
                 // the console's own log, not a message to the source.
                 let name = if self.rcon_source { "Rcon" } else { "Server" };
@@ -2358,6 +2384,29 @@ impl Game<'_> {
                 }
             }
         }
+    }
+
+    /// The message of a console `say` line as `SayCommand` takes it: the line is parsed as the
+    /// dispatcher parses a player's, so a bad selector fails the command (the error lines are the
+    /// `Err`), and a good one becomes the names it selects.
+    fn console_say_message(&mut self, line: &str) -> std::result::Result<String, Vec<Text>> {
+        self.as_console_in_overworld(|g| {
+            let dispatcher = g.ui.dispatcher.0.clone();
+            let parse = dispatcher.parse(line, &g.ui.registries);
+            match parse.executable() {
+                Ok((ctx, _)) => match ctx.get("message") {
+                    Some(horizon_client::command::Arg::Str(s)) => {
+                        Ok(g.expand_selectors(s).plain())
+                    }
+                    _ => Ok(line.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")),
+                },
+                Err(e) => {
+                    g.chat_capture = Some(Vec::new());
+                    g.syntax_failure(&e, line);
+                    Err(g.chat_capture.take().unwrap_or_default())
+                }
+            }
+        })
     }
 
     fn console_whitelist(&mut self, state: &mut ServerState, rest: &[&str]) {
@@ -2781,6 +2830,33 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    /// `banned-ips.json` holds addresses as text: one written by vanilla spells `::1` as Java does
+    /// (`0:0:0:0:0:0:0:1`), and an IPv4 player may arrive in its `::ffff:` form. The same address bans
+    /// whatever its spelling; other addresses and keys that are no address do not.
+    #[test]
+    fn an_ip_ban_matches_the_address_not_its_spelling() {
+        use super::ip_ban_key;
+        let keys = [
+            "203.0.113.7",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:198.51.100.2",
+            "not an address",
+        ];
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.7")), Some("203.0.113.7"));
+        assert_eq!(
+            ip_ban_key(keys, ip("::ffff:203.0.113.7")),
+            Some("203.0.113.7")
+        );
+        assert_eq!(ip_ban_key(keys, ip("::1")), Some("0:0:0:0:0:0:0:1"));
+        assert_eq!(
+            ip_ban_key(keys, ip("198.51.100.2")),
+            Some("::ffff:198.51.100.2")
+        );
+        assert_eq!(ip_ban_key(keys, ip("203.0.113.8")), None);
+        assert_eq!(ip_ban_key(keys, ip("::2")), None);
+    }
+
     /// `/restart` without `horizon-server` refuses and stops nothing; with it, it asks the server loop to end.
     #[test]
     fn restart_without_a_supervisor_does_nothing_and_says_why() {
@@ -2823,11 +2899,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(super::ban_ip_info(&[]).is_none());
-        let one = super::ban_ip_info(&["Alex"]).unwrap();
+        let name = |n| super::Text::literal(n).with_color(horizon_client::text::RED);
+        let one = super::ban_ip_info(&[name("Alex")]).unwrap();
         assert_eq!(one.translation_key(), Some("commands.banip.info"));
         let a = args(&one);
         assert!(a[0].contains('1') && a[1].contains("Alex"), "{a:?}");
-        let two = super::ban_ip_info(&["Alex", "Steve"]).unwrap();
+        let two = super::ban_ip_info(&[name("Alex"), name("Steve")]).unwrap();
         let a = args(&two);
         assert!(a[0].contains('2'), "{a:?}");
         assert!(
@@ -3322,5 +3399,73 @@ mod console_source_tests {
         );
         // The console's source is put back after each line.
         assert!(game.command_source.is_none());
+    }
+
+    /// `say` at the console: the message goes through `MessageArgument`, as a player's does. A selector
+    /// becomes the names it selects (none for the console's own `@s`), and a bad one fails the command
+    /// instead of reaching the players as the text that was typed.
+    #[test]
+    #[ignore = "daily"]
+    fn the_consoles_say_resolves_and_checks_its_selectors() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
+        );
+        let settings = Settings::default();
+        let loaded = load_resources(
+            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
+            Vec::new(),
+            None,
+            &root,
+            &settings,
+            std::time::Instant::now(),
+            false,
+            crate::game::execution_role::ExecutionRole::IntegratedServer,
+            &Progress::new(),
+            &mut |_, _| unreachable!(),
+        )
+        .unwrap();
+        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
+        options.resources = root.clone();
+        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
+        let mut resources = None;
+        let res = resources.insert(loaded.resources);
+        let mut game = Game::new(
+            res,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            settings,
+            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
+                root.clone(),
+            )),
+            None,
+        )
+        .unwrap();
+        game.build_registries();
+        game.set_allow_commands(true);
+        game.world
+            .chunks
+            .insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        game.block_ticks
+            .add_empty_chunk(ChunkPos::new(0, 0))
+            .unwrap();
+        assert_eq!(game.console_say_message("say hello"), Ok("hello".to_owned()));
+        assert_eq!(
+            game.console_say_message("say hello @s").map(|m| m.trim_end().to_owned()),
+            Ok("hello".to_owned())
+        );
+        let (ok, _) = console(&mut game, "summon pig 0 80 0 {NoAI:1b}");
+        assert!(ok);
+        assert_eq!(
+            game.console_say_message("say hi @e[type=pig]"),
+            Ok("hi Pig".to_owned())
+        );
+        let failed = game
+            .console_say_message("say @e[type=nothing]")
+            .expect_err("an unknown entity type fails the command");
+        assert_eq!(
+            failed.first().map(|t| t.plain()).as_deref(),
+            Some("Invalid or unknown entity type 'minecraft:nothing'")
+        );
     }
 }

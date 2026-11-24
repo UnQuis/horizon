@@ -5,6 +5,8 @@ pub(crate) use freezing::in_powder_snow;
 pub use freezing::{can_freeze, wears_gaze_disguise};
 mod feeding;
 mod freezing;
+#[cfg(test)]
+mod sink_tests;
 
 pub use feeding::takes_food;
 
@@ -21,6 +23,7 @@ use super::{
 };
 use crate::blocks::Fluid;
 use crate::breathing::{Breath, breathe, drown, own_air};
+use crate::first_person::SwingAnimation;
 use crate::health::DamageLevel;
 use crate::powder_snow::particle_velocity as powder_snow_particle_velocity;
 use horizon_core::{
@@ -102,17 +105,9 @@ mod inside_walk_tests {
             bounce_on: |_, _, _, _, _| {},
             // The production binding's own shape: the whole callback staged,
             // a panic contained with it.
-            inside_fire: |_level,
-                          _dimension,
-                          _entity,
-                          _kind,
-                          _state,
-                          at,
-                          _precise,
-                          staged,
-                          _writes| {
+            inside_fire: |_level, _dimension, contact, _precise, _swept, staged, _writes| {
                 let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fire_like_a_part(at, staged);
+                    fire_like_a_part(contact.position, staged);
                 }));
                 let _ = fired;
             },
@@ -487,16 +482,22 @@ impl Mob {
             6
         }
     }
-    /// `SwingState.startIfAble`: a swing past the first half of the current
-    /// one restarts it.
-    fn start_swing(&mut self, duration: i32) -> bool {
+    /// `SwingState.startIfAble`: a swing inside the first half of the current
+    /// one is refused. `swing_time` counts one behind `SwingState.ticks` (a
+    /// swing starts at -1 and `tick_swing` counts it up at the end of the
+    /// mob's tick, where vanilla's `SwingState.tick` runs at the start of
+    /// `baseTick`), so vanilla's `ticks > 0 && ticks <= durationTicks / 2` is
+    /// `swing_time >= 0 && swing_time < durationTicks / 2`.
+    fn start_swing(&mut self, animation: SwingAnimation, duration: i32) -> bool {
         let half = self.swing_duration() / 2;
-        if self.ai.swinging && self.ai.swing_time >= 0 && self.ai.swing_time < half {
+        let ticks = self.ai.swing_time + 1;
+        if self.ai.swinging && ticks > 0 && ticks <= half {
             return false;
         }
         self.ai.swing_time = -1;
         self.ai.swinging = true;
         self.ai.swing_duration = duration.max(1);
+        self.anim.swing_animation = animation;
         true
     }
     /// Whether the current swing is the off hand's (`swing_hand`'s arm
@@ -508,7 +509,7 @@ impl Mob {
     }
     /// LivingEntity.swing
     pub fn swing(&mut self) {
-        if self.start_swing(6) {
+        if self.start_swing(SwingAnimation::DEFAULT, 6) {
             self.extra.swing_right_arm = None;
             self.extra.swing_stab = false;
         }
@@ -516,7 +517,7 @@ impl Mob {
     /// `LivingEntity.swing(hand, animation, false)` for a swing of `duration`
     /// ticks (`getModifiedSwingDuration`): the arm is `hand.asArm(mainArm)`.
     pub fn swing_hand(&mut self, off_hand: bool, duration: i32) {
-        if self.start_swing(duration) {
+        if self.start_swing(SwingAnimation::DEFAULT, duration) {
             self.extra.swing_right_arm = Some(!off_hand != self.main_arm_left());
             self.extra.swing_stab = false;
         }
@@ -525,11 +526,7 @@ impl Mob {
     /// this mob's haste, conduit power or mining fatigue
     /// (`LivingEntity.getModifiedSwingDuration`). Whether the swing started
     /// (`SwingState.startIfAble`).
-    pub fn swing_hand_modified(
-        &mut self,
-        off_hand: bool,
-        animation: crate::first_person::SwingAnimation,
-    ) -> bool {
+    pub fn swing_hand_modified(&mut self, off_hand: bool, animation: SwingAnimation) -> bool {
         let amplifier = |id: &str| {
             self.extra
                 .effects
@@ -540,7 +537,7 @@ impl Mob {
         let dig_speed = amplifier("minecraft:haste").max(amplifier("minecraft:conduit_power"));
         let fatigue = amplifier("minecraft:mining_fatigue");
         let duration = crate::first_person::swing_duration(animation, dig_speed, fatigue);
-        if self.start_swing(duration) {
+        if self.start_swing(animation, duration) {
             self.extra.swing_right_arm = Some(!off_hand != self.main_arm_left());
             self.extra.swing_stab = animation.kind == 2;
             return true;
@@ -1012,6 +1009,22 @@ pub fn is_monster(s: Species) -> bool {
             | S::Wither
     )
 }
+/// `Entity.getSoundSource` for mobs: `Monster`'s own override is hostile, and
+/// so are a few mobs that are not `Monster`s (`Hoglin`, `Ghast`, `Phantom`,
+/// `Shulker` and the slimes). A killer bunny is hostile too; `Mob::sound_source`
+/// adds it from the variant.
+pub fn hostile_species(s: Species) -> bool {
+    is_monster(s)
+        || matches!(
+            s,
+            Species::Hoglin
+                | Species::Ghast
+                | Species::Phantom
+                | Species::Shulker
+                | Species::Slime
+                | Species::MagmaCube
+        )
+}
 /// One full entity tick. Returns false when the mob is gone.
 /// `Mob.getTarget` / `Mob.setTarget` (`asValidTarget`): a player in creative
 /// or spectator mode or in Peaceful is never a mob's target, however the target was set (an
@@ -1178,6 +1191,10 @@ fn ai_and_finish_tick(
     events: &mut Vec<MobEvent>,
 ) -> bool {
     if m.no_ai {
+        // Witch.aiStep picks and drinks its potions before super.aiStep():
+        // LivingEntity.tick calls aiStep without AI too, so a NoAI witch
+        // on fire still drinks fire resistance.
+        witch_ai_step(m, w, events);
         update_fall_flying(m, w, events);
         reset_effect_fall_distance(m);
         // Mob.aiStep still runs without AI: undead burn, endermites age.
@@ -1672,16 +1689,26 @@ impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
         {
             let mut staged = mod_api::InsideEffects::default();
             let mut writes = Vec::new();
-            let kind = self.m.kind.id.clone();
-            let id = self.m.id as i32;
+            let m = &*self.m;
             (hooks.inside_fire)(
                 self.level,
                 dimension,
-                id,
-                &kind,
-                state,
-                at,
+                crate::block_contact::Contact {
+                    entity: m.id as i32,
+                    kind: &m.kind.id,
+                    state,
+                    position: at,
+                },
                 precise,
+                &mod_api::SweptEntity::new(
+                    m.position,
+                    m.previous,
+                    m.velocity,
+                    m.extra.avatar_pose == crate::pose::Pose::Crouching,
+                    m.extra.crouching,
+                    m.fall_distance,
+                    true,
+                ),
                 &mut staged,
                 &mut writes,
             );
@@ -2144,7 +2171,11 @@ fn base_tick(
     }
     super::hurt_by::base_tick(m, w);
     // LivingEntity.baseTick runs tickEffects after the timers count down.
-    tick_effects(m, w.loop_context, level, w.mod_effects);
+    // Enderman.hurtServer can teleport even when LivingEntity rejects the
+    // damage. Settle each attempt before the next effect uses its position or RNG.
+    tick_effects(m, w.loop_context, level, w.mod_effects, |m| {
+        hurt_teleports(m, w, events);
+    });
     // Entity.applyEffectsFromBlocks runs in LivingEntity.aiStep, after
     // baseTick has counted the fire and the hurt timers down: a fire block or
     // lava ignites to the full 160 / 300 ticks and its hit lands after the
@@ -2158,6 +2189,8 @@ fn base_tick(
             touches_lava(m, w),
         )
     };
+    // LavaCauldronBlock.entityInside: LAVA_IGNITE and lavaHurt, as in lava.
+    let lava = lava || crate::entities::lava_cauldron_contacts(w.world, w.registry, m.bounds()) > 0;
     block_contact_damage(m, w, level, fire, lava);
     // Enderman.hurtServer and Shulker.hurtServer teleport inside the hurt
     // (fire, lava, a block, an effect).
@@ -2435,18 +2468,23 @@ fn reset_effect_fall_distance(m: &mut Mob) {
     }
 }
 
-/// LivingEntity.aiStep (and Mob/AgeableMob/Animal additions).
-fn ai_step(m: &mut Mob, w: &MobWorld, level: &mut DamageLevel<'_>, events: &mut Vec<MobEvent>) {
-    if m.species() == Species::Parrot {
-        super::parrot::ai_step(m, w, level.random(), events);
-    }
-    // Witch.aiStep runs before super.aiStep().
+/// `Witch.aiStep` before `super.aiStep()`, with or without AI (NoAI only
+/// skips `serverAiStep` and travel inside `LivingEntity.aiStep`).
+fn witch_ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     if m.species() == Species::Witch {
         let far = m
             .target_info(w)
             .is_some_and(|t| t.position.distance_squared(m.position) > 121.0);
         super::witch::ai_step(m, w.loop_context, events, far);
     }
+}
+
+/// LivingEntity.aiStep (and Mob/AgeableMob/Animal additions).
+fn ai_step(m: &mut Mob, w: &MobWorld, level: &mut DamageLevel<'_>, events: &mut Vec<MobEvent>) {
+    if m.species() == Species::Parrot {
+        super::parrot::ai_step(m, w, level.random(), events);
+    }
+    witch_ai_step(m, w, events);
     if m.species() == Species::Fox {
         super::fox::pre_ai_step(m);
     }
@@ -2563,12 +2601,13 @@ fn hurt_teleports(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
 impl Mob {
     /// LivingEntity.isPushable (and the push it takes from `Entity.push(Entity)`):
     /// bats and shulkers are never moved by others, nor is a mob on a climbable
-    /// block (`onClimbable`, cached by the last tick), nor a ridden horse
-    /// (`AbstractHorse.isPushable` is `!isVehicle`).
+    /// block (`onClimbable`, cached by the last tick) unless its own
+    /// `isPushable` says otherwise (`Parrot.isPushable` is a plain true),
+    /// nor a ridden horse (`AbstractHorse.isPushable` is `!isVehicle`).
     pub fn pushable(&self) -> bool {
         self.alive()
             && !matches!(self.species(), Species::Bat | Species::Shulker)
-            && !self.on_climbable
+            && (!self.on_climbable || self.species() == Species::Parrot)
             && (self.species() != Species::Creaking || super::creaking::can_move(self))
             && (self.species() != Species::Warden || !super::warden::digging_or_emerging(self))
             && !(super::equine::is_equine(self.species()) && super::equine::is_vehicle(self))
@@ -2591,7 +2630,7 @@ fn drop_tiny_motion(m: &mut Mob) {
 /// LivingEntity.pushEntities: every pushable entity overlapping the box is
 /// pushed apart from this one (`doPush(e)` = `e.push(this)`); pushes of other
 /// mobs are `Push` events their tick picks up.
-fn push_entities(
+pub(super) fn push_entities(
     m: &mut Mob,
     w: &MobWorld,
     level: &mut DamageLevel<'_>,
@@ -2602,7 +2641,7 @@ fn push_entities(
         return;
     }
     let bounds = m.bounds();
-    // The pusher's own isPushable and isVehicle, checked by `e.push(this)`.
+    // The pusher's own isPushable and isVehicle, checked by `e.push(this)` before moving it.
     let self_pushable = m.pushable() && !super::equine::is_vehicle(m);
     // Each passenger with whether it shares this one's root vehicle.
     let mut targets = super::world::take_push_targets();
@@ -2611,6 +2650,9 @@ fn push_entities(
         && m.rider.is_none()
         && p.alive
         && !p.spectator
+        // EntitySelector.pushableBy asks isPushable: a climbing player is left
+        // out, and `doPush` then gives neither of the pair a push.
+        && !p.on_climbable
         && p.bounds.intersects(bounds)
     {
         targets.push((Who::Player, p.position, p.passenger, false, false));
@@ -3406,22 +3448,28 @@ pub fn feed_animal(
     level: &mut impl RandomSource,
     love_cause: Option<[i32; 4]>,
 ) -> Option<Option<(&'static str, f32, f32)>> {
-    // Armadillo.mobInteract: a ball takes no food.
-    if super::armadillo::scared(m) {
-        return None;
-    }
+    feed_animal_with_love_decision(m, level, love_cause, true)
+}
+/// Apply the ordinary feed, with the server's decision about entering love mode.
+/// A refused entry still accepts the food and plays the eating sound.
+pub fn feed_animal_with_love_decision(
+    m: &mut Mob,
+    level: &mut impl RandomSource,
+    love_cause: Option<[i32; 4]>,
+    enter_love: bool,
+) -> Option<Option<(&'static str, f32, f32)>> {
     if !takes_food(m) {
         return None;
     }
-    if m.extra.age == 0 {
+    if m.extra.age != 0 {
+        // AgeableMob.ageUp(getSpeedUpSecondsWhenFeeding(-age), true): a tenth.
+        let secs = ((-m.extra.age / 20) as f32 * 0.1) as i32;
+        age_up(m, secs, true);
+    } else if enter_love {
         m.extra.in_love = 600;
         m.extra.love_player = true;
         // Animal.setInLove: the player who fed it, for a fox baby to trust.
         m.extra.love_cause = love_cause;
-    } else {
-        // AgeableMob.ageUp(getSpeedUpSecondsWhenFeeding(-age), true): a tenth.
-        let secs = ((-m.extra.age / 20) as f32 * 0.1) as i32;
-        age_up(m, secs, true);
     }
     let mut sound = eating_sound(m, level);
     if m.species() == Species::Strider && !m.silent {
@@ -3764,7 +3812,9 @@ pub fn forgives_dead_player(m: &Mob) -> bool {
     match m.species() {
         Species::Bee => super::bee::get(m).and_then(|bee| bee.angry_at) == Some(Who::Player),
         Species::PolarBear => m.extra.flag2,
-        Species::Enderman | Species::ZombifiedPiglin => m.ai.target == Some(Who::Player),
+        Species::Enderman | Species::ZombifiedPiglin => {
+            m.ai.target == Some(Who::Player) || m.extra.angry_at == Some(Who::Player)
+        }
         _ => m.extra.angry_at == Some(Who::Player),
     }
 }
@@ -3787,14 +3837,16 @@ pub fn forgive_dead_player(m: &mut Mob) {
     match m.species() {
         Species::Bee => super::bee::forgive_dead_player(m),
         Species::PolarBear => super::polar_bear::forgive_dead_player(m),
-        // The enderman's and zombified piglin's persistent anger is the
-        // target they hold (the stare goal, the hurt-by path): vanilla's
-        // `NeutralMob.playerDied` ends it through `stopBeingAngry` when it
-        // is the player who died, the last hurt by with it.
+        // The enderman's and zombified piglin's anger is the target they hold
+        // (the stare goal, the hurt-by path) and the anger target and timer
+        // that outlast it: vanilla's `NeutralMob.playerDied` ends all of it
+        // through `stopBeingAngry` when it is the player who died, the last
+        // hurt by with it.
         Species::Enderman | Species::ZombifiedPiglin => {
-            if m.ai.target == Some(Who::Player) {
+            if forgives_dead_player(m) {
                 m.ai.forget_hurt_by(m.age as i32);
                 m.ai.target = None;
+                super::neutral_anger::stop(m);
             }
         }
         // The iron golem keeps its anger's target as a wolf does
@@ -3880,13 +3932,14 @@ fn flower_contact_effects(m: &mut Mob, w: &MobWorld) {
     );
 }
 
-/// MobEffect ticking for the effects mobs receive (poison, wither,
-/// regeneration), and a content mod's on a server.
+/// `LivingEntity.tickEffects`: tick active effects in place, including the
+/// consequences of each effect's hurt before starting the next effect.
 pub(crate) fn tick_effects(
     m: &mut Mob,
     context: &LoopContext,
     level: &mut DamageLevel<'_>,
     mods: Option<&dyn super::ModEffectTicks>,
+    mut after_hurt: impl FnMut(&mut Mob),
 ) {
     // LivingEntity.tickEffects ticks each active effect with the mob's list
     // still in place: the damage a Poison or Wither tick deals reads the
@@ -3926,10 +3979,12 @@ pub(crate) fn tick_effects(
                 if count % interval(25) == 0 && !m.kind.flags.undead && m.health > 1.0 =>
             {
                 m.damage(level, 1.0, Damage::of(DamageKind::Magic));
+                after_hurt(m);
             }
             "minecraft:wither" if count % interval(40) == 0 => {
                 // WitherMobEffect.applyEffectTick: damageSources().wither().
                 m.damage(level, 1.0, Damage::of(DamageKind::Wither));
+                after_hurt(m);
             }
             // InstantenousMobEffect: applied on every tick it has time left
             // (`/effect give` keeps the effect listed for its few ticks; the hit
@@ -3943,6 +3998,7 @@ pub(crate) fn tick_effects(
                     amp,
                     1.0,
                 );
+                after_hurt(m);
             }
             "minecraft:regeneration"
                 if count % interval(50) == 0 && !m.kind.flags.undead && m.alive() =>
@@ -3963,10 +4019,10 @@ pub(crate) fn tick_effects(
                 }
                 if let Some(mods) = mods
                     && let Some(index) = m.extra.effects[i].registry_index
-                    && !mods.tick_mod_effect(level, index, m, count, amp)
                 {
                     // Removed before it counts down.
-                    expired = true;
+                    expired = !mods.tick_mod_effect(level, index, m, count, amp);
+                    after_hurt(m);
                 }
             }
             _ => {}
@@ -4244,6 +4300,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(
             pig.health,
@@ -4261,6 +4318,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(
             zombie.health, initial_zombie_health,
@@ -4318,6 +4376,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             &mut crate::health::TestLevel::new(0).level(),
             None,
+            |_| {},
         );
         assert_eq!(golem.health, 64.0);
     }
@@ -4352,6 +4411,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(golem.health, 68.0);
         let mut golem = make("minecraft:iron_golem");
@@ -4361,6 +4421,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(golem.health, 54.0);
         // The undead are healed by harm.
@@ -4371,6 +4432,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(zombie.health, 64.0);
         // Resistance V (amplifier 4) takes it all, III takes 80%.
@@ -4420,6 +4482,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert!(pig.is_invisible());
         pig.invisible = false;
@@ -4428,6 +4491,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert!(!pig.is_invisible());
         pig.add_effect("speed", 10, 0);
@@ -4436,6 +4500,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert!(pig.is_invisible());
         tick_effects(
@@ -4443,6 +4508,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert!(!pig.is_invisible());
     }
@@ -4466,6 +4532,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert!(!pig.is_invisible());
         pig.invisible = true;
@@ -4474,6 +4541,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(pig.extra.effects[0].duration, 600);
         assert!(
@@ -4511,6 +4579,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(pig.health, 19.2);
         // `onMobHurt` finds Infested in the same in-place list: the hurt mob
@@ -4531,6 +4600,7 @@ mod poison_effect_tests {
                 crate::test_resources::server_loop_context(),
                 level,
                 None,
+                |_| {},
             );
             pig.outbox
                 .iter()
@@ -4563,6 +4633,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             &mut test_level.level(),
             None,
+            |_| {},
         );
         assert!(pig.extra.effects.is_empty());
         // A poison with no remaining duration does not get its first tick either.
@@ -4596,6 +4667,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(pig.health, 1.0);
         for effect in [
@@ -4636,6 +4708,7 @@ mod poison_effect_tests {
             crate::test_resources::server_loop_context(),
             level,
             None,
+            |_| {},
         );
         assert_eq!(
             pig.last_damage.map(|(d, _)| d.kind),
@@ -5840,6 +5913,29 @@ mod forgiveness_tests {
         }
     }
 
+    /// Their anger target and timer (`updatePersistentAnger`) outlast the
+    /// target they hold: `NeutralMob.playerDied` ends both through
+    /// `stopBeingAngry` when they name the dying player, chased or out of
+    /// sight, so the mob is not angry at them once they respawn.
+    #[test]
+    fn a_dying_player_ends_the_anger_target_and_timer() {
+        for species in [Species::Enderman, Species::ZombifiedPiglin] {
+            for target in [Some(Who::Player), None] {
+                let mut m = mob(species);
+                m.extra.anger = 400;
+                m.extra.angry_at = Some(Who::Player);
+                m.ai.target = target;
+                assert!(forgives_dead_player(&m), "{species:?} {target:?}");
+                forgive_dead_player(&mut m);
+                assert_eq!(m.ai.target, None, "{species:?} {target:?}");
+                assert!(
+                    !crate::mobs::neutral_anger::angry_at_player(&m, true),
+                    "{species:?} {target:?}"
+                );
+            }
+        }
+    }
+
     /// The iron golem's anger is a timer and its target: the dying player
     /// it is angry at ends both (`NeutralMob.playerDied`), even once the golem
     /// has lost sight of them, and anger at another mob stays.
@@ -6489,6 +6585,25 @@ mod burn_and_rose_tests {
         );
         assert!(ran, "the vanilla test resources must be available");
     }
+
+    /// `LavaCauldronBlock.entityInside` ignites and hurts a mob standing in a
+    /// lava cauldron as lava does (#13100: a chicken farm's cauldron).
+    #[test]
+    #[ignore = "daily"]
+    fn a_lava_cauldron_burns_the_mob_inside_it() {
+        let build = build_with("minecraft:lava_cauldron");
+        let mut test_level = crate::health::TestLevel::new(0);
+        let level = &mut test_level.level();
+        let ran = crate::mobs::world::with_built_test_world(&[], build, |w, types| {
+            let mut m = golem(types);
+            let mut events = Vec::new();
+            let start = m.health;
+            base_tick(&mut m, w, level, &mut events);
+            assert_eq!(m.health, start - 4.0, "one lava hit");
+            assert_eq!(m.fire_ticks, 300, "ignited to the full time");
+        });
+        assert!(ran, "the vanilla test resources must be available");
+    }
 }
 
 #[cfg(test)]
@@ -6930,6 +7045,42 @@ mod ravager_noai_tests {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod witch_noai_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Vanilla 26.3: `LivingEntity.tick` calls `aiStep` whether or not the
+    /// mob has AI, and `Witch.aiStep` picks a potion (fire resistance while
+    /// it burns) before `super.aiStep()`. A burning NoAI witch drinks it
+    /// (#16909's sweep: vanilla holds the potion, Horizon held nothing).
+    #[test]
+    #[ignore = "daily"]
+    fn a_burning_noai_witch_still_drinks_fire_resistance() {
+        let ran = crate::mobs::world::with_test_world(&[], |w, types| {
+            let kind = Arc::new(types.types["minecraft:witch"].clone());
+            let mut mob = Mob::new(1, kind, Vec3::new(16.5, 101.0, 16.5), 0.0);
+            mob.no_ai = true;
+            mob.no_gravity = true;
+            mob.persistent = true;
+            mob.fire_ticks = 300;
+            let mut test_level = crate::health::TestLevel::new(0);
+            let mut events = Vec::new();
+            let drank = (1..=200).find(|_| {
+                tick(&mut mob, w, &mut test_level.level(), &mut events);
+                mob.has_effect("minecraft:fire_resistance")
+            });
+            assert!(
+                drank.is_some(),
+                "a burning NoAI witch had no fire resistance after 200 ticks"
+            );
+        });
+        if !ran {
+            eprintln!("Prepared mob data unavailable; witch NoAI coverage did not run");
+        }
     }
 }
 
@@ -7646,6 +7797,7 @@ mod hidden_speed_causal_tests {
             crate::test_resources::server_loop_context(),
             &mut crate::health::TestLevel::new(0).level(),
             None,
+            |_| {},
         );
         assert!(m.extra.effects.is_empty() && m.extra.effect_chains.is_empty());
         m.add_effect("speed", -1, 0);
@@ -7655,6 +7807,7 @@ mod hidden_speed_causal_tests {
             crate::test_resources::server_loop_context(),
             &mut crate::health::TestLevel::new(0).level(),
             None,
+            |_| {},
         );
         assert_eq!(
             m.extra
@@ -7670,6 +7823,7 @@ mod hidden_speed_causal_tests {
             crate::test_resources::server_loop_context(),
             &mut crate::health::TestLevel::new(0).level(),
             None,
+            |_| {},
         );
         assert_eq!(
             m.extra
@@ -7684,6 +7838,7 @@ mod hidden_speed_causal_tests {
             crate::test_resources::server_loop_context(),
             &mut crate::health::TestLevel::new(0).level(),
             None,
+            |_| {},
         );
         assert_eq!(
             m.extra
@@ -7746,6 +7901,7 @@ mod hidden_speed_causal_tests {
                 crate::test_resources::server_loop_context(),
                 &mut crate::health::TestLevel::new(0).level(),
                 Some(&cancel),
+                |_| {},
             );
             assert_eq!(cancel.0.get(), 1);
             assert!(m.extra.effects.is_empty() && m.extra.effect_chains.is_empty());
@@ -7926,6 +8082,7 @@ mod hidden_absorption_promotion_tests {
                 crate::test_resources::server_loop_context(),
                 &mut crate::health::TestLevel::new(0).level(),
                 None,
+                |_| {},
             );
         }
         assert_eq!(m.extra.effects.len(), 1);
