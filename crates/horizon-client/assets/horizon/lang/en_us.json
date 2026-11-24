@@ -341,7 +341,7 @@
   "TFR History Stability": "TFR History Stability",
   "TFR Cut Distance": "TFR Cut Distance",
   "TFR Cut Angle": "TFR Cut Angle",
-  "Alternates rendered and reprojected frames. Needs HDR's float frame and a supported device; disables frame generation. Off by default.": "Alternates rendered and reprojected frames. Needs HDR's float frame and a supported device; disables frame generation. Off by default.",
+  "Needs HDR's float frame; disables frame generation.": "Needs HDR's float frame; disables frame generation.",
   "How strongly history is reused (1.0: full).": "How strongly history is reused (1.0: full).",
   "Smooths stable areas; too high blurs motion.": "Smooths stable areas; too high blurs motion.",
   "Camera movement that forces a rendered frame.": "Camera movement that forces a rendered frame.",

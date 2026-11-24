@@ -434,7 +434,7 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                         h(
                             H::Tfr,
                             Medium,
-                            "Alternates rendered and reprojected frames. Needs HDR's float frame and a supported device; disables frame generation. Off by default.",
+                            "Needs HDR's float frame; disables frame generation.",
                         ),
                         h(
                             H::TfrReprojectionStrength,

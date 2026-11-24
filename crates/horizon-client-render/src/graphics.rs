@@ -1791,7 +1791,8 @@ mod tests {
             upscaling: Upscaling::Balanced,
             upscaling_sharpness: 40,
             screenshot_quality: 4,
-            frame_generation: FrameGeneration::Fsr31,
+            // TFR is on in this fixture, so frame generation is forced off by parse().
+            frame_generation: FrameGeneration::Off,
             hdr: HdrMode::On,
             hdr_paper_white: 240,
             hdr_peak: 1400,
