@@ -83,6 +83,7 @@ pub(crate) fn install() {
                     *amount += 1.0;
                 }
             },
+            living_heal_cause: |_, _, _, _| {},
             living_breathe: |context, _, kind, can_breathe, consume, _| {
                 if context.setting("rules_mod", "stack").is_some() {
                     // A cod breathes on land; a salmon loses all its air at once.
@@ -91,6 +92,11 @@ pub(crate) fn install() {
                         "minecraft:salmon" => i32::MAX,
                         _ => *consume + 4,
                     };
+                }
+            },
+            player_login_profile: |player, name, properties| {
+                if mod_api::__private::listened(mod_api::HookId::PlayerLoginProfile) {
+                    mod_api::dispatch_player_login_profile(player, name, properties);
                 }
             },
             farmland_trample: |context, _, _, _, _, cancel| {

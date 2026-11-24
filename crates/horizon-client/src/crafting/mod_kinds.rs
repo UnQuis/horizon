@@ -222,10 +222,11 @@ impl Recipes {
         height: usize,
         map_scale: &dyn Fn(i32) -> Option<u8>,
     ) -> Option<(&str, ItemStack)> {
-        let vanilla = Input::of(grid, size);
+        let vanilla = Input::of_rect(grid, size, width, height);
         if vanilla.is_none() && !self.mod_crafting {
             return None;
         }
+        let vanilla_stacks = vanilla.as_ref().map(InputStacks::from_input);
         let input = self
             .mod_crafting
             .then(|| snapshot_dimensions(grid, size, width, height))
@@ -242,7 +243,10 @@ impl Recipes {
                     .and_then(|input| recipe.assemble_owned(input.clone())),
                 _ => vanilla
                     .as_ref()
-                    .and_then(|input| Self::assemble_if_matches(&ctx, input, recipe)),
+                    .zip(vanilla_stacks.as_ref())
+                    .and_then(|(input, stacks)| {
+                        Self::assemble_if_matches(&ctx, input, stacks.as_slice(), recipe)
+                    }),
             };
             if let Some(output) = result {
                 return output.map(|output| (id.as_str(), output));
@@ -293,8 +297,27 @@ impl Recipes {
     }
 }
 
+/// The requested names that are recipe serializers of another type, each with the type it
+/// reads as (`minecraft:crafting_shaped` is a `minecraft:crafting` recipe): a sync selects by
+/// type, so such a name selects nothing.
+pub fn serializers_asked_as_types(requested: &[String]) -> Vec<(&str, String)> {
+    requested
+        .iter()
+        .filter_map(|name| match recipe_type("sync", name) {
+            Ok(Reading::Type(kind)) if kind != *name => Some((name.as_str(), kind)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Recipe types selected for sync; registered crafting serializers share crafting.
 pub fn sync_recipe_types(requested: &[String]) -> Vec<String> {
+    for (serializer, kind) in serializers_asked_as_types(requested) {
+        log::warn!(
+            "datapack_sync asked for {serializer}, a recipe serializer: recipe types select \
+             recipes, so it selects none; ask for {kind}"
+        );
+    }
     let mut types = requested.to_vec();
     if !mod_api::__private::parts_installation::crafting_recipe_kinds().is_empty() {
         types.push("minecraft:crafting".into());

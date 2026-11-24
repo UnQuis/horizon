@@ -81,6 +81,11 @@ pub struct RecorderStatus {
 /// The session's recorder, shared with its network thread.
 type RecorderSlot = Arc<Mutex<Option<Box<dyn PacketRecorder>>>>;
 
+/// Private play marker on the integrated owner's memory connection. It orders
+/// export ticks with the ordinary packet queues without entering replays or mod hooks.
+#[doc(hidden)]
+pub const EXPORT_FENCE: i32 = -1;
+
 /// What the network thread reports to the game.
 pub enum Event {
     /// Progress text for the connecting screen.
@@ -412,20 +417,15 @@ impl Session {
             if let Some(w) = thread_writer.lock().unwrap().take() {
                 w.shutdown();
             }
-            // Nothing else tells the game the connection ended: wait for room (#18380).
-            let _ = send.send_waiting(Event::Disconnected {
-                reason: why.text,
-                key: why.key,
-                from_server,
-            });
+            publish_disconnect(&send, why, from_server);
         })
         .inspect_err(|error| {
             // No reader runs to report the end: say it here, or the session waits forever.
-            let _ = payload_events.send(Event::Disconnected {
-                reason: format!("network thread: {error}"),
-                key: None,
-                from_server: false,
-            });
+            publish_disconnect(
+                &payload_events,
+                Reason::plain(format!("network thread: {error}")),
+                false,
+            );
         })
         .ok();
         let debug = std::env::var_os("HORIZON_NET_DEBUG").is_some();
@@ -740,6 +740,15 @@ pub fn shown_address(address: &str) -> String {
     }
 }
 
+/// A disconnect reason as the log keeps it. The player sees the address they typed in the
+/// "invalid address" refusal; the log, which a bug report carries, gets `<server>` instead.
+pub fn logged_reason(reason: &str, key: Option<&str>) -> String {
+    match key {
+        Some("horizon.multiplayer.invalid_address") => "Invalid server address: <server>".into(),
+        _ => reason.to_owned(),
+    }
+}
+
 /// The relay the player set (`friendsRelay` in horizon.txt, beside
 /// options.txt), else the resolver's (`HORIZON_RELAY_URL`). None by default.
 pub fn friends_relay_setting() -> Option<String> {
@@ -829,15 +838,47 @@ impl Reason {
         r.text = r.text.replacen("%s", arg, 1);
         r
     }
+    /// Wraps the session service's reason in vanilla's login failure message.
+    /// Auto-reconnect uses the reason key, treating rate limits like temporary
+    /// outages and other plain-text refusals as permanent.
+    fn login_failure(error: crate::auth::JoinError, lang: &Language) -> Self {
+        let wrapper = "disconnect.loginFailedInfo";
+        let (reason, key) = match error.reason() {
+            Ok(key) => (tr(lang, key), key),
+            Err(message) if matches!(error, crate::auth::JoinError::RateLimited(_)) => (
+                message.to_owned(),
+                "disconnect.loginFailedInfo.serversUnavailable",
+            ),
+            Err(message) => (message.to_owned(), wrapper),
+        };
+        Self {
+            text: plain(&translatable(wrapper, &[&reason]), lang),
+            key: Some(key.to_owned()),
+        }
+    }
     /// A server's disconnect component: the resolved text and the
     /// `translate` key when the component named one (servers' literal
     /// kicks have none; their text is the server's own language).
     fn component(reason_json: &str, lang: &Language) -> Self {
         match serde_json::from_str::<serde_json::Value>(reason_json) {
-            Ok(v) => Self {
-                text: json_text(&v, lang),
-                key: v["translate"].as_str().map(str::to_owned),
-            },
+            Ok(v) => {
+                let text = json_text(&v, lang);
+                let root = v.as_array().and_then(|a| a.first()).unwrap_or(&v);
+                Self {
+                    text: if text.is_empty()
+                        && !is_json_component(&v, 0)
+                        && !reason_json.trim().is_empty()
+                    {
+                        reason_json.chars().take(200).collect()
+                    } else {
+                        text
+                    },
+                    key: root
+                        .get("translate")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                }
+            }
             Err(_) => Self::plain(reason_json),
         }
     }
@@ -904,10 +945,15 @@ fn connect_tcp(
     Ok((c, host, port))
 }
 
-/// Whether joining servers of older releases is on (roadmap `older-servers`): off by default while the
-/// adapter is incomplete; `HORIZON_OLDER_SERVERS=1` turns it on.
+/// Whether joining servers of older releases is on (roadmap `older-servers`): on by default;
+/// `HORIZON_OLDER_SERVERS=0` turns it off.
 pub fn older_servers_enabled() -> bool {
-    std::env::var_os("HORIZON_OLDER_SERVERS").is_some_and(|v| v == "1")
+    older_servers_setting(std::env::var_os("HORIZON_OLDER_SERVERS").as_deref())
+}
+
+/// [`older_servers_enabled`] for a given `HORIZON_OLDER_SERVERS` value: only `0` turns it off.
+fn older_servers_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
 }
 
 /// The older release a server speaks, by its status ping, when Horizon can translate it; `None` for the
@@ -970,7 +1016,12 @@ fn run(
         let (host, port, token) = match address.strip_prefix(FRIEND) {
             Some(code) => join_friend(code, lang, send)?,
             None => {
-                let Some(target) = parse_address(address) else {
+                let target = if lan {
+                    lan_target(address)
+                } else {
+                    parse_address(address)
+                };
+                let Some(target) = target else {
                     // A refusal: never retried (`horizon.multiplayer
                     // .invalid_address` is in reconnect's key list).
                     return Err(Reason::keyed_arg(
@@ -1050,23 +1101,8 @@ fn run(
                         .ok_or_else(|| Reason::keyed("horizon.multiplayer.not_signed_in", lang))
                         .and_then(|account| {
                             let hash = server_hash(&hello.server_id, &secret, &hello.public_key);
-                            // The session service's refusal: the wrapped
-                            // `disconnect.loginFailedInfo` text is shown, and
-                            // the inner key (the reason's own) classifies
-                            // (`reconnect::allowed`).
-                            crate::auth::join_server(account, &hash).map_err(|err| {
-                                let (reason, key) = match err.reason() {
-                                    Ok(key) => (tr(lang, key), Some(key.to_owned())),
-                                    Err(message) => (message.to_owned(), None),
-                                };
-                                Reason {
-                                    text: plain(
-                                        &translatable("disconnect.loginFailedInfo", &[&reason]),
-                                        lang,
-                                    ),
-                                    key,
-                                }
-                            })
+                            crate::auth::join_server(account, &hash)
+                                .map_err(|error| Reason::login_failure(error, lang))
                         });
                     if let Err(reason) = authenticated {
                         if !continues_after_failed_join(lan, signed_in) {
@@ -1179,6 +1215,14 @@ fn receive_play(
         let (id, payload) = reader
             .recv()
             .map_err(|e| Reason::plain(connection_lost(e, lang)))?;
+        if id == EXPORT_FENCE && reader.is_memory() && payload.len() == size_of::<u64>() {
+            deliver(
+                send,
+                lang,
+                Event::Packet(Box::new(play::Clientbound::Unknown(id, payload))),
+            )?;
+            continue;
+        }
         let packet = match play::Clientbound::decode_with_payload_codecs(
             id,
             &payload,
@@ -1321,6 +1365,16 @@ fn receive_play(
 fn deliver(send: &ingress::Producer<Event>, lang: &Language, event: Event) -> Result<(), Reason> {
     send.send_waiting(event)
         .map_err(|refused| refusal(refused, lang))
+}
+
+fn publish_disconnect(send: &ingress::Producer<Event>, why: Reason, from_server: bool) {
+    // The game may be retaining every ordinary receive lease behind an export
+    // fence. Keep the disconnect ordered, but publish it in the control allowance.
+    let _ = send.send_over_budget(Event::Disconnected {
+        reason: why.text,
+        key: why.key,
+        from_server,
+    });
 }
 
 /// Why an event the game must get was refused. One larger than the whole incoming queue
@@ -1512,12 +1566,11 @@ fn configure(
                 };
                 // Horizon servers use the client brand to negotiate their extensions.
                 // Announce those only after the server identifies itself as Horizon.
+                // Velocity appends " (Velocity)" to the brand the server announced.
                 if p.channel == "minecraft:brand"
                     && horizon_protocol::buf::Reader::new(&p.data)
                         .string(32767)
-                        .ok()
-                        .as_deref()
-                        == Some("horizon")
+                        .is_ok_and(|brand| horizon_server_brand(&brand))
                 {
                     if let Some(control) = negotiation.require_protocol() {
                         send_control(control, &mut build_sent)?;
@@ -1647,6 +1700,14 @@ fn configure(
     }
 }
 
+/// A server brand this client negotiates Horizon's protocol with. Velocity
+/// appends ` (Velocity)` to the brand the server sent, so we accept both
+/// `"horizon"` and `"horizon (Velocity)"` explicitly without matching
+/// arbitrary `"horizon (...)"` prefixes.
+fn horizon_server_brand(brand: &str) -> bool {
+    matches!(brand, "horizon" | "horizon (Velocity)")
+}
+
 /// A failed `horizon:payloads` negotiation. In the first configuration it names the server's
 /// build (`None`: one from before builds were named, so older) and this one, unless they are the
 /// same; a reconfiguration keeps the negotiation's own error.
@@ -1688,62 +1749,107 @@ fn brand() -> Vec<u8> {
     w.data
 }
 
+/// Returns whether `v` is a recognisable JSON chat component (as opposed to an
+/// arbitrary unknown JSON payload like `{"custom": ...}` or `null`).
+fn is_json_component(v: &serde_json::Value, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match v {
+        serde_json::Value::String(_)
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => true,
+        serde_json::Value::Array(a) => {
+            !a.is_empty() && a.iter().all(|e| is_json_component(e, depth + 1))
+        }
+        serde_json::Value::Object(o) => [
+            "text",
+            "translate",
+            "keybind",
+            "selector",
+            "score",
+            "nbt",
+            "object",
+            "extra",
+        ]
+        .iter()
+        .any(|k| o.contains_key(*k)),
+        serde_json::Value::Null => false,
+    }
+}
+
 /// Flatten a JSON chat component (login disconnects are JSON).
 /// At most `horizon_protocol::text::MAX_TEXT` bytes, as `plain`: a login-phase reason from a
 /// server is any JSON it likes.
 pub fn json_text(v: &serde_json::Value, lang: &Language) -> String {
+    let mut out = String::new();
+    append_json_text(v, lang, &mut out, 0);
+    out
+}
+
+fn append_json_text(v: &serde_json::Value, lang: &Language, out: &mut String, depth: usize) {
     use horizon_protocol::text::{MAX_TEXT, push_capped};
+    if depth > 32 || out.len() >= MAX_TEXT {
+        return;
+    }
     match v {
-        serde_json::Value::String(s) => {
-            let mut out = String::new();
-            push_capped(&mut out, s);
-            out
-        }
+        serde_json::Value::String(s) => push_capped(out, s),
+        serde_json::Value::Bool(b) => push_capped(out, if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => push_capped(out, &n.to_string()),
+        serde_json::Value::Null => {}
         serde_json::Value::Array(a) => {
-            let mut out = String::new();
             for e in a {
                 if out.len() >= MAX_TEXT {
                     break;
                 }
-                push_capped(&mut out, &json_text(e, lang));
+                append_json_text(e, lang, out, depth + 1);
             }
-            out
         }
         serde_json::Value::Object(o) => {
-            let mut out = if let Some(t) = o.get("text").and_then(|t| t.as_str()) {
-                let mut out = String::new();
-                push_capped(&mut out, t);
-                out
-            } else if let Some(key) = o.get("translate").and_then(|t| t.as_str()) {
+            if let Some(t) = o.get("text").and_then(serde_json::Value::as_str) {
+                push_capped(out, t);
+            } else if let Some(key) = o.get("translate").and_then(serde_json::Value::as_str) {
+                // One budget for all the arguments, as in `horizon_protocol::text::plain`.
+                let mut room = MAX_TEXT;
                 let args: Vec<String> = o
                     .get("with")
-                    .and_then(|w| w.as_array())
-                    .map(|a| a.iter().map(|e| json_text(e, lang)).collect())
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|e| {
+                                let mut s = String::new();
+                                if room > 0 {
+                                    append_json_text(e, lang, &mut s, depth + 1);
+                                    room = room.saturating_sub(s.len());
+                                }
+                                s
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let pattern = lang
                     .get(key)
                     .cloned()
                     .or_else(|| {
                         o.get("fallback")
-                            .and_then(|f| f.as_str())
+                            .and_then(serde_json::Value::as_str)
                             .map(str::to_owned)
                     })
                     .unwrap_or_else(|| key.to_owned());
-                horizon_protocol::text::format_java(&pattern, &args)
-            } else {
-                String::new()
-            };
-            if let Some(extra) = o.get("extra").and_then(|e| e.as_array()) {
+                push_capped(out, &horizon_protocol::text::format_java(&pattern, &args));
+            } else if let Some(key) = o.get("keybind").and_then(serde_json::Value::as_str) {
+                push_capped(out, lang.get(key).map_or(key, String::as_str));
+            }
+            // Vanilla leaves unresolved `selector` and `score` contents empty on the client.
+            if let Some(extra) = o.get("extra").and_then(serde_json::Value::as_array) {
                 for e in extra {
                     if out.len() >= MAX_TEXT {
                         break;
                     }
-                    push_capped(&mut out, &json_text(e, lang));
+                    append_json_text(e, lang, out, depth + 1);
                 }
             }
-            out
         }
-        other => other.to_string(),
     }
 }
 
@@ -1889,10 +1995,100 @@ fn continues_after_failed_join(lan: bool, signed_in: bool) -> bool {
     lan && signed_in
 }
 
+/// Where a LAN game's join leads: only an IP and a port from 1 to 65535 (the
+/// multiplayer list passes the sender's IP and the announced port). Anything
+/// else is an invalid address, so a LAN announcement never starts a host name
+/// or SRV lookup.
+fn lan_target(address: &str) -> Option<(String, u16)> {
+    let target: std::net::SocketAddr = address.parse().ok()?;
+    (target.port() != 0).then(|| (target.ip().to_string(), target.port()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lan_join_takes_only_an_ip_and_a_port() {
+        use super::lan_target;
+        assert_eq!(
+            lan_target("192.168.1.10:25565"),
+            Some(("192.168.1.10".to_owned(), 25565))
+        );
+        assert_eq!(
+            lan_target("[fe80::1]:25566"),
+            Some(("fe80::1".to_owned(), 25566))
+        );
+        for refused in [
+            "192.168.1.10:",
+            "10.0.0.2:x",
+            "10.0.0.2:0",
+            "10.0.0.2:80:evil.example",
+            "10.0.0.2:evil.example:80",
+            "evil.example:25565",
+            "localhost:25565",
+            "",
+        ] {
+            assert_eq!(lan_target(refused), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_refused_address_stays_out_of_the_logged_reason() {
+        // The text is in the player's language and holds what they typed; the key says which
+        // refusal it is.
+        let shown = "Ungültige Serveradresse: my-smp.example.com:99999";
+        let key = Some("horizon.multiplayer.invalid_address");
+        assert_eq!(
+            logged_reason(shown, key),
+            "Invalid server address: <server>"
+        );
+        assert_eq!(logged_reason("Timed out", None), "Timed out");
+    }
+
+    #[test]
+    fn older_servers_are_on_unless_the_variable_is_zero() {
+        use std::ffi::OsStr;
+        assert!(super::older_servers_setting(None));
+        assert!(super::older_servers_setting(Some(OsStr::new("1"))));
+        assert!(!super::older_servers_setting(Some(OsStr::new("0"))));
+    }
+
     use super::*;
     use horizon_world::native_load_context::DataLoadOrigin;
+
+    #[test]
+    fn session_join_retries_only_temporary_failures() {
+        let lang: Language = [(
+            "disconnect.loginFailedInfo".to_owned(),
+            "Failed to log in: %s".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        for (status, body, message, retry) in [
+            (429, "", "Status: 429", true),
+            (403, "", "Status: 403", false),
+            (
+                403,
+                r#"{"errorMessage":"Request refused"}"#,
+                "Request refused",
+                false,
+            ),
+        ] {
+            let error = crate::auth::JoinError::from_response(status, body);
+            let reason = Reason::login_failure(error, &lang);
+            assert_eq!(reason.text, format!("Failed to log in: {message}"));
+            assert_eq!(
+                crate::reconnect::allowed(&reason.text, reason.key.as_deref(), false),
+                retry,
+                "{status} {body}",
+            );
+        }
+        let unavailable = Reason::login_failure(crate::auth::JoinError::Unavailable, &lang);
+        assert!(crate::reconnect::allowed(
+            &unavailable.text,
+            unavailable.key.as_deref(),
+            false,
+        ));
+    }
 
     fn empty_item_data(name: &str) -> (PathBuf, Arc<ItemData>) {
         let root =
@@ -2149,7 +2345,14 @@ mod tests {
 
     #[test]
     fn configuration_keeps_mod_lists_private_until_the_server_identifies_as_horizon() {
-        for server_brand in ["vanilla", "horizon"] {
+        for (server_brand, expected_mods) in [
+            ("vanilla", false),
+            ("vanilla (Velocity)", false),
+            ("horizon (custom)", false),
+            ("horizon (Proxy)", false),
+            ("horizon", true),
+            ("horizon (Velocity)", true),
+        ] {
             let (root, data) = empty_item_data(&format!("mod-list-{server_brand}"));
             let (client, server) = horizon_protocol::connection::Pipe::pair();
             let (mut reader, writer) = Connection::local(client).split();
@@ -2210,7 +2413,7 @@ mod tests {
                     .encode(),
                 )
                 .unwrap();
-            if server_brand == "horizon" {
+            if expected_mods {
                 use horizon_protocol::payload_negotiation::{CHANNEL, Control};
                 server
                     .send(
@@ -2260,8 +2463,8 @@ mod tests {
                     _ => {}
                 }
             }
-            assert_eq!(declared_mods, server_brand == "horizon");
-            assert_eq!(saw_offer, server_brand == "horizon");
+            assert_eq!(declared_mods, expected_mods, "{server_brand}");
+            assert_eq!(saw_offer, expected_mods, "{server_brand}");
             server
                 .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
                 .unwrap();
@@ -2289,6 +2492,77 @@ mod tests {
         let v = serde_json::json!({ "text": "", "extra": [v.clone(), v] });
         let text = json_text(&v, &Language::default());
         assert!(text.len() <= horizon_protocol::text::MAX_TEXT);
+    }
+
+    #[test]
+    fn login_reason_joins_empty_root_text_with_nested_extra() {
+        let raw = r#"{"text":"","extra":[{"text":"Server "},{"text":"restarting","extra":[{"text":"!"}]}]}"#;
+        let reason = Reason::component(raw, &Language::default());
+        assert_eq!(reason.text, "Server restarting!");
+        assert_eq!(reason.key, None);
+    }
+
+    #[test]
+    fn login_reason_supports_keybind_and_leaves_unresolved_selector_score_and_null_empty() {
+        let mut lang = Language::default();
+        lang.insert("key.jump".into(), "Space".into());
+        let v = serde_json::json!({
+            "text": "",
+            "extra": [
+                { "keybind": "key.jump" },
+                " ",
+                { "selector": "@p" },
+                { "score": { "name": "Alex" } },
+                null
+            ]
+        });
+        assert_eq!(json_text(&v, &lang), "Space ");
+    }
+
+    #[test]
+    fn login_reason_valid_empty_components_stay_blank() {
+        assert_eq!(Reason::component(r#""""#, &Language::default()).text, "");
+        assert_eq!(
+            Reason::component(r#"{"text":""}"#, &Language::default()).text,
+            ""
+        );
+        assert_eq!(
+            Reason::component(r#"{"selector":"@p"}"#, &Language::default()).text,
+            ""
+        );
+        assert_eq!(
+            Reason::component(r#"{"score":{"name":"Alex"}}"#, &Language::default()).text,
+            ""
+        );
+    }
+
+    #[test]
+    fn login_reason_array_component_preserves_translate_key() {
+        let mut lang = Language::default();
+        lang.insert(
+            "multiplayer.disconnect.kicked".into(),
+            "Kicked by an operator".into(),
+        );
+        let raw = r#"[{"translate":"multiplayer.disconnect.kicked"},{"text":": Maintenance"}]"#;
+        let reason = Reason::component(raw, &lang);
+        assert_eq!(reason.text, "Kicked by an operator: Maintenance");
+        assert_eq!(reason.key.as_deref(), Some("multiplayer.disconnect.kicked"));
+    }
+
+    #[test]
+    fn login_reason_deeply_nested_extra_stops_at_depth_limit() {
+        let mut v = serde_json::json!({ "text": "deep" });
+        for _ in 0..40 {
+            v = serde_json::json!({ "text": "", "extra": [v] });
+        }
+        assert_eq!(json_text(&v, &Language::default()), "");
+    }
+
+    #[test]
+    fn login_reason_empty_unknown_object_falls_back_to_raw_json() {
+        let raw = r#"{"custom":"unexpected_kick_payload"}"#;
+        let reason = Reason::component(raw, &Language::default());
+        assert_eq!(reason.text, raw);
     }
 
     fn pack(namespace: &str, id: &str, version: &str) -> cfg::KnownPack {
@@ -2364,6 +2638,18 @@ mod tests {
         assert_eq!(r.entries[2].data, None);
     }
 
+    #[test]
+    fn a_velocity_suffix_is_still_a_horizon_server() {
+        assert!(horizon_server_brand("horizon"));
+        assert!(horizon_server_brand("horizon (Velocity)"));
+        assert!(!horizon_server_brand("horizon (custom)"));
+        assert!(!horizon_server_brand("horizon (Proxy)"));
+        assert!(!horizon_server_brand("vanilla"));
+        assert!(!horizon_server_brand("horizonx"));
+        assert!(!horizon_server_brand("horizon("));
+        assert!(!horizon_server_brand(""));
+    }
+
     /// Launchers find the last server joined in `latest.log` by vanilla's line.
     #[test]
     fn the_connecting_line_is_vanillas() {
@@ -2386,11 +2672,13 @@ mod tests {
     #[ignore = "daily"]
     fn direct_login_preserves_hostname_and_negotiates_brand() {
         let (root, data) = empty_item_data("brand");
-        for server_brand in [
-            b"\x07vanilla".as_slice(),
-            b"\x07horizon",
-            b"\x05Paper",
-            b"\xff",
+        for (server_brand, expects_offer) in [
+            (b"\x07vanilla".as_slice(), false),
+            (b"\x12vanilla (Velocity)", false),
+            (b"\x07horizon", true),
+            (b"\x12horizon (Velocity)", true),
+            (b"\x05Paper", false),
+            (b"\xff", false),
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -2403,6 +2691,20 @@ mod tests {
                 Arc::clone(&data),
             );
             let (stream, _) = listener.accept().unwrap();
+            // Older-server detection pings the address on a second connection before the login
+            // handshake goes out; dropping that one leaves the release unknown, so this one
+            // (the login) is the one under test. With detection off no second one arrives.
+            listener.set_nonblocking(true).unwrap();
+            let waited = std::time::Instant::now();
+            while waited.elapsed() < Duration::from_secs(2) {
+                match listener.accept() {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("accept: {e}"),
+                }
+            }
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -2465,7 +2767,7 @@ mod tests {
                 drop(session);
                 continue;
             }
-            if server_brand == b"\x07horizon" {
+            if expects_offer {
                 use horizon_protocol::payload_negotiation::{CHANNEL, Control};
                 server
                     .send(
@@ -2483,8 +2785,16 @@ mod tests {
                         .encode(),
                 )
                 .unwrap();
-            if server_brand == b"\x07horizon" {
+            if expects_offer {
                 use horizon_protocol::payload_negotiation::{CHANNEL, Control, Manifest};
+                let (id, body) = server.recv().unwrap();
+                assert_eq!(
+                    cfg::Serverbound::decode(id, &body).unwrap(),
+                    cfg::Serverbound::CustomPayload(cfg::CustomPayload {
+                        channel: crate::build_mismatch::CHANNEL.into(),
+                        data: crate::build_mismatch::encode(&crate::build_mismatch::this_build()),
+                    })
+                );
                 let (id, body) = server.recv().unwrap();
                 assert_eq!(
                     cfg::Serverbound::decode(id, &body).unwrap(),
@@ -2539,7 +2849,7 @@ mod tests {
                     packet => panic!("unexpected configuration reply: {packet:?}"),
                 }
             }
-            assert_eq!(saw_protocol_offer, server_brand == b"\x07horizon");
+            assert_eq!(saw_protocol_offer, expects_offer, "{server_brand:?}");
             drop(server);
             drop(session);
         }
@@ -2593,6 +2903,30 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect()
+    }
+
+    #[test]
+    fn export_disconnect_uses_control_credit_when_gameplay_fills_the_budget() {
+        let packet_charge = horizon_mod_runtime::byte_channel::message_overhead::<Event>() + 1;
+        let (send, events) = ingress::channel(packet_charge, |_: &Event| 1).unwrap();
+        send.send(Event::Packet(Box::new(play::Clientbound::Unknown(
+            1,
+            Vec::new(),
+        ))))
+        .unwrap();
+        let held = events.try_recv_owned().unwrap();
+        assert_eq!(events.stats().reserved_bytes, packet_charge);
+
+        let reader = std::thread::spawn(move || {
+            publish_disconnect(&send, Reason::plain("test close"), true);
+        });
+        let disconnect = events.recv_timeout_owned(Duration::from_secs(1));
+        drop(held);
+        reader.join().unwrap();
+        assert!(matches!(
+            disconnect.unwrap().into_parts().0,
+            Event::Disconnected { reason, from_server: true, .. } if reason == "test close"
+        ));
     }
 
     #[test]
@@ -2885,6 +3219,87 @@ mod tests {
                 "disconnect took {elapsed:?}"
             );
         }
+    }
+
+    #[test]
+    fn export_fences_order_local_play_traffic_in_both_directions() {
+        use crate::lan::{Lan, NetConfig, NetEvent, data::SyncData};
+        use horizon_protocol::packets::play::{Clientbound as C, Serverbound as S};
+        use std::time::Instant;
+
+        let (root, data) = empty_item_data("export-fence");
+        let lan = Lan::start_with(
+            Arc::new(SyncData::empty()),
+            NetConfig {
+                singleplayer_profile: Some(("Owner".into(), offline_uuid("Owner"))),
+                announce: false,
+                listen: false,
+                ..NetConfig::loopback(0, "Export".into(), 2)
+            },
+        )
+        .unwrap();
+        let session = Session::connect_local(
+            lan.connect_local().unwrap(),
+            "Owner",
+            None,
+            cfg::ClientInformation::new(2),
+            Arc::new(Language::new()),
+            data,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let joined = loop {
+            if let Some(joined) =
+                lan.poll()
+                    .into_iter()
+                    .find_map(|receipt| match receipt.into_parts().0 {
+                        NetEvent::Joined(joined) => Some(joined),
+                        _ => None,
+                    })
+            {
+                break joined;
+            }
+            assert!(Instant::now() < deadline, "local fixture did not join");
+            std::thread::yield_now();
+        };
+        let receive = || loop {
+            if let Ok(receipt) = session.events.recv_timeout_owned(Duration::from_secs(2)) {
+                match receipt.into_parts().0 {
+                    Event::Packet(packet) => break *packet,
+                    Event::Disconnected { reason, .. } => panic!("{reason}"),
+                    _ => {}
+                }
+            } else {
+                panic!("local play packet did not arrive");
+            }
+        };
+
+        let movement = S::MovePlayerPos(play::MovePlayerPos {
+            x: 4.0,
+            y: 65.0,
+            z: 7.0,
+            flags: 1,
+        });
+        let input_fence = 43_u64.to_be_bytes().to_vec();
+        session.send(movement.clone());
+        session.send(S::Unknown(EXPORT_FENCE, input_fence.clone()));
+        assert_eq!(receive(), C::Unknown(EXPORT_FENCE, input_fence));
+        assert!(lan.poll().into_iter().any(|receipt| matches!(
+            receipt.into_parts().0, NetEvent::Packet(conn, packet, _)
+                if conn == joined.conn && *packet == movement
+        )));
+
+        let time = C::SetTime(play::SetTime {
+            game_time: 121,
+            clocks: Vec::new(),
+        });
+        let output_fence = C::Unknown(EXPORT_FENCE, 44_u64.to_be_bytes().to_vec());
+        joined.sender.send(time.encode());
+        joined.sender.send(output_fence.encode());
+        assert_eq!(receive(), time);
+        assert_eq!(receive(), output_fence);
+
+        drop(session);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

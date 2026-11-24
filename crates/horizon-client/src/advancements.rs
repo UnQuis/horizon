@@ -74,6 +74,24 @@ pub struct Tree {
     /// What the criteria of each trigger may ask of the player's level,
     /// statistics, advancements and recipes (`index_player_facts`).
     player_fact_triggers: HashMap<String, FactsAsked>,
+    /// Necessary pre-filters aligned with `by_trigger["minecraft:tick"]` so
+    /// unmet tick advancements are skipped before building an `EntityView`.
+    tick_filters: Vec<TickFilter>,
+}
+/// Necessary conjunctive requirements extracted from a `"minecraft:tick"`
+/// criterion's top-level player predicate. If any required flag or item slot is
+/// absent on the acting player, the full JSON predicate cannot pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TickFilter {
+    pub requires_sneaking: bool,
+    pub requires_sprinting: bool,
+    pub requires_swimming: bool,
+    pub requires_on_fire: bool,
+    pub requires_vehicle: bool,
+    pub requires_effects: bool,
+    /// Bitmask over `[mainhand, offhand, head, chest, legs, feet]`.
+    pub requires_equipment_mask: u8,
+    pub requires_location_block: Option<String>,
 }
 /// Which of `PlayerPredicate`'s level, `stats`, `advancements` and `recipes`
 /// a trigger's criteria may test: only those are filled in its player view.
@@ -149,20 +167,17 @@ fn frame(v: &Value) -> Frame {
     }
 }
 impl Tree {
-    /// `PlayerAdvancements.checkForAutomaticTriggers`: the advancements that
-    /// have no criteria at all, so nothing can ever grant them a criterion and
-    /// vanilla hands them over (and grants their rewards) as the player's
-    /// progress loads.
+    /// `PlayerAdvancements.checkForAutomaticTriggers`: the advancements without criteria, which
+    /// nothing can grant: vanilla hands them over (and their rewards) as the progress loads.
     pub fn automatic(&self) -> Vec<usize> {
         (0..self.list.len())
             .filter(|&i| self.list[i].criteria.is_empty())
             .collect()
     }
 
-    /// [`Tree::load`], shared while anyone holds it: a server's advancement
-    /// packets (`ServerAdvancements`) and its game's criteria read the same
-    /// files, and each kept its own copy (7 MB). A world whose data packs bring
-    /// advancements gets its own tree ([`Tree::load_with`]).
+    /// [`Tree::load`], shared while anyone holds it: a server's advancement packets
+    /// (`ServerAdvancements`) and its game's criteria read the same files, and each kept its own
+    /// copy (7 MB). A world whose packs bring advancements gets its own ([`Tree::load_with`]).
     pub fn shared(data: &Path, overlay: &horizon_world::loot::PackOverlay) -> Arc<Tree> {
         if overlay.kind("advancement").next().is_some() {
             return Arc::new(Tree::load_with(data, overlay));
@@ -238,6 +253,7 @@ impl Tree {
         tree.index_looking_at();
         tree.index_nbt();
         tree.index_player_facts();
+        tree.index_tick_filters();
         tree
     }
     /// Index the `recipe_unlocked` criteria by recipe: a grant that unlocks
@@ -342,6 +358,24 @@ impl Tree {
             .get(trigger)
             .copied()
             .unwrap_or_default()
+    }
+    /// Pre-compile necessary conjunctive filters aligned with `by_trigger["minecraft:tick"]`.
+    pub fn index_tick_filters(&mut self) {
+        self.tick_filters.clear();
+        let Some(list) = self.by_trigger.get("minecraft:tick") else {
+            return;
+        };
+        self.tick_filters.reserve(list.len());
+        for &(ai, ci) in list {
+            let conditions = self.list[ai].criteria[ci].conditions.read();
+            let mut filter = TickFilter::default();
+            collect_tick_player_filter(&conditions["player"], &mut filter);
+            self.tick_filters.push(filter);
+        }
+    }
+    /// Necessary pre-filters aligned with `by_trigger["minecraft:tick"]`.
+    pub fn tick_filters(&self) -> &[TickFilter] {
+        &self.tick_filters
     }
     /// The `recipe_unlocked` criteria that could pass for `recipe`, in tree
     /// order (the others name another recipe).
@@ -531,21 +565,35 @@ pub fn date_millis(text: &str) -> Option<i64> {
     let zone = zone.trim_start_matches(['+', '-']);
     let offset =
         zone.get(0..2)?.parse::<i64>().ok()? * 3600 + zone.get(2..4)?.parse::<i64>().ok()? * 60;
-    // Days from civil (Howard Hinnant's algorithm).
-    let y = if m <= 2 { y - 1 } else { y };
+    // Days from civil (Howard Hinnant's algorithm), checked: a text outside the range of a date is `None`.
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let y = if m <= 2 { y.checked_sub(1)? } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let mp = (m + 9) % 12;
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days * 86400 + h * 3600 + min * 60 + sec - sign * offset) * 1000)
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    let secs = days
+        .checked_mul(86400)?
+        .checked_add(h.checked_mul(3600)?)?
+        .checked_add(min.checked_mul(60)?)?
+        .checked_add(sec)?
+        .checked_sub(sign * offset)?;
+    secs.checked_mul(1000)
 }
 
 /// The player's progress: advancement -> criterion -> obtained date.
 #[derive(Default, Clone)]
 pub struct Progress {
     pub criteria: BTreeMap<String, BTreeMap<String, String>>,
+    /// What the game keeps with the player's progress (it travels with the player).
+    pub memo: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 impl Progress {
     pub fn has(&self, adv: &str, criterion: &str) -> bool {
@@ -555,17 +603,25 @@ impl Progress {
     }
     /// `AdvancementProgress.isDone`.
     pub fn done(&self, a: &Advancement) -> bool {
-        !a.requirements.is_empty()
-            && a.requirements
-                .iter()
-                .all(|group| group.iter().any(|c| self.has(&a.id, c)))
+        if a.requirements.is_empty() {
+            return false;
+        }
+        let Some(got) = self.criteria.get(&a.id) else {
+            return false;
+        };
+        a.requirements
+            .iter()
+            .all(|group| group.iter().any(|c| got.contains_key(c)))
     }
     /// Completed requirement groups and their count (the screen's tooltip).
     pub fn counts(&self, a: &Advancement) -> (usize, usize) {
+        let Some(got) = self.criteria.get(&a.id) else {
+            return (0, a.requirements.len());
+        };
         let done = a
             .requirements
             .iter()
-            .filter(|g| g.iter().any(|c| self.has(&a.id, c)))
+            .filter(|g| g.iter().any(|c| got.contains_key(c)))
             .count();
         (done, a.requirements.len())
     }
@@ -578,6 +634,7 @@ impl Progress {
         true
     }
     pub fn revoke(&mut self, adv: &str, criterion: &str) -> bool {
+        self.memo = None;
         self.criteria
             .get_mut(adv)
             .is_some_and(|m| m.remove(criterion).is_some())
@@ -622,7 +679,15 @@ pub trait World {
     /// Effective rain/thunder booleans, including the level's dimension rules.
     fn weather(&self) -> (bool, bool);
     fn biome(&self, pos: [i32; 3]) -> String;
+    /// Evaluate `f` with the biome id at `pos` without forcing a `String` allocation.
+    fn check_biome(&self, pos: [i32; 3], f: &mut dyn FnMut(&str) -> bool) -> bool {
+        f(&self.biome(pos))
+    }
     fn structures(&self, pos: [i32; 3]) -> Vec<String>;
+    /// True when any structure at `pos` satisfies `f`, without cloning the list per criterion.
+    fn any_structure(&self, pos: [i32; 3], f: &mut dyn FnMut(&str) -> bool) -> bool {
+        self.structures(pos).iter().any(|s| f(s))
+    }
     /// Block name and properties.
     fn block(&self, pos: [i32; 3]) -> (String, BTreeMap<String, String>);
     /// Legal values of the actual registered property, unavailable without registry access.
@@ -965,17 +1030,19 @@ pub fn location(v: &Value, p: [f64; 3], w: &dyn World) -> bool {
     {
         return false;
     }
-    if !v["biomes"].is_null() && !id_matches(&v["biomes"], "worldgen/biome", &w.biome(pos), w) {
+    if !v["biomes"].is_null()
+        && !w.check_biome(pos, &mut |b| {
+            id_matches(&v["biomes"], "worldgen/biome", b, w)
+        })
+    {
         return false;
     }
-    if !v["structures"].is_null() {
-        let here = w.structures(pos);
-        if !here
-            .iter()
-            .any(|s| id_matches(&v["structures"], "worldgen/structure", s, w))
-        {
-            return false;
-        }
+    if !v["structures"].is_null()
+        && !w.any_structure(pos, &mut |s| {
+            id_matches(&v["structures"], "worldgen/structure", s, w)
+        })
+    {
+        return false;
     }
     if let Some(b) = v["can_see_sky"].as_bool()
         && b != w.can_see_sky(pos)
@@ -1479,8 +1546,113 @@ pub fn conditions(v: &Value, ctx: &Entities, w: &dyn World) -> bool {
     references_valid(v, w) && conditions_with(v, ctx, &mut |v, ctx| condition_leaf(v, ctx, w))
 }
 
+fn collect_tick_player_filter(v: &Value, filter: &mut TickFilter) {
+    match v {
+        Value::Array(list) => {
+            for item in list {
+                collect_tick_player_filter(item, filter);
+            }
+        }
+        Value::Object(o) if o.contains_key("condition") || o.contains_key("type") => {
+            let ty = o
+                .get("condition")
+                .or_else(|| o.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match &*full(ty) {
+                "minecraft:all_of" => {
+                    for term in terms(v) {
+                        collect_tick_player_filter(term, filter);
+                    }
+                }
+                "minecraft:entity_properties"
+                    if o.get("entity")
+                        .and_then(Value::as_str)
+                        .is_none_or(|e| e == "this") =>
+                {
+                    collect_entity_filter(&v["predicate"], filter)
+                }
+                _ => {}
+            }
+        }
+        Value::Object(_) => collect_entity_filter(v, filter),
+        _ => {}
+    }
+}
+
+fn collect_entity_filter(predicate: &Value, filter: &mut TickFilter) {
+    let Some(o) = predicate.as_object() else {
+        return;
+    };
+    for (key, p) in o {
+        match &*full(key) {
+            "minecraft:flags" => {
+                if p["is_sneaking"].as_bool() == Some(true) {
+                    filter.requires_sneaking = true;
+                }
+                if p["is_sprinting"].as_bool() == Some(true) {
+                    filter.requires_sprinting = true;
+                }
+                if p["is_swimming"].as_bool() == Some(true) {
+                    filter.requires_swimming = true;
+                }
+                if p["is_on_fire"].as_bool() == Some(true) {
+                    filter.requires_on_fire = true;
+                }
+            }
+            "minecraft:vehicle" if !p.is_null() => {
+                filter.requires_vehicle = true;
+            }
+            "minecraft:effects" if p.as_object().is_some_and(|m| !m.is_empty()) => {
+                filter.requires_effects = true;
+            }
+            "minecraft:equipment" => {
+                const SLOTS: [&str; 6] = ["mainhand", "offhand", "head", "chest", "legs", "feet"];
+                for (bit, slot) in SLOTS.iter().enumerate() {
+                    if !p[*slot].is_null() {
+                        filter.requires_equipment_mask |= 1 << bit;
+                    }
+                }
+            }
+            "minecraft:location" => {
+                if let Some(block) = p["block"]["blocks"].as_str()
+                    && !block.starts_with('#')
+                {
+                    filter.requires_location_block = Some(full(block).into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn has_string_reference(v: &Value) -> bool {
+    match v {
+        Value::String(_) => true,
+        Value::Array(list) => list.iter().any(has_string_reference),
+        Value::Object(o) => {
+            let kind = o
+                .get("condition")
+                .or_else(|| o.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match &*full(kind) {
+                "minecraft:inverted" => has_string_reference(&v["term"]),
+                "minecraft:all_of" | "minecraft:any_of" => {
+                    terms(v).iter().any(has_string_reference)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Every named predicate `v` reaches is loaded, and none reaches itself.
 pub fn references_valid(v: &Value, w: &dyn World) -> bool {
+    if !has_string_reference(v) {
+        return true;
+    }
     predicate_references(v, w, &mut BTreeSet::new()).is_ok()
 }
 
@@ -3439,6 +3611,18 @@ mod tests {
         assert_eq!(date_millis("not a date"), None);
     }
     #[test]
+    fn a_date_outside_the_range_is_not_a_date() {
+        // the year would overflow the arithmetic; a month or day that does not exist is no date either
+        assert_eq!(date_millis("999999999999999 01-01 10:00:00 +0000"), None);
+        assert_eq!(
+            date_millis("9223372036854775807-05-05 10:00:00 +0000"),
+            None
+        );
+        assert_eq!(date_millis("2026-13-01 10:00:00 +0000"), None);
+        assert_eq!(date_millis("2026-05-00 10:00:00 +0000"), None);
+        assert_eq!(date_millis(""), None);
+    }
+    #[test]
     fn simulate_progression_advancements() {
         let mut tree = Tree::default();
         let advs = [
@@ -3746,5 +3930,237 @@ mod tests {
             };
             assert!(entity(&p, &view, &super::Flat, [0.0; 3]));
         }
+    }
+
+    #[test]
+    fn tick_filter_never_rejects_matching_entity_views() {
+        use serde_json::json;
+
+        struct BlockWorld {
+            block_name: &'static str,
+        }
+        impl World for BlockWorld {
+            fn dimension(&self) -> &str {
+                "minecraft:overworld"
+            }
+            fn weather(&self) -> (bool, bool) {
+                (false, false)
+            }
+            fn biome(&self, _: [i32; 3]) -> String {
+                "minecraft:plains".into()
+            }
+            fn structures(&self, _: [i32; 3]) -> Vec<String> {
+                Vec::new()
+            }
+            fn block(&self, _: [i32; 3]) -> (String, BTreeMap<String, String>) {
+                (self.block_name.into(), BTreeMap::new())
+            }
+            fn fluid(&self, _: [i32; 3]) -> Option<String> {
+                None
+            }
+            fn can_see_sky(&self, _: [i32; 3]) -> bool {
+                true
+            }
+            fn light(&self, _: [i32; 3]) -> i32 {
+                15
+            }
+            fn smokey(&self, _: [i32; 3]) -> bool {
+                false
+            }
+            fn in_tag(&self, _: &str, _: &str, _: &str) -> bool {
+                false
+            }
+        }
+
+        let filter_matches_view = |f: &TickFilter, e: &EntityView, w: &dyn World| -> bool {
+            if f.requires_sneaking && !e.sneaking {
+                return false;
+            }
+            if f.requires_sprinting && !e.sprinting {
+                return false;
+            }
+            if f.requires_swimming && !e.swimming {
+                return false;
+            }
+            if f.requires_on_fire && !e.on_fire {
+                return false;
+            }
+            if f.requires_vehicle && e.vehicle.is_none() {
+                return false;
+            }
+            if f.requires_effects && e.effects.is_empty() {
+                return false;
+            }
+            for bit in 0..6 {
+                if (f.requires_equipment_mask & (1 << bit)) != 0 && e.equipment[bit].is_none() {
+                    return false;
+                }
+            }
+            if let Some(wanted) = &f.requires_location_block {
+                let pos = [
+                    e.position[0].floor() as i32,
+                    e.position[1].floor() as i32,
+                    e.position[2].floor() as i32,
+                ];
+                if &w.block(pos).0 != wanted {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let predicates = [
+            json!({"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}, "equipment": {"feet": {"items": "minecraft:leather_boots"}}}}),
+            json!({"condition": "minecraft:all_of", "terms": [
+                {"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sprinting": true, "is_on_fire": true}}},
+                {"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"location": {"block": {"blocks": "minecraft:water"}}}}
+            ]}),
+            json!({"flags": {"is_swimming": true, "is_flying": true}, "stepping_on": {"block": {"blocks": "minecraft:stone"}}}),
+            json!({"vehicle": {"entity_type": "minecraft:horse"}, "effects": {"minecraft:speed": {}}}),
+            json!({"condition": "minecraft:inverted", "term": {"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}}}}),
+            json!({"condition": "minecraft:any_of", "terms": [{"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}}}, {"flags": {"is_sprinting": true}}]}),
+        ];
+
+        let mut views = Vec::new();
+        for sneaking in [false, true] {
+            for sprinting in [false, true] {
+                for swimming in [false, true] {
+                    for on_fire in [false, true] {
+                        for flying in [false, true] {
+                            for has_feet in [false, true] {
+                                let mut eq: [Option<ItemView>; 7] = Default::default();
+                                if has_feet {
+                                    eq[5] = Some(ItemView {
+                                        id: "minecraft:leather_boots".into(),
+                                        count: 1,
+                                        ..Default::default()
+                                    });
+                                }
+                                views.push(EntityView {
+                                    kind: "minecraft:player".into(),
+                                    position: [0.5, 64.0, 0.5],
+                                    on_fire,
+                                    sneaking,
+                                    sprinting,
+                                    swimming,
+                                    flying,
+                                    equipment: eq,
+                                    vehicle: Some(Box::new(EntityView {
+                                        kind: "minecraft:horse".into(),
+                                        ..Default::default()
+                                    })),
+                                    effects: vec![("minecraft:speed".into(), 0, 100)],
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        views.push(EntityView {
+            kind: "minecraft:player".into(),
+            ..Default::default()
+        });
+
+        for block_name in ["minecraft:air", "minecraft:water", "minecraft:stone"] {
+            let w = BlockWorld { block_name };
+            for p in &predicates {
+                let mut filter = TickFilter::default();
+                collect_tick_player_filter(p, &mut filter);
+                for v in &views {
+                    let ctx = Entities {
+                        this: Some(v),
+                        origin: v.position,
+                        tool: None,
+                        block_pos: None,
+                    };
+                    if conditions(p, &ctx, &w) {
+                        assert!(
+                            filter_matches_view(&filter, v, &w),
+                            "TickFilter rejected view accepted by conditions! pred={p} filter={filter:?} view={v:?} block={block_name}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Gliding/stepping predicates must not constrain the pre-filter (safe wrt #17473).
+        let mut fly_step_filter = TickFilter::default();
+        collect_tick_player_filter(&predicates[2], &mut fly_step_filter);
+        assert!(fly_step_filter.requires_swimming);
+        assert!(filter_matches_view(
+            &fly_step_filter,
+            &EntityView {
+                swimming: true,
+                flying: false,
+                ..Default::default()
+            },
+            &BlockWorld {
+                block_name: "minecraft:air",
+            }
+        ));
+    }
+
+    #[test]
+    fn references_valid_fast_path_matches_full_scan() {
+        let w = Flat;
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!([{"condition": "minecraft:entity_properties", "entity": "this", "predicate": {"flags": {"is_sneaking": true}}}]),
+            serde_json::json!({"condition": "minecraft:all_of", "terms": [{"condition": "minecraft:entity_properties", "predicate": {}}]}),
+            serde_json::json!({"condition": "minecraft:inverted", "term": "missing:ref"}),
+            serde_json::json!({"condition": "minecraft:any_of", "terms": ["missing:ref"]}),
+        ] {
+            assert_eq!(
+                references_valid(&v, &w),
+                predicate_references(&v, &w, &mut BTreeSet::new()).is_ok(),
+                "{v}"
+            );
+        }
+    }
+
+    fn tree_from_entries<I>(entries: I) -> Tree
+    where
+        I: IntoIterator<Item = (String, Value)>,
+    {
+        let mut tree = Tree::default();
+        for (id, v) in entries {
+            if let Some(a) = parse(&id, &v) {
+                let index = tree.list.len();
+                for (ci, c) in a.criteria.iter().enumerate() {
+                    tree.by_trigger
+                        .entry(c.trigger.clone())
+                        .or_default()
+                        .push((index, ci));
+                }
+                tree.by_id.insert(id, index);
+                tree.list.push(a);
+            }
+        }
+        tree.index_tick_filters();
+        tree
+    }
+
+    #[test]
+    fn progress_done_and_counts_match_empty_and_partial_states() {
+        let tree = tree_from_entries([(
+            "minecraft:test/a".to_owned(),
+            serde_json::json!({
+                "criteria": {
+                    "c1": {"trigger": "minecraft:tick", "conditions": {"player": {"flags": {"is_sneaking": true}}}},
+                    "c2": {"trigger": "minecraft:tick", "conditions": {}}
+                },
+                "requirements": [["c1", "c2"]]
+            }),
+        )]);
+        assert_eq!(tree.tick_filters().len(), 2);
+        let a = &tree.list[0];
+        let mut progress = Progress::default();
+        assert!(!progress.done(a));
+        assert_eq!(progress.counts(a), (0, 1));
+        assert!(progress.grant(&a.id, "c1", "2026-01-01"));
+        assert!(progress.done(a));
+        assert_eq!(progress.counts(a), (1, 1));
     }
 }

@@ -6,8 +6,8 @@ use super::{
     anim::{Poses, State},
     brain::{Ttl, living_near, melee_attack, melee_attack_by_age},
     goals::{
-        Cx, Float, Goal, HurtByTarget, LOOK, LookAtPlayer, MOVE, NearestTarget, Prey,
-        RandomLookAround, Stroll, TARGET, TargetState, goal_clone, target_continue,
+        Cx, Goal, HurtByTarget, LOOK, LookAtPlayer, MOVE, NearestTarget, Prey, RandomLookAround,
+        Stroll, TARGET, TargetState, goal_clone, target_continue,
     },
 };
 use horizon_core::geometry::{Vec3, trig::Mth};
@@ -1330,7 +1330,7 @@ pub fn register_piglin(m: &mut Mob) {
     // `AbstractPiglin.<init>`: a piglin's navigation opens doors.
     m.ai.nav.can_open_doors = true;
     let g = &mut m.ai.goals;
-    g.add(0, Float);
+    // `PiglinAi` has no `FloatGoal`: a piglin sinks in water.
     // `PiglinAi.initCoreActivity`: `InteractWithDoor.create()`.
     g.add(0, super::doors::InteractWithDoor::default());
     g.add(1, Admire);
@@ -1463,7 +1463,7 @@ impl Goal for HuntHoglin {
 }
 pub fn register_brute(m: &mut Mob) {
     let g = &mut m.ai.goals;
-    g.add(0, Float);
+    // `PiglinBruteAi` has no `FloatGoal`: a brute sinks in water.
     // `PiglinBruteAi.initFightActivity`: `MeleeAttack.create(20)`.
     g.add(2, melee_attack(20));
     // `PiglinBruteAi.createIdleMovementBehaviors`: `StrollToPoi(HOME, 0.6, 2,
@@ -1541,7 +1541,7 @@ impl Goal for BruteStrollHome {
 }
 pub fn register_hoglin(m: &mut Mob) {
     let g = &mut m.ai.goals;
-    g.add(0, Float);
+    // `HoglinAi.initCoreActivity` has only the look and move sinks: no `FloatGoal`.
     // `HoglinAi.initRetreatActivity`: `SetWalkTargetAwayFrom.entity(AVOID_TARGET, 1.3, 15, false)`.
     g.add(1, WalkAway::retreat(1.3, 15.0, false));
     // HoglinAi: MeleeAttack.create(40) for adults, 15 for babies, in the
@@ -1569,7 +1569,7 @@ pub fn register_hoglin(m: &mut Mob) {
 }
 pub fn register_zoglin(m: &mut Mob) {
     let g = &mut m.ai.goals;
-    g.add(0, Float);
+    // `Zoglin` registers no `FloatGoal` either: it sinks in water.
     // `Zoglin.initFightActivity`: `create(40)` for adults, 15 for babies.
     g.add(2, melee_attack_by_age(40, 15));
     g.add(5, Stroll::avoiding_water(0.4));
@@ -1970,24 +1970,7 @@ pub fn ai_step(
     if w.dimension_type.piglins_zombify && !m.extra.flag2 && m.alive() {
         m.extra.counter2 += 1;
         if m.extra.counter2 > CONVERSION {
-            // `Piglin.finishConversion` runs `PiglinAi.cancelAdmiring` first:
-            // the item the piglin is admiring leaves the off hand and lands
-            // where it stands, so the zombified piglin never carries it.
-            if m.species() == Species::Piglin {
-                let admiring = (m.extra.off_hand_id().is_some() && m.extra.using_item > 0)
-                    || m.extra.piglin.seen_admire > 0;
-                if admiring
-                    && let Some(item) = m.extra.take_slot_id(horizon_items::equipment::OFFHAND)
-                {
-                    events.push(MobEvent::DropItem {
-                        mob: m.id,
-                        item,
-                        count: 1,
-                        at: [m.position.x, m.position.y, m.position.z],
-                    });
-                    m.extra.using_item = 0;
-                }
-            }
+            finish_conversion_drops(m, events);
             // `Hoglin.finishConversion` is `ConversionParams.single(this, true,
             // false)`, `AbstractPiglin.finishConversion` `(this, true, true)`;
             // both leave the new mob nauseous (the game adds it).
@@ -2012,16 +1995,6 @@ pub fn ai_step(
                 ),
             };
             events.push(MobEvent::Sound(sound, m.center(), 1.0, 1.0));
-            // Conversion also drops the piglin's internal inventory.
-            if m.species() == Species::Piglin {
-                for stack in m.extra.inventory.drain(..).filter(|stack| stack.count > 0) {
-                    events.push(MobEvent::DropStack {
-                        mob: m.id,
-                        stack,
-                        at: [m.position.x, m.position.y, m.position.z],
-                    });
-                }
-            }
             // `Hoglin.finishConversion` is `ConversionParams.single(this, true,
             // false)`, `AbstractPiglin.finishConversion` `(this, true, true)`;
             // both leave the new mob nauseous.
@@ -2040,6 +2013,33 @@ pub fn ai_step(
     if m.species() == Species::Piglin && m.alive() && m.age.wrapping_add(m.id).is_multiple_of(20) {
         m.extra.repellent = find_piglin_repellent(m, w);
         piglin_sense(m, w);
+    }
+}
+/// What `Piglin.finishConversion` does before converting: `PiglinAi.cancelAdmiring`
+/// (the item being admired leaves the off hand and lands where the piglin stands)
+/// and dropping every stack of its inventory, so the zombified piglin carries neither.
+pub fn finish_conversion_drops(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    if m.species() != Species::Piglin {
+        return;
+    }
+    let at = [m.position.x, m.position.y, m.position.z];
+    let admiring = (m.extra.off_hand_id().is_some() && m.extra.using_item > 0)
+        || m.extra.piglin.seen_admire > 0;
+    if admiring && let Some(item) = m.extra.take_slot_id(horizon_items::equipment::OFFHAND) {
+        events.push(MobEvent::DropItem {
+            mob: m.id,
+            item,
+            count: 1,
+            at,
+        });
+        m.extra.using_item = 0;
+    }
+    for stack in m.extra.inventory.drain(..).filter(|stack| stack.count > 0) {
+        events.push(MobEvent::DropStack {
+            mob: m.id,
+            stack,
+            at,
+        });
     }
 }
 /// `PiglinSpecificSensor.findNearestRepellent`: the nearest `#piglin_repellents`

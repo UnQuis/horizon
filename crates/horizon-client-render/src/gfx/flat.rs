@@ -19,6 +19,15 @@
 //! start, and the run is drawn indirectly with the count the copy reached.
 use super::SolidPipeline;
 use super::arena::GRAIN;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic process-wide counter so block table generations never collide across `clear`,
+/// `trim`, or `take_tables`.
+static NEXT_BLOCK_TABLE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_block_table_generation() -> u64 {
+    NEXT_BLOCK_TABLE_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 #[path = "binding_cache.rs"]
 mod binding_cache;
@@ -69,6 +78,8 @@ pub const ARENA_BINDING: u32 = 19;
 struct PageTable {
     /// Section id of every block of the page.
     blocks: wgpu::Buffer,
+    /// Monotonic generation bumped on every write to `blocks` (`Flat::place`).
+    generation: u64,
     group: Option<wgpu::BindGroup>,
     /// The section arena's page `group` binds at `ARENA_BINDING` (`bind_pages`).
     arena: Option<wgpu::Buffer>,
@@ -223,10 +234,10 @@ fn parse_mesa_version(driver_info: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some(version)
 }
 
-/// Intel Gen11 (Ice Lake) and Gen12 (Tiger Lake, Rocket Lake, Alder Lake,
-/// Raptor Lake) ANV Vulkan drivers had broken `first_instance` for
-/// instance-step vertex attributes (#3529, #4599), causing terrain sections to
-/// be drawn with another section's origin and flicker.
+/// Intel Gen11 (Ice Lake, Jasper Lake) and Gen12 (Tiger Lake, Rocket Lake,
+/// Alder Lake, Raptor Lake) ANV Vulkan drivers had broken `first_instance` for
+/// instance-step vertex attributes (#3529, #4599, #19080), causing terrain
+/// sections to be drawn with another section's origin and flicker.
 ///
 /// PR #15007 tested Raptor Lake (RPL-U, 0xa7a1) on Mesa 26.0.8 without terrain
 /// flicker. Allow indirect multi-draw and GPU culling for Raptor Lake from that
@@ -249,6 +260,9 @@ pub fn is_broken_intel_vulkan(info: &wgpu::AdapterInfo) -> bool {
     matches!(
         info.device,
         0x8a50..=0x8a71 // Gen11: Ice Lake
+            | 0x4e55 // Gen11: Jasper Lake (UHD Graphics, #19080)
+            | 0x4e61
+            | 0x4e71
             | 0x9a40..=0x9a7f // Gen12: Tiger Lake
             | 0x4c80..=0x4c9a // Gen12: Rocket Lake
             | 0x4600..=0x46ff // Gen12: Alder Lake (incl. 0x46a8 in #4599)
@@ -256,6 +270,8 @@ pub fn is_broken_intel_vulkan(info: &wgpu::AdapterInfo) -> bool {
     ) || [
         "ICL",
         "Ice Lake",
+        "JSL",
+        "Jasper Lake",
         "TGL",
         "Tiger Lake",
         "RKL",
@@ -288,6 +304,18 @@ fn storage(binding: u32, stage: wgpu::ShaderStages, read_only: bool) -> wgpu::Bi
         },
         count: None,
     }
+}
+
+/// `buffer`, for one a frame grows: `None` where there was no room for it (#13624).
+fn grown(
+    device: &wgpu::Device,
+    label: &str,
+    size: u64,
+    usage: wgpu::BufferUsages,
+) -> Option<wgpu::Buffer> {
+    super::frame_targets::made(device, super::frame_targets::Kind::Buffers, || {
+        buffer(device, label, size, usage)
+    })
 }
 
 fn buffer(
@@ -439,12 +467,20 @@ impl Flat {
     ) -> Self {
         let vertex = wgpu::ShaderStages::VERTEX;
         let compute = wgpu::ShaderStages::COMPUTE;
+        let (vtm, vm) = if super::surface_setup::mesh_shader::on(device) {
+            (
+                vertex | wgpu::ShaderStages::TASK | wgpu::ShaderStages::MESH | compute,
+                vertex | wgpu::ShaderStages::MESH,
+            )
+        } else {
+            (vertex, vertex)
+        };
         let draw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Flat section draws"),
             entries: &[
-                storage(0, vertex, true),
-                storage(1, vertex, true),
-                storage(ARENA_BINDING, vertex, true),
+                storage(0, vtm, true),
+                storage(1, vtm, true),
+                storage(ARENA_BINDING, vm, true),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -657,9 +693,11 @@ impl Flat {
                 blocks * 4,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             ),
+            generation: 0,
             group: None,
             arena: None,
         });
+        table.generation = next_block_table_generation();
         let first = start / GRAIN;
         let ids = vec![id; vertices.div_ceil(GRAIN) as usize];
         uploads.buffer(
@@ -713,12 +751,66 @@ impl Flat {
             }
         }
     }
+    /// Uploads the frame's camera-relative origins by section id into `self.origins`, growing
+    /// the storage buffer if needed and resetting cached page bind groups so `bind_pages` rebinds.
+    /// `false`, with nothing uploaded and the old buffer kept, where there was no room to grow it
+    /// (#13624).
+    pub fn write_origins(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        uploads: &mut super::upload::Uploads,
+        origins: impl Iterator<Item = (u32, [f32; 4])>,
+    ) -> bool {
+        self.origin_data.clear();
+        self.origin_data.resize(self.next_id as usize, [0.0; 4]);
+        for (id, o) in origins {
+            let id = id as usize;
+            if self.origin_data.len() <= id {
+                self.origin_data.resize(id + 1, [0.0; 4]);
+            }
+            self.origin_data[id] = o;
+        }
+        if self.origin_data.len() as u64 > self.origin_capacity {
+            let capacity = (self.origin_data.len() as u64).next_power_of_two();
+            let usage = wgpu::BufferUsages::STORAGE;
+            let Some(origins) = grown(device, "Section origins by id", capacity * 16, usage) else {
+                return false;
+            };
+            self.origin_capacity = capacity;
+            self.origins = origins;
+            for page in self.pages.iter_mut().flatten() {
+                page.group = None;
+            }
+        }
+        if !self.origin_data.is_empty() {
+            uploads.buffer(
+                encoder,
+                &self.origins,
+                0,
+                bytemuck::cast_slice(&self.origin_data),
+            );
+        }
+        true
+    }
+    /// Lets go of the frame's flat bindings and calls: it draws section by section.
+    fn unbind(&mut self) {
+        self.phase2_group = None;
+        self.groups.clear();
+        self.calls.clear();
+        self.phase1_calls = 0;
+        self.solid_calls = 0;
+        self.shadow_calls = [0; 2];
+        self.marks = [0; MARKS];
+        self.pass_calls = [0; 3];
+    }
     /// Builds the frame's index list from `draws` (`DrawIndexedIndirectArgs`:
     /// index count, instances, first index, base vertex, first instance),
     /// solid ones first, with their (vertex page, sorted index page) and
     /// the origins of the sections they draw by id. Records the copy into
     /// `encoder`; `calls` then lists the frame's draw calls. False when the
-    /// frame cannot be drawn flat (the per-section draws then apply).
+    /// frame cannot be drawn flat (the per-section draws then apply), as where there was no room
+    /// to grow its tables (#13624).
     ///
     /// When culling, the solid draws from `phase1_draws` are phase 2's, which
     /// `phase2` holds as the test leaves them: `flatten_phase2` copies them.
@@ -748,33 +840,9 @@ impl Flat {
             solid_draws
         };
         // Origins by section id.
-        self.origin_data.clear();
-        for (id, o) in origins {
-            let id = id as usize;
-            if self.origin_data.len() <= id {
-                self.origin_data.resize(id + 1, [0.0; 4]);
-            }
-            self.origin_data[id] = o;
-        }
-        if self.origin_data.len() as u64 > self.origin_capacity {
-            self.origin_capacity = (self.origin_data.len() as u64).next_power_of_two();
-            self.origins = buffer(
-                device,
-                "Section origins by id",
-                self.origin_capacity * 16,
-                wgpu::BufferUsages::STORAGE,
-            );
-            for page in self.pages.iter_mut().flatten() {
-                page.group = None;
-            }
-        }
-        if !self.origin_data.is_empty() {
-            uploads.buffer(
-                encoder,
-                &self.origins,
-                0,
-                bytemuck::cast_slice(&self.origin_data),
-            );
+        if !self.write_origins(device, encoder, uploads, origins) {
+            self.unbind();
+            return false;
         }
         let Plan {
             phase1_calls,
@@ -806,33 +874,60 @@ impl Flat {
         self.pass_calls = pass_calls;
         if total == 0 || total * 4 > device.limits().max_storage_buffer_binding_size {
             // Do not retain bindings for a frame that cannot use flat draws.
-            self.phase2_group = None;
-            self.groups.clear();
-            self.calls.clear();
-            self.phase1_calls = 0;
-            self.solid_calls = 0;
-            self.shadow_calls = [0; 2];
-            self.marks = [0; MARKS];
-            self.pass_calls = [0; 3];
+            self.unbind();
             return false;
         }
-        if self.range_data.len() as u64 > self.range_capacity {
-            self.range_capacity = (self.range_data.len() as u64).next_power_of_two();
-            self.ranges = buffer(
-                device,
+        // Each table that has to grow is made before any is kept: without the room for one
+        // (#13624) the frame draws section by section, and the old ones stay.
+        let ranges = self.range_data.len() as u64;
+        let phase2_calls = (solid_calls - phase1_calls) as u64;
+        let phase2_usage = wgpu::BufferUsages::STORAGE
+            | if self.indirect_execution {
+                wgpu::BufferUsages::INDIRECT
+            } else {
+                wgpu::BufferUsages::empty()
+            };
+        let grow = |needed: u64, capacity: u64, label, stride, usage| {
+            if needed <= capacity {
+                return Some(None);
+            }
+            let capacity = needed.next_power_of_two();
+            grown(device, label, capacity * stride, usage).map(|b| Some((capacity, b)))
+        };
+        let (Some(new_ranges), Some(new_indices), Some(new_calls)) = (
+            grow(
+                ranges,
+                self.range_capacity,
                 "Flat section ranges",
-                self.range_capacity * 16,
+                16,
                 wgpu::BufferUsages::STORAGE,
-            );
-        }
-        if total > self.index_capacity {
-            self.index_capacity = total.next_power_of_two();
-            self.indices = buffer(
-                device,
+            ),
+            grow(
+                total,
+                self.index_capacity,
                 "Flat section indices",
-                self.index_capacity * 4,
+                4,
                 wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
-            );
+            ),
+            grow(
+                phase2_calls,
+                self.phase2_call_capacity,
+                "Flat section draw calls, phase 2",
+                20,
+                phase2_usage,
+            ),
+        ) else {
+            self.unbind();
+            return false;
+        };
+        if let Some((capacity, buffer)) = new_ranges {
+            (self.range_capacity, self.ranges) = (capacity, buffer);
+        }
+        if let Some((capacity, buffer)) = new_indices {
+            (self.index_capacity, self.indices) = (capacity, buffer);
+        }
+        if let Some((capacity, buffer)) = new_calls {
+            (self.phase2_call_capacity, self.phase2_calls) = (capacity, buffer);
         }
         uploads.buffer(
             encoder,
@@ -848,21 +943,7 @@ impl Flat {
                 .iter()
                 .map(|c| [0, 1, c.first, 0, if page_instances { c.page } else { 0 }]),
         );
-        let phase2_calls = self.phase2_call_data.len() as u64;
-        if phase2_calls > self.phase2_call_capacity {
-            self.phase2_call_capacity = phase2_calls.next_power_of_two();
-            self.phase2_calls = buffer(
-                device,
-                "Flat section draw calls, phase 2",
-                self.phase2_call_capacity * 20,
-                wgpu::BufferUsages::STORAGE
-                    | if self.indirect_execution {
-                        wgpu::BufferUsages::INDIRECT
-                    } else {
-                        wgpu::BufferUsages::empty()
-                    },
-            );
-        }
+        debug_assert_eq!(self.phase2_call_data.len() as u64, phase2_calls);
         if phase2_calls > 0 {
             uploads.buffer(
                 encoder,
@@ -1140,6 +1221,10 @@ impl Flat {
     pub(super) fn block_table(&self, page: u32) -> Option<&wgpu::Buffer> {
         Some(&self.pages.get(page as usize)?.as_ref()?.blocks)
     }
+    /// Monotonic generation counter for `page`'s block table, bumped on every `Flat::place`.
+    pub(super) fn block_table_generation(&self, page: u32) -> Option<u64> {
+        Some(self.pages.get(page as usize)?.as_ref()?.generation)
+    }
     pub(super) fn blocks_per_page(&self) -> u64 {
         self.blocks_per_page
     }
@@ -1272,6 +1357,9 @@ mod tests {
         // Earlier families keep their workaround even with a modern Mesa release.
         for (device, name) in [
             (0x8a52, "Intel Ice Lake"),
+            (0x4e55, "Intel(R) UHD Graphics (JSL)"),
+            (0x4e61, "Intel UHD Graphics"),
+            (0x4e71, "JasperLake [UHD Graphics]"),
             (0x9a49, "Intel Tiger Lake"),
             (0x4c8a, "Intel Rocket Lake"),
             (0x46a8, "Intel Alder Lake"),
@@ -1280,12 +1368,38 @@ mod tests {
             info.name = name.into();
             assert!(is_broken_intel_vulkan(&info), "{name}");
         }
+        // Jasper Lake by name alone too, with no PCI device id reported.
+        info.device = 0;
+        info.name = "Intel(R) UHD Graphics (JSL)".into();
+        assert!(is_broken_intel_vulkan(&info));
         // A Mesa-looking version cannot turn on this workaround for other backends/vendors.
         info.backend = wgpu::Backend::Dx12;
         assert!(!is_broken_intel_vulkan(&info));
         info.backend = wgpu::Backend::Vulkan;
         info.vendor = 0x10de;
         assert!(!is_broken_intel_vulkan(&info));
+    }
+
+    /// #19080: Jasper Lake flickers with indirect first-instance draws, so
+    /// vanilla terrain must take the flat path there at any section count.
+    #[test]
+    fn jasper_lake_draws_vanilla_terrain_flat() {
+        let info = wgpu::AdapterInfo {
+            name: "Intel(R) UHD Graphics (JSL)".into(),
+            vendor: 0x8086,
+            device: 0x4e55,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: "Intel open-source Mesa driver".into(),
+            driver_info: "Mesa 26.0.8".into(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        };
+        assert!(is_broken_intel_vulkan(&info));
+        assert!(for_vanilla(&info));
     }
 
     /// Draws as `render` writes them: solid (page, quads at a base vertex)
@@ -1675,5 +1789,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn block_table_generations_are_nonzero_and_unique_across_threads() {
+        let mut all: Vec<u64> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..256)
+                            .map(|_| next_block_table_generation())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert!(all.iter().all(|&g| g > 0));
+        all.sort_unstable();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(all.len(), before);
     }
 }

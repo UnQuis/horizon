@@ -150,6 +150,21 @@ pub struct Connection {
     pub reader: ConnReader,
     pub writer: ConnWriter,
 }
+/// A listener on every address of the machine, IPv6 and IPv4 at once, as Java's `ServerSocketChannel` bound
+/// to no address listens (a vanilla server with `server-ip` empty): `[::]` with `IPV6_V6ONLY` off, so an IPv4
+/// peer arrives as `::ffff:a.b.c.d`. `SO_REUSEADDR` as std's `TcpListener::bind` sets it on Unix, never on
+/// Windows (where it would let another program take the port). Blocking, like std's.
+pub fn bind_dual_stack(port: u16) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 fn configure_stream(stream: &TcpStream) -> Result<()> {
     stream.set_nodelay(true)?;
     let sock = socket2::SockRef::from(stream);
@@ -383,6 +398,11 @@ impl ConnReader {
         self.stream.read_exact(&mut out)?;
         Ok(out)
     }
+    /// Whether this reader uses the engine's in-memory transport.
+    pub fn is_memory(&self) -> bool {
+        self.memory
+    }
+
     /// Block until a whole packet arrives: (id, payload).
     pub fn recv(&mut self) -> Result<(i32, Vec<u8>)> {
         if let Some(packet) = self.adapter.as_ref().and_then(|a| a.next_incoming()) {
@@ -655,21 +675,31 @@ impl ConnWriter {
         self.stream.flush()?;
         Ok(())
     }
-    /// A packet body as this connection's client takes it: renumbered for a client of an older release
-    /// ([`Connection::serve_older`]), `None` when it has no such packet; as it is otherwise.
-    pub fn for_client<'a>(&self, body: &'a [u8]) -> Result<Option<std::borrow::Cow<'a, [u8]>>> {
+    /// Whether this connection serves a client of an older release ([`Connection::serve_older`]): only
+    /// then does a body become other bodies, so the rest can frame the borrowed body as it is.
+    pub fn serves_older_client(&self) -> bool {
+        self.older_client.is_some()
+    }
+    /// The packet bodies this connection's client takes for one body, in order: renumbered for a client of an
+    /// older release ([`Connection::serve_older`]), none when it has no such packet, and what the packet brought
+    /// with it (a boat's wood, an experience orb's value) after it; the body itself otherwise.
+    pub fn for_client<'a>(&self, body: &'a [u8]) -> Result<Vec<std::borrow::Cow<'a, [u8]>>> {
         match &self.older_client {
-            None => Ok(Some(std::borrow::Cow::Borrowed(body))),
-            Some(client) => Ok(client.clientbound(body)?.map(std::borrow::Cow::Owned)),
+            None => Ok(vec![std::borrow::Cow::Borrowed(body)]),
+            Some(client) => Ok(client
+                .clientbound_all(body)?
+                .into_iter()
+                .map(std::borrow::Cow::Owned)
+                .collect()),
         }
     }
     /// Send one packet body (VarInt id + payload).
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
         if self.older_client.is_some() {
-            return match self.for_client(body)? {
-                Some(body) => self.send_contents(&self.contents(&body)?),
-                None => Ok(()),
-            };
+            for body in self.for_client(body)? {
+                self.send_contents(&self.contents(&body)?)?;
+            }
+            return Ok(());
         }
         if let Some(a) = self.adapter.clone() {
             if let Some(body) = a.serverbound(body)? {

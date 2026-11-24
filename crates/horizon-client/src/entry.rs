@@ -24,6 +24,7 @@ impl Startup {
 /// and resource marker metadata only: no logging, account loading, mods or worker threads.
 /// Account IO, cwd changes and command registration remain in Options::read, after leases.
 pub fn prepare() -> Startup {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     horizon_mod_package::holder::enter();
     let result: crate::Result<_> = (|| {
         let mut command = std::process::Command::new(std::env::current_exe()?);
@@ -39,7 +40,10 @@ pub fn prepare() -> Startup {
     let Some(options) = options else {
         std::process::exit(0);
     };
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     let capture = horizon_mod_package::holder::acquire(&launch);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let capture = None;
     Startup {
         launch,
         options,
@@ -201,6 +205,9 @@ pub fn start<G>(
             alter_ground: crate::game::api_values::alter_ground,
             on_tree_grow: crate::game::native_tree_grow::on_tree_grow,
             rotate: crate::game::native_rotate::rotate,
+            can_survive: crate::game::native_survival::can_survive_v2,
+            may_place_on: crate::game::native_survival::may_place_on_v2,
+            can_sustain_plant: crate::game::native_survival::can_sustain_plant_v2,
             feature: crate::game::native_worldgen_parts::feature,
         },
     )
@@ -244,6 +251,10 @@ pub fn start<G>(
     }
     horizon_hooks::engine::shutdown();
     logging::flush();
+    // `/restart`: the world is saved; the supervisor reads this code as "start the game again".
+    if game::exit_code::restart_requested() {
+        std::process::exit(game::exit_code::RESTART);
+    }
 }
 
 pub(crate) fn install_client_hooks() {
@@ -264,6 +275,14 @@ pub(crate) fn install_client_hooks() {
             let context = reader.context();
             mod_api::dispatch_living_heal(&context, entity, amount, cancel);
         },
+        living_heal_cause: |context, entity, cause, amount| {
+            if !mod_api::__private::listened(mod_api::HookId::LivingHealCause) {
+                return;
+            }
+            let reader = horizon_client_render::api_context::LoopReader(context);
+            let context = reader.context();
+            mod_api::dispatch_living_heal_cause(&context, entity, cause, amount);
+        },
         living_breathe: |context, entity, kind, can_breathe, consume, refill| {
             if !mod_api::__private::listened(mod_api::HookId::LivingBreathe) {
                 return;
@@ -271,6 +290,12 @@ pub(crate) fn install_client_hooks() {
             let reader = horizon_client_render::api_context::LoopReader(context);
             let context = reader.context();
             mod_api::dispatch_living_breathe(&context, entity, kind, can_breathe, consume, refill);
+        },
+        player_login_profile: |player, name, properties| {
+            if !mod_api::__private::listened(mod_api::HookId::PlayerLoginProfile) {
+                return;
+            }
+            mod_api::dispatch_player_login_profile(player, name, properties);
         },
         farmland_trample: |context, entity, pos, state, distance, cancel| {
             if !mod_api::__private::listened(mod_api::HookId::FarmlandTrample) {

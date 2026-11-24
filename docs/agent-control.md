@@ -266,7 +266,8 @@ turn the switch off.
 - **Confirm what can't be undone.** A command that deletes the player's things requires
   `confirm` and carries the MCP `destructiveHint`. In the game these are `world-delete`, `fill`
   and `setblock` (the table's `DESTRUCTIVE`); in the launcher, `remove`, `modpack remove`,
-  `mods remove`, `servers forget` and `account sign-out` (`cli_tools::DESTRUCTIVE`).
+  `mods remove`, `servers forget` and `account sign-out` (`cli_tools::DESTRUCTIVE`), and what
+  decides what the next Play runs or joins: `instance launch`, `instance java` and `game-args`.
   Without `confirm: true` the call is refused and the message says to ask the player. In the game
   CLI the flag is `--confirm`. The launcher CLI asks nothing: a person typing `remove` meant it.
 - **Ask before reaching out.** A command that sends data or reaches other people carries
@@ -295,16 +296,19 @@ turn the switch off.
    {"id": "done", "kind": "button", "label": "Done", "bounds": [...], "enabled": true}]}
 ```
 
-- **Ids are stable and readable.** An id is the label up to its `:`, as a slug (`FOV: 70` is
-  `fov`, `AI Agent...` is `ai-agent`). A repeated slug gets `-2`, `-3`; unlabelled elements are
-  `<kind>-<n>`. A slider's id doesn't change with its value. Slots are `slot-<ID>` with their
-  stack.
+- **Registered IDs do not change with the client's language.** For example, `singleplayer`,
+  `create-new-world`, `options`, `fov`, `done` and `back-to-game` work in Russian and English;
+  `label` still contains the translated text. Widgets without a registered ID use the drawn
+  label up to its `:` as a slug (for example, `My World` is `my-world`). These fallback IDs can
+  change with the label; read `ui` to find them. Repeated slugs get `-2`, `-3`; unlabelled
+  elements are `<kind>-<n>`. Slots are `slot-<ID>` with their stack.
 - **Kinds:** `button`, `slider` (`value` 0..1), `field`, `row` (a world, server, pack or
   language), `tab` (`selected`), `slot`.
 - **Actions:**
   - `click ID [right|middle] [shift]` clicks where the mouse would.
   - `set ID VALUE` moves a slider.
   - `type` types into the focused field.
+  - `click-button LABEL` takes the displayed label, not a registered ID.
 
   After a click, the next `ui`, `click` or `set` waits for a redrawn frame. Right after
   `launch`, they and `screen` and `click-button` wait for the first one.
@@ -389,6 +393,41 @@ A recording is one folder, a bundle is that folder plus the logs in one zip:
   loading. It is not frame-perfect and only makes sense on the same build and machine;
   `state.jsonl` is the oracle for where the re-run should have ended. A server recording replays
   only `--in-place`, into the same world.
+
+### Fixed-clock offscreen export
+
+Start the game with `--offscreen` and enter a world or open a replay.
+
+```sh
+horizon-ctl export start portrait --size 1080x1920 --fps 30000/1001 --frames 90
+```
+
+The reply gives the absolute folder under the game's `exports/` and returns before frames are written.
+A PNG sequence is the default. To pipe RGB frames to the configured encoder in `horizon-export.txt`, use
+`--format encoder`. `export status` reports queued steps and frames written. `export stop` replies with
+`draining` while accepted frames are written and the output is finalized. `quit` cancels an active export,
+including one that is draining. On failure, `frames_written` is the count observed during abort.
+A PNG already being written may finish in the background. After the last readback, a stalled
+writer or manifest publication fails the export after 60 seconds. The final `export` event reports `finished` or `stopped` once
+`export.json` is published. If cancellation reaches a rename in progress, the failure event reports
+that publication could not be confirmed. Pass the last event sequence from before the start to
+`wait-for event export --since SEQ` if the export may finish before the wait starts.
+
+Use `--hold` to wait for `export step N`. You can issue control commands such as `tp` and `look` between
+steps. While a step is queued or an automatic export is running, only read-only commands, `export`,
+and `quit` are accepted. Captures wait for terrain,
+lighting, and uploads to settle, with a 30-second stall limit. For a live world they also wait for the
+server to send the view's remaining columns, even after the view's loading indicator expires. Use
+`--no-settle` to capture immediately.
+Use `--hud` to keep the HUD visible. During export, uploaded sections and their block entities
+appear fully visible so their fade-in does not depend on worker timing.
+
+The fixed clock drives the client and replay playhead. During live capture it also drives a private
+integrated server. External and published servers keep their own clocks. A standalone replay seeks back up to one second and ticks forward to the original
+position before capturing. An in-world replay starts where it is because it cannot rebuild the live world by
+seeking backwards. With settling enabled, replay exports advance through recorded portal
+loading intervals without writing frames. The output resumes at the next consecutive frame index
+once the destination has settled.
 
 ### Repeatable screenshots
 

@@ -72,7 +72,7 @@ struct Open {
 }
 
 /// `EntityTypeTags.CAN_WEAR_HORSE_ARMOR`.
-fn can_wear_horse_armor(species: Species) -> bool {
+pub(super) fn can_wear_horse_armor(species: Species) -> bool {
     matches!(species, Species::Horse | Species::ZombieHorse)
 }
 /// Whether `item` fits the body slot of the species (`isEquippableInSlot`).
@@ -282,6 +282,11 @@ impl Game<'_> {
                 horizon_client::item_sync::equip_sound(s, self.res.items())
                     .unwrap_or_else(|| "minecraft:item.armor.equip_generic".into())
             })
+        };
+        let slot = if saddle_put_on { "saddle" } else { "body" };
+        let sound = match (sound, put_on) {
+            (Some(sound), Some(stack)) => self.mod_equip_sound(stack, slot, Some(sound)),
+            (sound, _) => sound,
         };
         let m = &mut self.mobs[index];
         let id = m.id;
@@ -569,6 +574,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let mut verts = Vec::new();
+        let worn = self.mob_armor_layers(&m);
         // A screen preview: custom entity model animations see is_in_gui = 1.
         horizon_client::mobs::cem_anim::in_gui(|| {
             horizon_client::mobs::render::render_with(
@@ -578,6 +584,7 @@ impl Game<'_> {
                 &lookup,
                 240 | 240 << 8,
                 self.res.mob_data(),
+                &worn,
                 &[],
                 &mut verts,
             );

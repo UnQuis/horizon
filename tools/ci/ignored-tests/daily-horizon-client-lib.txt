@@ -46,7 +46,8 @@ horizon-client-lib entities::honey_slide_tests::a_resting_item_skips_move_three_
 horizon-client-lib entities::honey_slide_tests::an_item_at_the_top_of_a_bubble_column_is_at_its_surface lib daily resources
 horizon-client-lib entities::orb_lava_tests::a_burning_server_orb_is_hurt_every_twenty_ticks_and_burns_out lib daily resources
 horizon-client-lib entities::orb_lava_tests::a_server_orb_takes_lava_damage_after_moving_and_discards_at_zero lib daily resources
-horizon-client-lib entities::orb_lava_tests::an_invulnerable_orb_keeps_its_health_but_still_emits_lava_sound lib daily resources
+horizon-client-lib entities::orb_lava_tests::an_invulnerable_orb_keeps_its_health_and_makes_no_lava_sound lib daily resources
+horizon-client-lib entities::orb_lava_tests::an_invulnerable_orb_keeps_its_health_on_fire lib daily resources
 horizon-client-lib entities::orb_lava_tests::boundary_case_surviving_and_discarding_and_multi_contact_in_one_tick lib daily resources
 horizon-client-lib entities::orb_lava_tests::legacy_orb_in_air_or_water_or_non_lava_does_not_play_sound_or_consume_random lib daily resources
 horizon-client-lib entities::orb_lava_tests::negative_case_non_contact_or_client_orb_does_not_play_burn_sound lib daily resources
@@ -54,6 +55,12 @@ horizon-client-lib entities::orb_lava_tests::positive_case_server_orb_in_lava_pl
 horizon-client-lib entities::slime_bounce_tests::a_slime_bounce_marks_the_item_for_immediate_sync lib daily resources
 horizon-client-lib entities::world_border_tests::a_dropped_item_on_soul_sand_or_honey_is_slowed_by_the_move lib daily resources
 horizon-client-lib entities::world_border_tests::the_world_border_stops_items_and_experience_orbs lib daily resources
+horizon-client-lib export::sink::tests::a_stalled_encoder_releases_submission_and_shutdown_with_a_timeout lib daily child-process
+horizon-client-lib export::sink::tests::encoder_early_exit_reports_status_from_write_and_finish lib daily child-process
+horizon-client-lib export::sink::tests::missing_fd_output_leaves_the_export_directory_empty lib daily child-process
+horizon-client-lib export::sink::tests::protocol_probe_times_out_when_a_helper_keeps_stdout_open lib daily child-process
+horizon-client-lib export::sink::tests::slow_encoder_applies_backpressure_and_receives_frames_in_order lib daily child-process
+horizon-client-lib export::sink::tests::successful_encoder_exit_kills_helpers_without_inherited_pipes lib daily child-process
 horizon-client-lib item_render::special_parts_tests::a_parts_tint_reaches_the_vertices_as_a_vanilla_tint_does lib daily resources
 horizon-client-lib join_seq::visibility::tests::unbound_passes_block_until_restore_consumption_and_unwind lib daily child-process
 horizon-client-lib lan::conn::tests::profession_mod_missing_refused_before_pairing lib daily child-process
@@ -94,6 +101,7 @@ horizon-client-lib lan::tests::actor_ids_never_wrap lib daily network
 horizon-client-lib lan::viewed_levels::tests::a_viewed_sound_reaches_a_viewer_holding_its_chunk_within_its_distance lib daily network
 horizon-client-lib lan::viewed_levels::tests::with_no_viewer_no_copy_is_built lib daily network
 horizon-client-lib lan::waypoints::tests::moves_by_receiver_match_the_loop lib daily slow
+horizon-client-lib launch::tests::launch_gives_the_game_a_relative_socket_as_an_absolute_path bin:horizon-ctl daily child-process
 horizon-client-lib launch::tests::launch_refuses_a_socket_path_too_long bin:horizon-ctl daily child-process
 horizon-client-lib menu::equip_movement::tests::four_slot_menu_transfer_prepares_once_and_stale_placement_refuses lib daily resources
 horizon-client-lib menu::equip_movement::tests::menus_without_actor_or_equipment_candidates_do_not_prepare lib daily resources

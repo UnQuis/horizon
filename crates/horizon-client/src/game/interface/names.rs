@@ -438,22 +438,12 @@ impl Game<'_> {
                     continue;
                 }
             }
-            let height = match (a.marker, a.small) {
-                (true, _) => 0.0,
-                (false, true) => 0.9875,
-                (false, false) => 1.975,
-            };
+            let height = f64::from(a.box_size().1);
             let distance_sqr =
                 glam::DVec3::new(a.position.x, a.position.y, a.position.z).distance_squared(camera);
             let position = a.render_position(alpha);
             // Same dimensions and dragon-head growth as armor_stand_geometry.
-            let width = if a.marker {
-                0.0
-            } else if a.small {
-                0.25
-            } else {
-                0.5
-            };
+            let width = f64::from(a.box_size().0);
             let dragon = a.equipment[5]
                 .as_ref()
                 .is_some_and(|i| &*i.item == "minecraft:dragon_head");
@@ -726,6 +716,16 @@ impl Game<'_> {
         let forward = glam::DVec3::from_array(view_vector(view_yaw, view_pitch));
         let right = forward.cross(glam::DVec3::Y).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
+        // A mod's roll (`native_camera_roll`) turns the camera's right and up about its forward,
+        // as `Camera.setRotation`'s roll turns `Camera.rotation()`.
+        let (right, up) = if self.posed_roll == 0.0 {
+            (right, up)
+        } else {
+            // In f32, as the view's `view_roll` and the billboards' `rolled_camera` turn.
+            let (sin, cos) = self.posed_roll.to_radians().sin_cos();
+            let (sin, cos) = (f64::from(sin), f64::from(cos));
+            (right * cos - up * sin, right * sin + up * cos)
+        };
         let away = forward.as_vec3() * 0.002;
         let mut batch = HudBatch::new(
             [1, 1],

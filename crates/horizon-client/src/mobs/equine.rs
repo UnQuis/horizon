@@ -160,8 +160,12 @@ pub fn rear_offset(m: &Mob) -> [f64; 3] {
     [0.0, 0.15 * stand * scale, -0.7 * stand * scale]
 }
 /// `AbstractHorse.isImmobile`: no goals while it eats or rears. A mount its
-/// rider steers still takes their input (`travelRidden`).
+/// rider steers still takes their input (`travelRidden`). `Llama.isImmobile`:
+/// only while it eats (a loaded `EatingHaystack`; it never grazes).
 pub fn immobile(m: &Mob) -> bool {
+    if super::llama::is_llama(m.species()) {
+        return m.extra.flag;
+    }
     can_rear(m.species()) && (m.extra.flag || m.extra.counter > 0) && !controlled(m)
 }
 /// `AbstractHorse.onElasticLeashPull`: a lead pulled taut ends the horse's
@@ -1573,6 +1577,24 @@ mod tests {
         assert_eq!(m.extra.counter, 0);
     }
 
+    /// `Llama.isImmobile` is `isDeadOrDying() || isEating()`: an eating llama
+    /// runs no goals, and a llama does not stand (#18677).
+    #[test]
+    fn an_eating_llama_is_immobile() {
+        for (species, id) in [
+            (Species::Llama, "minecraft:llama"),
+            (Species::TraderLlama, "minecraft:trader_llama"),
+        ] {
+            let mut m = equine(1, species, id);
+            assert!(!immobile(&m), "{id}");
+            m.extra.flag = true;
+            assert!(immobile(&m), "{id} eating");
+            m.extra.flag = false;
+            m.extra.counter = 5;
+            assert!(!immobile(&m), "{id} has no standing");
+        }
+    }
+
     #[test]
     fn llamas_and_camels_never_rear_when_hurt() {
         let mut test_level = crate::health::TestLevel::new(0);
@@ -1698,6 +1720,50 @@ mod tests {
             outcomes,
             vec![true, false],
             "a mob-ridden horse bolts; a mob-ridden zombie horse is controlled"
+        );
+    }
+
+    /// `ZombieHorse.addBehaviourGoals` tempts with `#minecraft:zombie_horse_food`,
+    /// which `VanillaItemTagsProvider` fills with the red mushroom alone
+    /// (`ZombieHorse.isFood` reads the same tag): a player holding one tempts a
+    /// zombie horse, one holding its family's wheat does not.
+    #[test]
+    fn a_red_mushroom_tempts_a_zombie_horse() {
+        use crate::mobs::world::{test_player, with_test_world};
+        let tempted = |hand: &str| -> Option<bool> {
+            let mut out = None;
+            let ran = with_test_world(&[], |w, types| {
+                let mut world = w.clone();
+                let mut p = test_player(Vec3::new(5.5, 64.0, 0.5));
+                p.main_hand = Some(hand.into());
+                world.player = Some(p);
+                let kind = Arc::new(types.types["minecraft:zombie_horse"].clone());
+                let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+                register(&mut m);
+                m.on_ground = true;
+                let mut lr = crate::health::TestLevel::new(0);
+                let mut events = Vec::new();
+                let mut cx = Cx {
+                    w: &world,
+                    level: &mut lr.level(),
+                    events: &mut events,
+                };
+                let mut goals = std::mem::take(&mut m.ai.goals);
+                goals.tick(&mut m, &mut cx);
+                out = Some(goals.is_running("Tempt"));
+                m.ai.goals = goals;
+            });
+            let _ = ran;
+            out
+        };
+        let Some(mushroom) = tempted("minecraft:red_mushroom") else {
+            return;
+        };
+        assert!(mushroom, "a red mushroom tempts a zombie horse");
+        assert_eq!(
+            tempted("minecraft:wheat"),
+            Some(false),
+            "wheat is horse food, not zombie horse food"
         );
     }
 

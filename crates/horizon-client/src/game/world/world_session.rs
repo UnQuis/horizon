@@ -253,6 +253,9 @@ impl Game<'_> {
         // Native application termination can bypass CloseRequested. Finish any
         // save screen synchronously here, before the process can go away.
         while self.pending_save.is_some() {
+            if self.pending_mod_export() {
+                self.poll_export();
+            }
             self.poll_closing_save()?;
             if self.pending_save.is_some() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -293,6 +296,7 @@ impl Game<'_> {
     }
 
     pub(super) fn close_world(&mut self) -> Result<()> {
+        self.interrupt_export_for_world_exit("export interrupted because the world closed");
         self.destroying.clear();
         // Pause-menu and death-screen exits use the normal world-close action.
         // A standalone replay owns a synthetic remote session, so it must go

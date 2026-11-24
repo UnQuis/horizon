@@ -33,6 +33,7 @@ mod blend_capability;
 mod blend_capability_tests;
 mod indirect;
 mod packed;
+mod sky;
 
 mod flip_carry;
 
@@ -67,7 +68,7 @@ mod sky_disc_blend_tests;
 mod undrawn_terrain_tests;
 
 mod image_formats;
-use image_formats::{image_format, storage_formats_of};
+use image_formats::{binds_as, image_format, storage_formats_of};
 #[cfg(test)]
 mod full_outputs_tests;
 #[cfg(test)]
@@ -75,6 +76,8 @@ mod shadow_faces_tests;
 
 #[cfg(test)]
 mod r11f_image_tests;
+#[cfg(test)]
+mod storage_format_tests;
 
 #[cfg(test)]
 mod work_group_fold_tests;
@@ -700,6 +703,7 @@ pub struct PackPost {
     /// program: vanilla's stays hidden even when the program writes nothing.
     hides_sky: bool,
     hides_celestial: bool,
+    sky_visibility: horizon_shaders::SkyVisibility,
     /// `colortex0ClearColor`, when the pack sets it.
     sky_clear: Option<[f32; 4]>,
     /// What draws rain and snow (the same program, each with its kind's sprite as `texture`),
@@ -748,6 +752,7 @@ pub struct PackPost {
     pub timing: Option<super::pack_timing::PassTiming>,
     /// `depthtex0` at the screen's centre, read back for `centerDepthSmooth`.
     center_depth: Option<super::pack_center_depth::CenterDepth>,
+    export_depth_since: Option<std::time::Instant>,
     /// `shaders.properties`' custom uniforms, after the frame's in `uniforms.values`.
     custom: horizon_shaders::Custom,
     atlas: Option<wgpu::TextureView>,
@@ -1499,7 +1504,7 @@ fn compile(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Option<(String, String)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::thread::available_parallelism()
+    let threads = horizon_threads::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, 8)
         .min(jobs.len().max(1));
@@ -1845,13 +1850,9 @@ fn bindings(
                 (None, None) => stand_in(&i.name, notes),
             }
         };
-        // An `R11F_G11F_B10F` image or buffer this device makes `RGBA16F` (a float stand-in
-        // that neither clamps nor drops NaN) takes `layout(r11f_g11f_b10f)` as `rgba16f`
-        // (`storage_formats_of`): Iris 1.11.7 stored into and read back such an image with a
-        // probe pack of ours (#10490), where Horizon refused the program.
-        let stand_in = format == wgpu::TextureFormat::Rg11b10Ufloat
-            && actual == wgpu::TextureFormat::Rgba16Float;
-        if actual != format && !stand_in {
+        // The texture's format wins over a qualifier `binds_as` takes for it; the module's image
+        // then declares it too (`storage_formats_of`).
+        if !binds_as(format, actual) {
             notes.push(format!(
                 "{name}: `{}` is {} but its texture is {actual:?}",
                 i.name, i.format
@@ -3426,6 +3427,7 @@ impl PackPost {
             hides_clouds,
             hides_sky,
             hides_celestial,
+            sky_visibility: post.sky_visibility,
             sky_clear,
             weather,
             weather_draw: None,
@@ -3451,6 +3453,7 @@ impl PackPost {
             gui_size: world.gui_size,
             timing: None,
             center_depth: None,
+            export_depth_since: None,
             custom,
             atlas: world.atlas.as_ref().map(|a| a.0.clone()),
             material_maps: world.material_maps,
@@ -3605,6 +3608,7 @@ impl PackPost {
         self.custom.restart_at(0);
         self.custom.forget_world();
         self.center_depth = None;
+        self.export_depth_since = None;
         self.targets = None;
         self.main = 0;
         self.mips_valid = 0;
@@ -4142,78 +4146,6 @@ impl PackPost {
         *self.terrain_slot(list, cutout) = Some(pass);
     }
 
-    /// The sky's parts in vanilla's order, each with the program that draws it; one render pass
-    /// while consecutive programs write the same buffers.
-    fn draw_sky(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        size: [u32; 2],
-        frame: &super::Frame,
-    ) {
-        let Some(mut sky) = self.sky.take() else {
-            return;
-        };
-        let parts = sky
-            .geometry
-            .prepare(queue, frame, self.uniforms.shadow.sun_path_rotation);
-        let mut groups = [None, None];
-        for (i, pass) in [&mut sky.basic, &mut sky.textured].into_iter().enumerate() {
-            if let Some(pass) = pass {
-                groups[i] = Some(self.bind(device, queue, encoder, pass, size));
-                self.mips_valid &= !pass.written;
-            }
-        }
-        let passes = [&sky.basic, &sky.textured];
-        let mut open: Option<(wgpu::RenderPass<'_>, usize)> = None;
-        for part in parts {
-            let i = usize::from(part.textured);
-            let (Some(pass), Some(group)) = (passes[i], &groups[i]) else {
-                continue;
-            };
-            let current = open.as_ref().map(|o| o.1);
-            if current != Some(i) {
-                let same = current
-                    .and_then(|c| passes[c].as_ref())
-                    .is_some_and(|p| p.writes == pass.writes);
-                if !same {
-                    drop(open.take());
-                    open = Some((self.begin(encoder, pass).forget_lifetime(), i));
-                }
-                let rp = &mut open.as_mut().expect("open").0;
-                rp.set_pipeline(pass.render());
-                rp.set_bind_group(0, group, &[]);
-                // A sky program that reads the pack's SSBOs (Noble's `gbuffers_textured`, the
-                // sun's fallback) binds them, as the other passes do.
-                if pass.buffers
-                    && let Some(g) = &self.buffers.group
-                {
-                    rp.set_bind_group(4, g, &[]);
-                }
-                sky.geometry.bind(rp, part.textured);
-                open.as_mut().expect("open").1 = i;
-            }
-            let rp = &mut open.as_mut().expect("open").0;
-            // Each part with vanilla's blend for it: one program, three pipelines.
-            let part_pipeline =
-                pass.sky_parts
-                    .as_ref()
-                    .and_then(|[plain, stars]| match part.stage {
-                        "SKY" | "VOID" => plain.get(),
-                        "STARS" => stars.get(),
-                        _ => None,
-                    });
-            rp.set_pipeline(part_pipeline.unwrap_or(pass.render()));
-            if pass.draw {
-                self.draws.bind(rp, part.stage);
-            }
-            rp.draw(part.range, 0..1);
-        }
-        drop(open);
-        self.sky = Some(sky);
-    }
-
     /// Entities, block entities, translucent entity parts and particles with the pack's
     /// programs, those drawn before deferred or (`late`) after: each run `prepare_entities` kept
     /// is one draw with its own `entityId` or `blockEntityId` and `entityColor`.
@@ -4495,9 +4427,34 @@ impl PackPost {
         }
     }
 
+    pub(super) fn await_export_center_depth(&mut self) {
+        self.export_depth_since = Some(std::time::Instant::now());
+    }
+
+    pub(super) fn poll_export_center_depth(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<bool, String> {
+        let Some(since) = self.export_depth_since else {
+            return Ok(true);
+        };
+        let depth = self
+            .center_depth
+            .as_mut()
+            .ok_or("the shader pack copied no centre depth")?;
+        if depth.poll_completed(device)?.is_some() {
+            self.export_depth_since = None;
+            Ok(true)
+        } else if since.elapsed() >= super::frame_export::FRAME_EXPORT_STALL_TIMEOUT {
+            Err("export stalled waiting for the frame's centre depth".into())
+        } else {
+            Ok(false)
+        }
+    }
+
     /// The centre depth the frame copied: its readback, started by calling it right after the
     /// frame's submission.
-    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static> {
+    pub fn submitted(&mut self) -> Option<impl FnOnce() + Send + 'static + use<>> {
         self.center_depth.as_mut()?.submitted()
     }
 
@@ -4924,6 +4881,42 @@ impl PackPost {
     /// The names of the programs that run, in order.
     pub fn programs(&self) -> Vec<&str> {
         self.passes.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Whether a running pass can read resource-pack companion maps. Resolve this after
+    /// pipeline fallback and texture overrides, independently of whether maps exist yet.
+    pub fn needs_material_maps(&self) -> bool {
+        let entities = self
+            .entities
+            .iter()
+            .flat_map(|e| e.passes.iter().chain(&e.shadow).flatten());
+        self.passes
+            .iter()
+            .chain(
+                [
+                    &self.terrain,
+                    &self.terrain_cutout,
+                    &self.water,
+                    &self.clouds,
+                    &self.lines,
+                    &self.hand_water,
+                    &self.shadow_terrain,
+                    &self.shadow_water,
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .chain(entities)
+            .chain(self.weather.iter().flatten())
+            .chain(self.hand.iter().map(|h| &h.0))
+            .chain(&self.shadow_comp)
+            .any(|pass| {
+                (pass.material_maps || pass.paged)
+                    && pass
+                        .samplers
+                        .iter()
+                        .any(|s| matches!(s.source, Source::Normals | Source::Specular))
+            })
     }
 
     /// Drops every pass's cached bind groups, compute stages included: they name views that
@@ -6637,6 +6630,9 @@ mod destination_tests;
 mod material_tests;
 
 #[cfg(test)]
+mod material_demand_tests;
+
+#[cfg(test)]
 #[path = "pack_paged_maps_tests.rs"]
 mod paged_maps_tests;
 
@@ -6672,6 +6668,10 @@ mod mipmap_box_tests;
 
 #[cfg(test)]
 mod colortex_mip_blend_tests;
+
+#[cfg(test)]
+#[path = "pack_sky_visibility_tests.rs"]
+mod sky_visibility_tests;
 
 #[cfg(test)]
 mod material_route_tests;

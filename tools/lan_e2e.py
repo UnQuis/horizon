@@ -380,10 +380,12 @@ import threading
 import time
 import zlib
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agent_control_e2e import Cli, Failed, game_env  # noqa: E402
+import fast_bins  # noqa: E402
 import lab  # noqa: E402
 from integration_env import game_environment, require_server_reports  # noqa: E402
 
@@ -1563,6 +1565,10 @@ def check_arrows(host, guest, out):
         g('command', command='item replace entity @s weapon.mainhand with minecraft:bow')
         g('command', command='give @s minecraft:arrow 16')
     hits = {}
+    # AbstractArrow.onHitEntity: an arrow that hurt a player sends its shooter game event 6
+    # (PLAY_ARROW_HIT_SOUND), which the shooter's client plays as this sound (#8053).
+    ding = 'minecraft:entity.arrow.hit_player'
+    heard_dings = {}
     try:
         for name, rule, shooter in (('guest shoots host', 'true', guest), ('host shoots guest', 'true', host),
                                     ('pvp off', 'false', guest)):
@@ -1573,9 +1579,11 @@ def check_arrows(host, guest, out):
             shooter.wait(20)
             victim = (lambda: host('state')['player']['health']) if shooter is guest else (lambda: remote(guest)['health'])
             before = victim()
+            dings = heard(shooter, ding)
             shooter.raw('use-item', '--hold', 1.3)  # a full draw (BowItem: 20 ticks)
             shooter.wait(20)
             hits[name] = (before, victim())
+            heard_dings[name] = heard(shooter, ding) - dings
             shooter.shot(out, 'arrows-' + name.replace(' ', '-'))
     finally:
         host('command', command='gamerule pvp true')
@@ -1584,6 +1592,9 @@ def check_arrows(host, guest, out):
     assert hits['guest shoots host'][1] < hits['guest shoots host'][0], f"the guest's arrow did not hurt the host: {hits}"
     assert hits['host shoots guest'][1] < hits['host shoots guest'][0], f"the host's arrow did not hurt the guest: {hits}"
     assert hits['pvp off'][1] >= hits['pvp off'][0], f'pvp off, an arrow still hurts: {hits}'
+    assert heard_dings['guest shoots host'] == 1 and heard_dings['host shoots guest'] == 1, \
+        f'a shooter did not hear one arrow-hit ding for the hit: {heard_dings}'
+    assert heard_dings['pvp off'] == 0, f'pvp off, the refused arrow still dings: {heard_dings}'
     return hits
 
 
@@ -1911,7 +1922,7 @@ def mob_looks(game, centre):
             continue
         key = f"{m['kind'].removeprefix('minecraft:')}@{round(m['pos'][0] - centre[0])}"
         found[key] = {'baby': m['baby'], 'color': m['color'], 'sheared': m['sheared'], 'size': m['size'],
-                      'tame': m['tame'], 'sitting': m['sitting'], 'burning': m['burning'],
+                      'tame': m['tame'], 'sitting_pose': m['sitting_pose'], 'burning': m['burning'],
                       'health': round(m['health'])}
     return found
 
@@ -1927,7 +1938,7 @@ def check_looks(host, guest, out):
         'sheep@1': ('{NoAI:1b,Color:14b,Sheared:1b}', {'color': 14, 'sheared': True}),
         'slime@3': ('{NoAI:1b,Size:3}', {'size': 4}),
         'wolf@5': ('{NoAI:1b,Owner:[I;1,2,3,4],Sitting:1b,CollarColor:11b}',
-                   {'tame': True, 'sitting': True, 'color': 11}),
+                   {'tame': True, 'sitting_pose': True, 'color': 11}),
     }
     sides = {'host': host, 'guest': guest}
     seen = {}
@@ -3307,25 +3318,48 @@ def grid_items(game):
 
 
 def check_recipes(host, guest, out):
+    def toggle_craftable(book):
+        button = next(rect for rect in book['targets'] if rect[2:] == [26.0, 16.0])
+        guest.raw('click-at', *centre(button))
+        guest.wait(5)
+        return guest('screen')['recipe_book']
+
     guest('command', command='clear @s')
     guest('command', command='give @s minecraft:oak_log 4')
     guest.wait(40)
     guest.raw('key', 'e', 'tap')
     guest.wait(5)
+    restore_filter = False
     try:
         book = guest('screen').get('recipe_book')
         assert book, 'the guest\'s inventory has no recipe book'
-        if len(book['targets']) == 1:
+        if not book['open']:
             guest.raw('click-at', *centre(book['targets'][0]))
             guest.wait(5)
             book = guest('screen').get('recipe_book')
         known = book['known']
         assert known > 0, f'the guest\'s book is empty: {book}'
-        guest.raw('click-at', *centre(book['targets'][1]))
+        # Search, paging and tabs also export targets. The craftable filter
+        # keeps earlier checks' recipe unlocks from affecting the selection.
+        if not book['filtering']:
+            book = toggle_craftable(book)
+            restore_filter = book['filtering']
+        assert book['filtering'], f"the guest's book did not filter: {book}"
+        recipes = [rect for rect in book['targets'] if rect[2:] == [25.0, 25.0]]
+        assert recipes, f"the guest's book has no craftable recipe buttons: {book}"
+        guest.raw('click-at', *centre(recipes[0]))
         guest.wait(10)
         grid = grid_items(guest)
         guest.shot(out, 'recipes')
     finally:
+        if restore_filter:
+            # The alternatives popup below needs the uncraftable entries too.
+            book = guest('screen')['recipe_book']
+            if not book['open']:
+                guest.raw('click-at', *centre(book['targets'][0]))
+                guest.wait(5)
+                book = guest('screen')['recipe_book']
+            toggle_craftable(book)
         guest.raw('key', 'esc', 'tap')
         guest.wait(5)
     assert any('oak_log' in str(item) for item in grid.values()), f'nothing placed in the grid: {grid}'
@@ -4882,8 +4916,12 @@ def check_fireworks(host, guest, out):
     host('command', command=f'fill {x - 2} {y + 2} {z + 1} {x + 2} {y + 2} {z + 5} minecraft:stone')
     for game, dx in ((host, -2), (guest, 2)):
         game('command', command='gamemode creative')
-        game('command', command=f'tp @s {x + dx + 0.5} {y} {z + 0.5}')
+        stand = (x + dx + 0.5, y, z + 0.5)
+        game('command', command=f'tp @s {stand[0]} {stand[1]} {stand[2]}')
+        game.until(lambda: pos_of(game), lambda p: math.dist(p, stand) < 0.1, ticks=40)
         game.raw('look-at', x + 0.5, y + 1.5, z + 3.5)
+    # Interact aims at the clicked face. Record the host baseline from that same view.
+    host.raw('look-at-block', *at, 'up')
 
     def reds(path):
         """The red pixels' positions, above the hotbar."""
@@ -4897,23 +4935,25 @@ def check_fireworks(host, guest, out):
     before = {g.name: made(g, 'flash') for g in (host, guest)}
     host('command', command='item replace entity @s weapon.mainhand with minecraft:firework_rocket'
          '[fireworks={flight_duration:0,explosions:[{shape:"large_ball",colors:[I;16711680],has_trail:true}]}]')
-    host.raw('interact', *at)
+    host.raw('interact', *at, 'up')
     # The held item's red texture must not count as a burst or a later spark.
     host('command', command='item replace entity @s weapon.mainhand with minecraft:air')
-    for _ in range(30):
-        host.wait(2)
-        if all(made(g, 'flash') > before[g.name] for g in (host, guest)):
-            break
+
+    def capture(game):
+        game.until(lambda: made(game, 'flash') - before[game.name], lambda n: n > 0, ticks=60)
+        # Do not let the other window's readback or decoding use up this client's spark lifetime.
+        burst = game.shot(out, 'fireworks-burst')
+        game.wait(4)
+        trail = game.shot(out, 'fireworks-trail-fade')
+        return burst, trail
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        captures = dict(zip((host.name, guest.name), pool.map(capture, (host, guest))))
     flashes = {g.name: made(g, 'flash') - before[g.name] for g in (host, guest)}
-    assert all(n == 1 for n in flashes.values()), f'configured burst missing or duplicated: {flashes}'
-    # Capture both views before decoding PNGs: decoding must not consume the sparks' lifetime (48-59 ticks). A
-    # screenshot takes ~0.6 s where the frame is drawn on the CPU (lavapipe), so the later shots come 4 ticks after
-    # the burst's, not more: by then the tracked rocket is gone.
-    burst_shots = {g.name: g.shot(out, 'fireworks-burst') for g in (host, guest)}
-    host.wait(4)
-    trail_shots = {g.name: g.shot(out, 'fireworks-trail-fade') for g in (host, guest)}
-    burst = {name: len(reds(path) - baseline[name]) for name, path in burst_shots.items()}
-    trails = {name: len(reds(path) - baseline[name]) for name, path in trail_shots.items()}
+    assert all(n == 1 for n in flashes.values()), \
+        f'configured burst missing or duplicated: {flashes}'
+    burst = {name: len(reds(burst) - baseline[name]) for name, (burst, _) in captures.items()}
+    trails = {name: len(reds(trail) - baseline[name]) for name, (_, trail) in captures.items()}
     rockets = {g.name: g('status')['rockets'] for g in (host, guest)}
     assert not any(rockets.values()), f'exploded rocket remains: {rockets}'
     assert all(n > 20 for n in burst.values()), f'no red burst: {burst}'
@@ -6373,6 +6413,29 @@ def check_frames(host, guest, out):
                       and o['position'] == [x, y + 1, z + 2]]
             assert theirs and theirs[0]['item'] == 'minecraft:diamond' and theirs[0]['rotation'] == 1, \
                 f'the other side sees the {label}\'s frame as {theirs}'
+            # Empty the frame, then insert a filled map with an empty main hand.
+            player.raw('look-at', f'{x + 0.5:.2f}', f'{y + 1.5:.2f}', f'{z + 2.95:.2f}')
+            player.raw('mouse', 'left', 'click')
+            player.wait(10)
+            emptied = next(o for o in player('status')['objects'] if o['id'] == frame['id'])
+            assert emptied.get('item') is None, f'{label}: expected an empty frame, got {emptied}'
+            player('command', command='item replace entity @s weapon.mainhand with minecraft:air')
+            player('command', command='item replace entity @s weapon.offhand with '
+                   'minecraft:filled_map[minecraft:map_id=0]')
+            player.wait(5)
+            inventory = player('inventory')
+            offhand = inventory['offhand']
+            assert inventory['held'] is None, f'{label}: the main hand is not empty'
+            assert offhand['item'] == 'minecraft:filled_map' and offhand['count'] == 1, \
+                f'{label}: expected one map in the off hand, got {offhand}'
+            player.raw('mouse', 'right', 'click')
+            player.wait(15)
+            for viewer in (player, other):
+                seen = next(o for o in viewer('status')['objects'] if o['id'] == frame['id'])
+                assert seen.get('item') == 'minecraft:filled_map', f'{label}: off-hand map insertion left {seen}'
+            offhand = player('inventory')['offhand']
+            assert offhand['item'] is None, f'{label}: the client still sees {offhand} in the off hand'
+            server_reply(player, 'execute unless items entity @s weapon.offhand *', 'Test passed')
             player('command', command='item replace entity @s weapon.mainhand with minecraft:iron_helmet')
             player.wait(5)
             stand = [o for o in player('status')['objects'] if o['kind'] == 'minecraft:armor_stand'
@@ -6405,14 +6468,17 @@ def check_frames(host, guest, out):
             assert player('inventory')['counts'].get('minecraft:name_tag') == 2, 'named tag was not consumed once'
             server_reply(player, f'data get entity {selector} CustomName', name)
             server_reply(other, f'data get entity {selector} CustomName', name)
-            # NameTagItem shrinks its stack in creative too.
+            # Player.interactOn gives NameTagItem a copy of the creative player's stack.
             player('command', command='gamemode creative')
+            creative_name = f'{label} creative Bob'
             player('command', command='item replace entity @s weapon.mainhand with '
-                   f'minecraft:name_tag[minecraft:custom_name="{name}"] 3')
+                   f'minecraft:name_tag[minecraft:custom_name="{creative_name}"] 3')
             player.wait(5)
             player.raw('mouse', 'right', 'click')
             player.wait(10)
-            assert player('inventory')['counts'].get('minecraft:name_tag') == 2, 'creative tag was not consumed once'
+            assert player('inventory')['counts'].get('minecraft:name_tag') == 3, 'creative tag was consumed'
+            server_reply(player, f'data get entity {selector} CustomName', creative_name)
+            server_reply(other, f'data get entity {selector} CustomName', creative_name)
             player('command', command='gamemode survival')
             result[label] = {'frame': 'diamond, turned', 'stand': 'helmet on and off; named tag consumed'}
         finally:
@@ -6581,14 +6647,15 @@ def ride(player, other, label, spot, kind, nbt, ready, stick, test):
             assert math.dist(seated[::2], mine[::2]) < 1.5, f'the {label} sits at {seated}, its {kind} at {mine}'
             result['moved'] = round(moved, 2)
         if 'jump' in test:
-            base = mob_seen(player, mob['id'])['pos'][1]
-            player.raw('key', 'space', 'down')
-            player.wait(10)
-            player.raw('key', 'space', 'up')
-            top = base
-            for _ in range(10):
-                player.wait(2)
-                top = max(top, mob_seen(player, mob['id'])['pos'][1])
+            grounded = player.until(lambda: mob_seen(player, mob['id']),
+                                    lambda m: m is not None and m['on_ground'], ticks=20)
+            base = grounded['pos'][1]
+            # Keep the release and height samples in one socket session to see the short peak.
+            replies = player.script(['key space down', 'wait 10', 'key space up', 'mobs 8']
+                                    + ['wait 1', 'mobs 8'] * 20, every=True)
+            samples = [next((m for m in r['near'] if m['id'] == mob['id']), None) for r in replies[3::2]]
+            assert all(samples), f"the {label}'s {kind} {mob['id']} disappeared during its jump"
+            top = max(m['pos'][1] for m in samples)
             assert top - base > 0.4, f"the {label}'s {kind} jumped {top - base:.2f} blocks"
             result['jumped'] = round(top - base, 2)
         if 'rise' in test:
@@ -7484,8 +7551,7 @@ def main():
     if args.bin_dir:
         bins = Path(args.bin_dir).resolve()
     else:
-        subprocess.run(['cargo', 'build', '--locked', '--profile', 'fast', '-p', 'horizon-game', '-p', 'horizon-client-lib',
-                        '--bin', 'horizon-client', '--bin', 'horizon-ctl'],
+        subprocess.run(fast_bins.command('horizon-client', 'horizon-ctl'),
                        cwd=ROOT, check=True)
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
                                          capture_output=True, text=True, check=True).stdout)
@@ -8700,7 +8766,7 @@ def check_vehicles(host, guest, out):
     for label, player in (('host', host), ('guest', guest)):
         x, y, z = spots[label]
         seen = result[label] = {}
-        near = lambda kind, at: [o for o in host('status')['objects'] if o['kind'].endswith(kind)
+        near = lambda kind, at: [o for o in host('status')['objects'] if o['kind'] == f'minecraft:{kind}'
                                  and abs(o['position'][0] - at[0]) < 2 and abs(o['position'][2] - at[2]) < 2]
         try:
             cell = (x, y + 1, z + 2)
@@ -8738,22 +8804,34 @@ def check_vehicles(host, guest, out):
             seen['minecart_in_lava'] = len(near('minecart', boat_at))
             booms = player('status')['heard'].get('minecraft:entity.generic.explode', 0)
             player('command', command=f'summon minecraft:tnt_minecart {boat_at[0]} {y} {boat_at[2]}')
-            player.wait(60)
-            seen['tnt_minecart'] = {'left': len(near('tnt_minecart', boat_at)),
-                                    'booms': player('status')['heard'].get('minecraft:entity.generic.explode', 0) - booms}
+
+            def tnt_state():
+                return {'left': len(near('tnt_minecart', boat_at)),
+                        'booms': heard(player, 'minecraft:entity.generic.explode') - booms}
+
+            seen['tnt_minecart'] = host.until(tnt_state, lambda t: t == {'left': 0, 'booms': 1})
 
             player('command', command=f'fill {x - 3} {y} {z - 3} {x + 4} {y + 3} {z + 6} minecraft:air')
             player('command', command=f'fill {x - 3} {y - 1} {z - 3} {x + 4} {y - 1} {z + 6} minecraft:stone')
             player('command', command='gamemode survival')
+            rest = (x + 0.5, y, z + 0.5)
+            player('command', command=f'tp @s {rest[0]} {rest[1]} {rest[2]} 0 0')
+            player.until(lambda: pos_of(player), lambda p: math.dist(p, rest) < 0.1, ticks=40)
             cart_at = (x + 0.5, y, z + 1.6)
+            existing = {o['id'] for o in near('minecart', cart_at)}
             player('command', command=f'summon minecraft:minecart {cart_at[0]} {y} {cart_at[2]}')
-            player.wait(10)
-            before = near('minecart', cart_at)[0]['position']
+
+            def new_cart():
+                return next((o for o in near('minecart', cart_at) if o['id'] not in existing), None)
+
+            cart = host.until(new_cart, lambda o: o is not None)
+            before = cart['position']
             # Half into the cart from the north: it is pushed south until they are apart.
             player('command', command=f'tp @s {x + 0.5} {y} {before[2] - 0.4:.2f} 0 0')
             player.wait(20)
-            after = near('minecart', cart_at)[0]['position']
-            seen['cart_pushed'] = round(after[2] - before[2], 3)
+            cart_after = next((o for o in host('status')['objects'] if o['id'] == cart['id']), None)
+            assert cart_after is not None, f"{label}: pushed cart {cart['id']} missing (started at {before})"
+            seen['cart_pushed'] = round(cart_after['position'][2] - before[2], 3)
             player.shot(out, f'vehicles-{label}')
         finally:
             player('command', command='kill @e[type=minecraft:minecart]')

@@ -9,15 +9,22 @@ pub mod allocator_stats;
 #[cfg(target_os = "windows")]
 pub mod boot_paint;
 pub mod callgrind;
+#[cfg(target_os = "macos")]
+pub mod file_acl;
+#[cfg(windows)]
+pub mod file_publish;
 pub mod heap_census;
 #[cfg(target_os = "linux")]
 pub mod heap_sample;
 pub mod jobs;
+#[cfg(windows)]
+pub mod process_job;
 pub mod process_memory;
 #[cfg(target_os = "linux")]
 pub mod profile;
 #[cfg(target_os = "linux")]
 pub mod sampler;
+pub mod server_core;
 pub mod sizing;
 pub mod stack_dump;
 /// Alt+Space and a bare Alt never open the window's system menu, as in GLFW.
@@ -43,8 +50,16 @@ pub fn worker_count() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
         parse_worker_count(std::env::var("HORIZON_WORKER_THREADS").ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .unwrap_or_else(|| available_parallelism().map_or(1, |n| n.get()))
     })
+}
+
+/// The CPUs this process may use, for sizing a pool: `std::thread::available_parallelism`,
+/// except while the server thread holds a core of its own ([`server_core`]), when the calling
+/// thread's own mask is narrower than the process's (the server thread's is that core alone,
+/// the threads moved off it have the rest): then the whole set the reservation was taken from.
+pub fn available_parallelism() -> std::io::Result<std::num::NonZeroUsize> {
+    server_core::whole_set().map_or_else(std::thread::available_parallelism, Ok)
 }
 
 /// `HORIZON_SERIAL_TICK=all`: every [`par_chunks_mut`] keeps its chunks on the
@@ -99,7 +114,10 @@ pub fn par_chunks_mut_with<T: Send>(
         let threads: Vec<_> = (0..helpers)
             .filter_map(|_| {
                 horizon_guest_stack::builder()
-                    .spawn_scoped(scope, work)
+                    .spawn_scoped(scope, || {
+                        server_core::leave_reserved();
+                        work()
+                    })
                     .ok()
             })
             .collect();
@@ -272,7 +290,7 @@ fn parse_decoder_priority(value: Option<String>) -> bool {
 /// unprivileged thread lower its priority but not raise it (and the JVM
 /// leaves it there too). Whether the OS took it.
 pub fn favour_current() -> bool {
-    if std::thread::available_parallelism().map_or(1, |n| n.get()) <= 4 {
+    if available_parallelism().map_or(1, |n| n.get()) <= 4 {
         return false;
     }
     favour()
@@ -399,6 +417,8 @@ pub fn put_helpers_behind() {
 /// wants its core. A tick or a frame then gets a core when it starts instead
 /// of waiting behind them. Nothing elsewhere. Whether the OS took it.
 pub fn behind_server() -> bool {
+    // Avoid the server core when this thread's existing selection permits it.
+    server_core::leave_reserved();
     HELPERS_BEHIND.load(Ordering::Relaxed) && behind()
 }
 
@@ -468,14 +488,17 @@ fn far() -> bool {
 /// terrain on the efficiency cores long after the near chunks were in, and
 /// it took minutes to settle. On Linux and Android an unprivileged thread
 /// can't raise its priority again: it stays behind (`behind_server`), as it
-/// always has there, and this changes nothing. Whether the OS took it.
-#[cfg(any(target_vendor = "apple", windows))]
+/// always has there, and this changes nothing. On Windows it stays below
+/// normal for good too: back at normal, the far threads stood level with the
+/// game's other helpers and the rest of the desktop, the suspected cause of a
+/// world entry freezing a 16-thread PC (#19952). Whether the OS took it.
+#[cfg(target_vendor = "apple")]
 pub fn far_terrain_behind(behind: bool) -> bool {
-    // Both set the class or priority outright: calling again is harmless.
+    // Both set the class outright: calling again is harmless.
     if behind { far() } else { far_back() }
 }
 
-#[cfg(not(any(target_vendor = "apple", windows)))]
+#[cfg(not(target_vendor = "apple"))]
 pub fn far_terrain_behind(_behind: bool) -> bool {
     false
 }
@@ -484,15 +507,6 @@ pub fn far_terrain_behind(_behind: bool) -> bool {
 fn far_back() -> bool {
     // SAFETY: sets the calling thread's own QoS class; no pointers.
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) == 0 }
-}
-
-#[cfg(windows)]
-fn far_back() -> bool {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_NORMAL,
-    };
-    // SAFETY: GetCurrentThread's pseudo handle needs no closing.
-    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) != 0 }
 }
 
 /// Run the calling thread only on a core nothing else wants: work that may
@@ -851,11 +865,34 @@ mod tests {
     /// Without `HORIZON_WORKER_THREADS`, the count is the machine's.
     #[test]
     fn worker_count_defaults_to_the_machine() {
+        let _test = super::server_core::RESERVATION_TEST.lock().unwrap();
         if std::env::var_os("HORIZON_WORKER_THREADS").is_some() {
             return;
         }
-        let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert_eq!(super::worker_count(), machine);
+        assert_eq!(super::worker_count(), machine());
+    }
+
+    /// The machine's count as std sees it from a thread with the main thread's CPUs. libtest
+    /// starts each test on a new thread from its main thread: one started while another test's
+    /// reservation had moved that main thread off the reserved core inherits the narrower mask,
+    /// and lives too short for the keeper to see it. The main thread is given back, so its mask
+    /// is the machine's again once that test ends (this test holds the same lock).
+    fn machine() -> usize {
+        std::thread::spawn(|| {
+            #[cfg(target_os = "linux")]
+            // SAFETY: a zeroed cpu_set_t is the empty set; the size passed is its own, and the
+            // mask set is the main thread's, on this short-lived thread only.
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                let size = std::mem::size_of::<libc::cpu_set_t>();
+                if libc::sched_getaffinity(libc::getpid(), size, &mut set) == 0 {
+                    libc::sched_setaffinity(0, size, &set);
+                }
+            }
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        })
+        .join()
+        .unwrap()
     }
 
     /// The pool leaves a core, counting only the performance cores where the machine has them.
@@ -1009,6 +1046,27 @@ mod tests {
             }
         );
         assert_eq!(frame, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
+    /// #19952: on Windows a far terrain thread stays below normal priority
+    /// once the near terrain is in, so the frame, the near terrain and the
+    /// desktop keep going first however many far threads there are.
+    #[cfg(windows)]
+    #[test]
+    fn a_far_terrain_thread_stays_below_normal_once_near_terrain_is_in() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let priority = std::thread::spawn(|| {
+            assert!(super::far_terrain_current());
+            super::far_terrain_behind(false);
+            // SAFETY: reads the priority of the thread it runs on; the
+            // pseudo handle needs no closing.
+            unsafe { GetThreadPriority(GetCurrentThread()) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(priority, THREAD_PRIORITY_BELOW_NORMAL);
     }
 
     /// A helper goes behind only once a dedicated server asks for it, and

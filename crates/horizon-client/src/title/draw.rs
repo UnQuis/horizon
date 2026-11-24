@@ -170,7 +170,13 @@ impl Title {
                 let tw = HudBatch::text_width(atlas, notice).ceil();
                 let rect = [w - tw - 2.0, h - 10.0, tw, 10.0];
                 self.credits_button.set(rect);
-                crate::widgets::record(notice, rect, true);
+                crate::widgets::record_with_id(
+                    Some("not-affiliated-with-mojang-or-microsoft"),
+                    notice,
+                    rect,
+                    true,
+                    crate::widgets::Kind::Button,
+                );
                 let inside = cursor.0 >= rect[0]
                     && cursor.0 < rect[0] + rect[2]
                     && cursor.1 >= rect[1]
@@ -818,7 +824,13 @@ impl Title {
         // The hovered button's `Tooltip`, drawn once the widgets are.
         let mut button_tooltip = None;
         for b in self.buttons(w, h) {
-            crate::widgets::record(&b.label, [b.x, b.y, b.w, 20.0], b.enabled);
+            crate::widgets::record_with_id(
+                b.agent_id,
+                &b.label,
+                [b.x, b.y, b.w, 20.0],
+                b.enabled,
+                crate::widgets::Kind::Button,
+            );
             // Realms' icon buttons have no label to record.
             if b.enabled && b.label.trim().is_empty() {
                 crate::widgets::target([b.x, b.y, b.w, 20.0]);
@@ -842,16 +854,10 @@ impl Title {
             } else {
                 "gui/sprites/widget/button"
             };
-            // Nine-slice approximation: left and right halves of the 200-wide sprite.
-            if let Some(r) = atlas.sprites.get(sprite).copied() {
-                let half = b.w / 2.0;
-                let mut left = r;
-                left.u1 = r.u0 + (r.u1 - r.u0) * (half / r.w as f32);
-                batch.rect_uv(b.x, b.y, half, 20.0, left, u32::MAX);
-                let mut right = r;
-                right.u0 = r.u1 - (r.u1 - r.u0) * (half / r.w as f32);
-                batch.rect_uv(b.x + half, b.y, half, 20.0, right, u32::MAX);
-            }
+            // `Button.extractContents`: `blitSprite` with the sprite's own `gui.scaling`, so
+            // a pack's button of another size (a 20x20 nine-slice) draws as it does on the
+            // other screens.
+            crate::ui::nine_slice(batch, atlas, sprite, b.x, b.y, b.w, 20.0, u32::MAX);
             let color = if b.enabled {
                 u32::MAX
             } else {

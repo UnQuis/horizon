@@ -67,6 +67,14 @@ vanilla camera. Requests from later render callbacks apply at the next frame's e
 Setting a type never emits `camera_type_cycle`; F5 alone cycles, and its final event choice
 wins over requests made inside the cycle callback.
 
+`camera_roll` turns the drawn camera about its view direction, in degrees, right after
+`camera_pose`: at 90 the world's up is at the screen's left, as NeoForge's
+`ViewportEvent.ComputeCameraAngles` roll. It starts at 0 each frame, is neither bounded nor
+scaled by Distortion Effects (unlike `camera_shake`), and a value that isn't finite is 0. The
+world, its culling, the billboards facing the camera and `Camera.view` follow it; the
+first-person hand and the HUD stay level. It is a hook of its own rather than a field of
+`CameraPoseEvent` so that wasm mods built before it keep loading.
+
 ## Viewed levels
 
 A server can open other levels for a client to view besides the one the player is in (`horizon:levels`,
@@ -86,6 +94,22 @@ into another level replaces the client level: the old handle stays stale for goo
 levels too, but keeps the client level, so the old handle reads again after the reopen. Writes,
 server-only reads, the other level reads and the entity reads (`entities_in`) refuse a viewed level.
 Native and wasm mods use the same handle methods.
+
+## Far terrain reads
+
+A map drawing past the loaded chunks reads the far terrain the player already sees there:
+`client_far_surface(&columns)` gives each block column's `TerrainColumn` (top solid height, its
+block, the water's top and the biome) from the finest far tile sampled over it, whether or not
+its chunk is loaded. A far tile's cell can be many blocks wide, so a far column is that cell's
+reduced surface, and it comes from wherever the far terrain does: the world's generator, the
+server's offer or chunks kept from earlier visits. It reads nothing new
+from the server.
+
+A column no tile covers yet is `None`, and every column is `None` while far terrain is off
+(LOD Distance 0) or not started. The tiles follow the camera, so a column can go back to `None`
+after the player moves away: keep what you read. Inside the loaded chunks read them instead
+(`client_surface_heights`), since a far tile can lag an edit. No client world, or more than
+65,536 columns in one call, is `Err` and reads nothing.
 
 ## Crosshair reads
 
@@ -128,6 +152,13 @@ These read the local player as the client sees it. They take no mod-controlled n
   team name, name) and stop at the 80 it draws. Header and footer are `None` when empty. It is what
   this client has been sent and changes as the server updates the list; `None` outside a world.
   There is no NeoForge call for this: it is Horizon's own read.
+- `ClientHost::client_session().client_waypoints()` is the locator bar's tracked waypoints:
+  `ClientWaypoints { entries }`. Each `ClientWaypointEntry` has the waypoint's `id` (`Uuid` for
+  a player's waypoint, `Name` for a named one), its `target` (`Block`, `Chunk`, `Azimuth` or
+  `Empty`), the icon `style` (`waypoint_style` asset id) and the icon `color` as `0xRRGGBB`
+  (`None` when the server sent none — the bar then colours the dot from the waypoint's id).
+  Entries come in the order the server sent them. It is what this client has been sent and
+  changes as the server tracks and untracks waypoints; `None` outside a world.
 - `ClientHost::local_item_use()` is the item in use: `ItemUse { hand, ticks_used, ticks_remaining }`
   (`isUsingItem`, `getUsedItemHand`, `getTicksUsingItem`, `getUseItemRemainingTicks`).
   `ticks_used + ticks_remaining` is the use duration. It is `None` when no item is in use or no world
