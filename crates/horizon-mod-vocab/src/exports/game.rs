@@ -1,6 +1,7 @@
 // hidden: a module of game-side types; mods use their re-exports
 #[doc(hidden)]
 pub mod game;
+pub use crate::game::{LodColumnFootprint, LodTileFootprint};
 pub use crate::game::NbtUpgradeError;
 pub use crate::game::TerrainColumn;
 pub use crate::game::{
@@ -9,6 +10,7 @@ pub use crate::game::{
     MobRender, ModEvent, ModMismatch, ModMismatchResolution, PhantomSpawnResult, PlayerRender,
     Shake, SleepProblem,
 };
+pub use crate::game::{DataFixError, DataKind};
 mod __private {
     mod built {
         pub use crate::game::built::ConfigFile;

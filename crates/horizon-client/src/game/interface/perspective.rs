@@ -404,7 +404,10 @@ impl Game<'_> {
         let (yaw, pitch) = self
             .posed_rotation
             .unwrap_or((self.view.y_rot, self.view.x_rot));
-        super::camera_rotation(CameraType::FirstPerson, yaw, pitch)
+        super::rolled_camera(
+            super::camera_rotation(CameraType::FirstPerson, yaw, pitch),
+            self.posed_roll,
+        )
     }
     /// The player as `Camera.alignWithEntity` sees it.
     fn player_camera_entity(&mut self) -> Option<CameraEntity> {
@@ -513,6 +516,13 @@ impl Game<'_> {
             self.player_model = Some(m);
         }
         let pose = p.pose;
+        // The server's pose for the own player, while the local pose is the one it came over.
+        let own_pose = self
+            .remote
+            .as_ref()
+            .and_then(|r| r.own_pose)
+            .filter(|&(_, local)| local == pose)
+            .map(|(shown, _)| shown);
         let crouching = pose == Pose::Crouching;
         let position = p.position;
         let (fall_flying, fly_ticks, velocity) = (p.fall_flying, p.fall_fly_ticks, p.velocity);
@@ -639,7 +649,7 @@ impl Game<'_> {
         }
         m.extra.crouching = crouching;
         // Guests and server players take their pose from DATA_POSE, not here.
-        m.extra.avatar_pose = pose;
+        m.extra.avatar_pose = own_pose.unwrap_or(pose);
         // What custom entity model animations read of the fluids (`is_in_water`, crawling).
         m.fluids.in_water = in_water;
         m.fluids.in_lava = in_lava;
@@ -816,13 +826,14 @@ impl Game<'_> {
             name: &name,
             local: true,
         };
-        let listened = self.mob_render_listened();
-        let pre = self.mod_render_pre(m, Some(who), listened, alpha as f32, camera, packed, out);
+        let hooks = self.mob_render_listened();
+        let pre = self.mod_render_pre(m, Some(who), hooks, alpha as f32, camera, packed, out);
         let Some(hidden) = pre else {
             return;
         };
         // The mods' layers' posed parts, kept from the draw below while they want them.
         let (mut parts, layers) = (None, self.mod_layers(m));
+        let want_parts = hooks.any_post_for(true) || layers.is_some();
         // A spectator still draws its own model in third person: the poses'
         // visibility (set by player_model_visibility) hides body parts, and
         // translucent_body marks the body OIT for the ghostly look. Only first
@@ -835,9 +846,10 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
+                &Default::default(),
                 &self.player_armor_layers(),
                 hidden,
-                (listened || layers.is_some()).then_some(&mut parts),
+                want_parts.then_some(&mut parts),
                 out,
             );
         } else {
@@ -848,8 +860,9 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
+                &Default::default(),
                 &self.player_armor_layers(),
-                (listened || layers.is_some()).then_some(&mut parts),
+                want_parts.then_some(&mut parts),
                 out,
             );
         }
@@ -971,11 +984,28 @@ impl Game<'_> {
             let light = 240 | 240 << 8;
             if body {
                 horizon_client::mobs::render::render_with(
-                    &m, 1.0, camera, &lookup, light, data, &armour, &mut verts,
+                    &m,
+                    1.0,
+                    camera,
+                    &lookup,
+                    light,
+                    data,
+                    &Default::default(),
+                    &armour,
+                    &mut verts,
                 );
             } else {
                 horizon_client::mobs::render::render_layers(
-                    &m, 1.0, camera, &lookup, light, data, &armour, None, &mut verts,
+                    &m,
+                    1.0,
+                    camera,
+                    &lookup,
+                    light,
+                    data,
+                    &Default::default(),
+                    &armour,
+                    None,
+                    &mut verts,
                 );
             }
         });
@@ -2014,11 +2044,28 @@ mod preview_tests {
             let at = glam::DVec3::ZERO;
             if body {
                 horizon_client::mobs::render::render_with(
-                    &m, 1.0, at, &atlas, 0xF0F0, &data, &armour, &mut out,
+                    &m,
+                    1.0,
+                    at,
+                    &atlas,
+                    0xF0F0,
+                    &data,
+                    &Default::default(),
+                    &armour,
+                    &mut out,
                 );
             } else {
                 horizon_client::mobs::render::render_layers(
-                    &m, 1.0, at, &atlas, 0xF0F0, &data, &armour, None, &mut out,
+                    &m,
+                    1.0,
+                    at,
+                    &atlas,
+                    0xF0F0,
+                    &data,
+                    &Default::default(),
+                    &armour,
+                    None,
+                    &mut out,
                 );
             }
             out
@@ -2042,6 +2089,7 @@ mod preview_tests {
                 &atlas,
                 0xF0F0,
                 &data,
+                &Default::default(),
                 armour,
                 None,
                 out,

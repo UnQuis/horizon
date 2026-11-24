@@ -4,6 +4,7 @@ use crate::{
     hud::{HudAtlas, HudBatch},
     text::Text,
 };
+use mod_api::DimensionTransitionCause;
 
 /// `Minecraft.doWorldLoad`: `max(5, 3) + ChunkLevel.RADIUS_AROUND_FULL_CHUNK + 1`.
 pub const STATUS_RADIUS: i32 = 8;
@@ -103,6 +104,7 @@ pub struct PlayerCheck {
 pub struct LevelLoadTracker {
     state: Option<ClientState>,
     transition_screen: Option<usize>,
+    transition_cause: Option<DimensionTransitionCause>,
     close_delay_ms: u64,
     /// `LevelLoadingScreen.reason`.
     pub reason: Reason,
@@ -112,6 +114,7 @@ impl LevelLoadTracker {
         Self {
             state: None,
             transition_screen: None,
+            transition_cause: None,
             close_delay_ms,
             reason: Reason::Other,
         }
@@ -123,12 +126,14 @@ impl LevelLoadTracker {
         });
         self.reason = reason;
         self.transition_screen = None;
+        self.transition_cause = None;
     }
     /// The tracker's work is over and the screen has closed
     /// (`ClientPacketListener.tick` drops it once the level is ready).
     pub fn finish(&mut self) {
         self.state = None;
         self.transition_screen = None;
+        self.transition_cause = None;
     }
     /// Retain the presentation selected once at dimension entry, until this load finishes.
     pub fn set_transition_screen(&mut self, screen: Option<usize>) {
@@ -140,9 +145,30 @@ impl LevelLoadTracker {
     pub fn transition_screen(&self) -> Option<usize> {
         self.transition_screen
     }
+    /// Retain the packet's cause for the life of this load.
+    pub fn set_transition_cause(&mut self, cause: DimensionTransitionCause) {
+        if self.is_active() {
+            self.transition_cause = Some(cause);
+        }
+    }
+    /// The cause of the active client load, once its packet has been handled.
+    pub fn transition_cause(&self) -> Option<DimensionTransitionCause> {
+        self.transition_cause
+    }
     /// A load is under way, so its screen is up.
     pub fn is_active(&self) -> bool {
         self.state.is_some()
+    }
+    /// Whether a recorded load needs more packets before it can settle locally.
+    pub fn needs_load_packets(&self, has_player_column: bool) -> bool {
+        match self.state {
+            Some(ClientState::WaitingForServer { .. }) => true,
+            Some(ClientState::WaitingForPlayerChunk {
+                player_section_ready,
+                ..
+            }) => !player_section_ready && !has_player_column,
+            _ => false,
+        }
     }
     /// `loadingPacketsReceived`: `LEVEL_CHUNKS_LOAD_START` came.
     pub fn loading_packets_received(&mut self) {
@@ -190,6 +216,20 @@ impl LevelLoadTracker {
             }
         }
     }
+    /// Poll completion independently of the simulation clock. The player's
+    /// compiled section can arrive while the simulation waits for loading.
+    pub fn poll_client_load(&mut self, now: u64, section_ready: bool, player: PlayerCheck) -> bool {
+        if section_ready && self.wants_player_section() {
+            self.player_section_ready();
+        }
+        self.tick_client_load(now, player);
+        if !self.is_level_ready(now) {
+            return false;
+        }
+        self.finish();
+        true
+    }
+
     /// `isLevelReady`.
     pub fn is_level_ready(&self, now: u64) -> bool {
         matches!(self.state, Some(ClientState::Ready { ready_at }) if now >= ready_at + self.close_delay_ms)

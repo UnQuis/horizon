@@ -98,9 +98,11 @@ pub fn villager_make_bread<L: VillagerLevel + ?Sized>(l: &mut L, i: usize) {
     e.remove_item("minecraft:wheat", loaves * 3);
     let left = e.add_item(ItemStack::new("minecraft:bread", loaves), max_stack);
     if let Some(rest) = left {
-        // spawnAtLocation(level, stack, 0.5F)
+        // spawnAtLocation(level, stack, 0.5F): ItemEntity's constructor
+        // gives the drop a small random horizontal scatter, not a straight
+        // drop at the villager's feet.
         let p = l.mobs()[i].position;
-        l.spawn_item(rest, [p.x, p.y + 0.5, p.z], [0.0, 0.2, 0.0], 10);
+        l.spawn_item_own(rest, [p.x, p.y + 0.5, p.z], 10);
     }
 }
 
@@ -122,9 +124,9 @@ pub fn villager_throw<L: VillagerLevel + ?Sized>(
 
 /// `TradeWithVillager.tick` for one pair: gossip (at most once in 1200
 /// ticks for both), then surplus food and wanted wares tossed over.
-pub fn villager_meet<L: VillagerLevel + ?Sized>(l: &mut L, a: u32, b: u32) {
+pub fn villager_meet<L: VillagerLevel + ?Sized>(l: &mut L, a: u32, b: u32) -> usize {
     let (Some(ia), Some(ib)) = (l.villager_index(a), l.villager_index(b)) else {
-        return;
+        return 0;
     };
     let professions = l.stations().professions.clone();
     let p = l.parts();
@@ -136,6 +138,7 @@ pub fn villager_meet<L: VillagerLevel + ?Sized>(l: &mut L, a: u32, b: u32) {
     if meeting.gossiped {
         l.villager_golem_check(a, 5);
     }
+    meeting.new_gossip
 }
 
 /// `Villager.spawnGolemIfNeeded`: when enough villagers nearby that

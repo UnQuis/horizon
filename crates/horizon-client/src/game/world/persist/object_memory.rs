@@ -282,6 +282,7 @@ impl Game<'_> {
         if let Some(n) = entity_nbt::trident_from_nbt(&tag) {
             let mut t =
                 crate::game::trident::ThrownTrident::from_nbt(n, &tag, self.pack.assets.registry);
+            t.read_loyalty(&world_stations!(self).enchantments, &mut self.world.random);
             t.id = self.take_entity_id();
             // One that came through a portal keeps its cooldown.
             let id = t.id;
@@ -341,10 +342,26 @@ impl Game<'_> {
             // getShortOr uses NumericTag.shortValue: floor floating values
             // to int before short narrowing; integer tags narrow directly.
             let fuse = tnt_fuse(&tag);
+            // A fresh load: Entity.load's angles. A portal arrival:
+            // teleportSetPosition's `setYRot`/`setXRot` of the turned angles,
+            // with no `% 360` on the yaw.
+            let rotation = if used_portal {
+                let [yaw, pitch] = entity_nbt::rotation(&tag);
+                [
+                    if yaw.is_finite() { yaw } else { 0.0 },
+                    if pitch.is_finite() {
+                        (pitch % 360.0).clamp(-90.0, 90.0)
+                    } else {
+                        0.0
+                    },
+                ]
+            } else {
+                entity_nbt::loaded_rotation(&tag)
+            };
             self.tnts.push(crate::game::tnt::PrimedTnt {
                 used_portal,
                 attachment_lifetime: Default::default(),
-                rotation: [0.0, 0.0],
+                rotation,
                 join: Default::default(),
                 no_gravity: entity_nbt::flag(&tag, "NoGravity"),
                 id,
@@ -365,7 +382,9 @@ impl Game<'_> {
                     .get("block_state")
                     .and_then(|v| entity_nbt::state_from_nbt(self.pack.assets.registry, v)),
             });
-            // `Entity.load`: the `PortalCooldown` of one that just came through.
+            // `Entity.load`: the `PortalCooldown` of one that just came through,
+            // which `handlePortal` counts down every tick.
+            self.restore_portal_cooldown(id, &tag);
             if let Some(state) = transferred {
                 self.adopt_transferred_entity_state(id, state);
             }
@@ -829,8 +848,26 @@ impl Game<'_> {
     pub(super) fn mob_object_tree_nbt(&mut self, object: MobObject) -> Tag {
         let id = self.mob_at(object).id;
         let mut tag = self.mob_object_nbt(object);
-        self.put_mob_passengers(&mut tag, id);
+        self.put_riding(&mut tag, object, id);
         tag
+    }
+
+    /// `Entity.saveWithoutId`'s riding parts for a mob object (id `id`): a passenger saves `Pos`
+    /// at its vehicle's x and z with its own y, then the mobs riding it go under `Passengers`.
+    /// Resident and off-level mobs, and riders saved through their mount, all come here.
+    fn put_riding(&mut self, tag: &mut Tag, object: MobObject, id: u32) {
+        use crate::game::commands::Target;
+        let vehicle = self.passenger_vehicle_target(Target::Mob(id));
+        if let (Some(at), Tag::Compound(c)) =
+            (vehicle.and_then(|v| self.target_position(v)), &mut *tag)
+        {
+            let pos = [at[0], self.mob_at(object).position.y, at[2]];
+            c.insert(
+                "Pos".into(),
+                Tag::List(pos.map(|v| Tag::Double(v.to_bits())).into()),
+            );
+        }
+        self.put_mob_passengers(tag, id);
     }
 
     pub(super) fn mob_object_nbt(&mut self, object: MobObject) -> Tag {

@@ -115,6 +115,7 @@ pub mod trial_spawner;
 pub mod turtle;
 pub mod undead;
 pub mod vex;
+pub mod village_index;
 pub mod villager;
 pub mod villager_brain;
 pub mod villager_hats;
@@ -281,6 +282,20 @@ impl MobType {
 
     pub fn layer(&self, key: &str) -> Option<&Arc<Part>> {
         self.layers.get(key)
+    }
+    /// `instanceof Enemy` for the type's mobs. The zombie horse, camel husk and zombie nautilus
+    /// are in the monster category but extend `Animal`/`AbstractNautilus`, and the sulfur cube
+    /// extends `AbstractCubeMob` without `Enemy`, as the slime and magma cube add it: none of
+    /// them implements `Enemy`.
+    pub fn is_enemy(&self) -> bool {
+        self.category == "monster"
+            && !matches!(
+                self.species,
+                Species::ZombieHorse
+                    | Species::CamelHusk
+                    | Species::ZombieNautilus
+                    | Species::SulfurCube
+            )
     }
 }
 /// Each type's default attribute values, parsed exactly (serde_json's
@@ -993,6 +1008,10 @@ pub struct Extra {
     pub immovable: bool,
     /// `Mannequin.DATA_DESCRIPTION`: the text under its name.
     pub description: MannequinDescription,
+    /// Runtime-only: `(world.revision, [x.to_bits(), y.to_bits(), z.to_bits()])` at which an
+    /// immovable, invulnerable mannequin was last verified stationary in an inert environment
+    /// (dry, unlit, not in powder snow).
+    pub static_env_stamp: Option<(u64, [u64; 3], [u32; 2])>,
     /// `LivingEntity`'s `minecraft:scale` (`getScale`), which scales its box
     /// (`getDimensions`), eye height and model (`LivingEntityRenderState.scale`):
     /// the local player's own, and on a server every living entity's from its
@@ -1637,13 +1656,21 @@ pub enum MannequinDescription {
     Custom(horizon_core::nbt::Tag),
 }
 impl MannequinDescription {
+    /// Cached default component (`entity.minecraft.mannequin.label`) to avoid per-tick allocations.
+    pub fn default_component() -> &'static horizon_core::nbt::Tag {
+        static DEFAULT: std::sync::OnceLock<horizon_core::nbt::Tag> = std::sync::OnceLock::new();
+        DEFAULT.get_or_init(|| {
+            horizon_core::nbt::Tag::compound([(
+                "translate",
+                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
+            )])
+        })
+    }
+
     /// `Mannequin.getDescription`: the component `DATA_DESCRIPTION` holds, none when hidden.
     pub fn component(&self) -> Option<horizon_core::nbt::Tag> {
         match self {
-            Self::Default => Some(horizon_core::nbt::Tag::compound([(
-                "translate",
-                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
-            )])),
+            Self::Default => Some(Self::default_component().clone()),
             Self::Hidden => None,
             Self::Custom(tag) => Some(tag.clone()),
         }
@@ -1652,7 +1679,7 @@ impl MannequinDescription {
     pub fn from_component(tag: Option<&horizon_core::nbt::Tag>) -> Self {
         match tag {
             None => Self::Hidden,
-            Some(tag) if Some(tag) == Self::Default.component().as_ref() => Self::Default,
+            Some(tag) if tag == Self::default_component() => Self::Default,
             Some(tag) => Self::Custom(tag.clone()),
         }
     }
@@ -2889,6 +2916,10 @@ impl PendingPushes {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty() && self.by_mob.is_empty()
     }
+    /// Whether any queued push targets mob `id`.
+    pub fn has_for(&self, id: u32) -> bool {
+        self.list.iter().any(|(target, _)| *target == id) || self.by_mob.contains_key(&id)
+    }
     pub fn push(&mut self, id: u32, v: Vec3) {
         if self.by_mob.is_empty() && self.list.len() < Self::LIST_MAX {
             self.list.push((id, v));
@@ -3123,6 +3154,8 @@ pub struct PlayerView {
     /// The Invisibility effect (`isInvisible`).
     pub invisible: bool,
     pub spectator: bool,
+    /// `Player.onClimbable`: a climbable block at its feet (`LivingEntity.isPushable` vetoes it).
+    pub on_climbable: bool,
     /// `PiglinAi.isWearingSafeArmor`: some golden armour.
     pub gold_armor: bool,
     /// `getLastHurtByMob` (within 100 ticks) and when.
@@ -3153,8 +3186,7 @@ pub struct PlayerView {
     pub passenger: bool,
     /// The vehicle entity id, including mounts without a `Vehicle` follow view.
     pub riding_vehicle: Option<u32>,
-    /// The boat or nautilus the player rides and steers
-    /// (`getControllingPassenger`).
+    /// The boat or nautilus the player rides and steers (`getControllingPassenger`).
     pub vehicle: Option<Vehicle>,
 }
 /// What a player rides, for the mobs that follow it (`FollowPlayerRiddenEntityGoal`).
@@ -3248,6 +3280,8 @@ pub struct MobWorld<'a> {
     /// keeps them (the mob ticks: a slot keeps its mob, and its species, all
     /// tick). Each zombie looking for a village read every slot.
     pub others_villagers: Option<&'a [u32]>,
+    /// The villagers' village sections of `others`, when the caller keeps them up to date.
+    pub village: Option<&'a village_index::VillageIndex>,
     /// The slots of `others` by species, when the caller keeps them (the mob loops).
     pub species_slots: Option<&'a species_slots::SpeciesSlots>,
     /// The slots of `others` that may stop a moving mob
@@ -3790,15 +3824,9 @@ impl Mob {
     pub fn hostile(&self) -> bool {
         self.kind.category == "monster"
     }
-    /// `instanceof Enemy`. The zombie horse, camel husk and zombie nautilus are in
-    /// the monster category but extend `Animal`/`AbstractNautilus`, which do
-    /// not implement `Enemy`.
+    /// `instanceof Enemy`: its type's ([`MobType::is_enemy`]).
     pub fn is_enemy(&self) -> bool {
-        self.hostile()
-            && !matches!(
-                self.species(),
-                Species::ZombieHorse | Species::CamelHusk | Species::ZombieNautilus
-            )
+        self.kind.is_enemy()
     }
     #[inline]
     pub fn species(&self) -> Species {
@@ -4358,12 +4386,61 @@ impl Mob {
         self.prepare_tick();
         neutral_anger::tick_until_consumption(self, w, level, events)
     }
-    fn prepare_tick(&mut self) {
+    pub(crate) fn prepare_tick(&mut self) {
         self.track_section();
         // LivingEntity.tick: CombatTracker.recheckStatus.
         let alive = self.alive();
         self.combat.recheck(alive, self.age);
         self.extra.stuck.tick();
+    }
+
+    /// Whether this mob is a stationary, immovable, invulnerable mannequin whose tick has no
+    /// block-contact, damage, or finite-effect countdown side effects once verified for the
+    /// current `(world.revision, position)` stamp.
+    pub fn is_static_mannequin(&self) -> bool {
+        self.species() == Species::Mannequin
+            && self.extra.immovable
+            && self.invulnerable_flag
+            && !self.removed
+            && self.alive()
+            && !self.first_tick
+            && !self.effects_dirty
+            && self.extra.mount.is_none()
+            && self.rider.is_none()
+            && self.extra.rider.is_none()
+            && self.extra.leash.is_none()
+            && self.extra.leash_pending.is_none()
+            && self.fire_ticks == 0
+            && self.ticks_frozen == 0
+            && self.hurt_time == 0
+            && self.invulnerable == 0
+            && self.invulnerable_time == 0
+            && self.ai.last_hurt_by_player == 0
+            && self.impulse_grace_time == 0
+            && !self.ai.swinging
+            && self.velocity == Vec3::ZERO
+            && self.position == self.previous
+            && !self.fluids.in_water
+            && !self.fluids.in_lava
+            && !self.in_powder_snow
+            && self.air >= self.max_air_supply()
+            && self.outbox.is_empty()
+            && self.extra.effect_chains.is_empty()
+            && self.extra.effects.iter().all(|e| {
+                e.duration == -1
+                    && matches!(
+                        e.id,
+                        "minecraft:resistance"
+                            | "minecraft:fire_resistance"
+                            | "minecraft:water_breathing"
+                            | "minecraft:invisibility"
+                            | "minecraft:night_vision"
+                            | "minecraft:slow_falling"
+                            | "minecraft:glowing"
+                            | "minecraft:speed"
+                            | "minecraft:slowness"
+                    )
+            })
     }
     /// The section the mob is in, noted when it changes (`EntitySection` lists).
     fn track_section(&mut self) {
@@ -4732,6 +4809,7 @@ impl Mob {
         crate::hunger::native_living_heal(context, self.id, &mut amount, &mut cancel);
         if !cancel && self.health > 0.0 {
             self.health = (self.health + amount).clamp(0.0, self.attrs.max_health);
+            crate::hunger::native_living_heal_cause(context, self.id, "other", amount);
         }
     }
     /// `HealOrHarmMobEffect.applyInstantenousEffect`: a harming effect hurts a

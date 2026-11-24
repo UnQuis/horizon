@@ -121,6 +121,12 @@ cargo run --release -p horizon-game -- --render-distance 12
 
 Development builds that link quickly: `cargo build --profile fast -p horizon-game`.
 
+On Windows, with the build prerequisites and prepared resources above and `python` on `PATH`, run
+`tools\build-and-run.bat --world "Dev World" --render-distance 8` from the checkout.
+It builds `target\fast\horizon-client.exe`, passes along game arguments, and prints the new
+temporary run directory. Saves, options and logs stay there by default, not in the checkout
+or in your regular Horizon profile. Each invocation starts with a fresh directory.
+
 `HORIZON_OCCLUSION_PROFILE=1` enables detailed entity-occlusion phase and bounds-scan timings
 in `horizon-ctl stats` and `bench`. The normal benchmark keeps these CPU-clock reads disabled;
 query, cache-hit and cull counters remain available without profiling.
@@ -165,19 +171,20 @@ if your audio server underruns (e.g. PipeWire with `min-quantum` ≥ 1024), set
 `HORIZON_AUDIO_BUFFER=2048` or `HORIZON_AUDIO_BUFFER=default` to use the backend's
 default buffer size.
 
-### Experimental older servers
+### Older servers
 
 The native Rust adapter recognizes 26.2, 26.1.x, 1.21.11, 1.21.9/1.21.10,
 1.21.7/1.21.8, 1.21.6, 1.21.5, 1.21.4, 1.21.2/1.21.3, 1.21/1.21.1,
-1.20.5/1.20.6, 1.20.3/1.20.4 and 1.20.2. It is off by default while compatibility is incomplete. Set
-`HORIZON_OLDER_SERVERS=1` before starting the game; the server's status ping selects
-the adapter. The client still needs its prepared **26.3** resources.
+1.20.5/1.20.6, 1.20.3/1.20.4 and 1.20.2. It is on by default: the server's status ping selects the adapter. Set
+`HORIZON_OLDER_SERVERS=0` before starting the game to turn it off. The client still needs its prepared **26.3** resources.
+
+To turn it off for one run:
 
 ```sh
-HORIZON_OLDER_SERVERS=1 cargo run --profile fast -p horizon-game -- --server 127.0.0.1:25565
+HORIZON_OLDER_SERVERS=0 cargo run --profile fast -p horizon-game -- --server 127.0.0.1:25565
 ```
 
-In PowerShell, set `$env:HORIZON_OLDER_SERVERS = '1'`, then run the same Cargo
+In PowerShell, set `$env:HORIZON_OLDER_SERVERS = '0'`, then run the same Cargo
 command without the environment assignment at its start.
 
 This does not load Fabric JARs or emulate every older version's movement and
@@ -222,6 +229,8 @@ reconstruction. Modified entity/block-entity data has no general reverse datafix
 and newer components without an old field cannot be represented. Incoming block-entity
 updates and chunk entries use forward datafixes for banner patterns, skull profiles,
 text and nested inventory stacks, retaining opaque fields and the original tag identity.
+The legacy registry and item context is acquired only for translations that read it,
+not for movement, keepalives or other packets that do not use that data.
 Independent vanilla fixtures cover these conversions; they do not establish full rendered parity. Static banners,
 enchantments, paintings, instruments and the original wolf coat use vanilla names.
 Old recipes, trades, horse equipment, attribute/effect metadata and particles are
@@ -308,7 +317,9 @@ $C quit                                      # save and exit
 
 `horizon-ctl help` lists the commands by group and `horizon-ctl COMMAND --help`
 explains one with examples; `horizon-ctl help --game` lists what the running
-game accepts, test hooks included.
+game accepts, test hooks included. The widget IDs above are independent of the
+client language; use `ui` to discover IDs for other widgets
+([agent-control.md](agent-control.md#the-widget-tree)).
 
 - **Observe:** `state` (position, rotation, velocity, health, food, saturation,
   XP, effects, game mode, dimension, time, weather, the screen and what the

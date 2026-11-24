@@ -28,8 +28,8 @@ use horizon_assets::{
     animation::AnimationMetadata,
     item_bake::{BakedItemModel, SpriteLookup, SpriteMask, bake_item_model, bake_sprite_layer},
     item_model::{
-        ClientItem, Context, DisplayContext, FoilType, ItemEnv, ItemModels, LayerContent,
-        LevelState, OwnerState, PreparedParts, SpecialModel, StackView,
+        ClientItem, Context, DisplayContext, FoilType, ItemEnv, ItemModelNode, ItemModels,
+        LayerContent, LevelState, OwnerState, PreparedParts, SpecialModel, StackView,
     },
     model::Direction,
     palette::PalettedPermutations,
@@ -39,7 +39,7 @@ use horizon_core::nbt::Tag;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 /// One quad as submitted for drawing: pose-space corners, atlas UVs, the
@@ -323,14 +323,13 @@ impl ItemRenderState {
             if layer.foil != FoilType::None {
                 return false;
             }
-            let Some(stored) = skin.models.item(baked, skin.frame) else {
-                return false;
-            };
-            let translucent = |run: &crate::mobs::skin::ItemRun| {
-                let sprite = &baked.quads[run.quad].material.sprite;
-                renderer.sprites.translucent(sprite_name(sprite))
-            };
-            if stored.runs.iter().any(translucent) {
+            if skin
+                .models
+                .item_opaque(baked, skin.frame, |sprite| {
+                    renderer.sprites.translucent(sprite_name(sprite))
+                })
+                .is_none()
+            {
                 return false;
             }
         }
@@ -348,8 +347,7 @@ impl ItemRenderState {
                 let q = &baked.quads[run.quad];
                 let Some(r) = sprites
                     .get(sprite_name(&q.material.sprite))
-                    .or_else(|| sprites.get("misc/missingno"))
-                    .or_else(|| sprites.get("horizon/missingno"))
+                    .or_else(|| sprites.get(crate::hud::MISSING_SPRITE))
                 else {
                     continue;
                 };
@@ -451,10 +449,6 @@ fn submit_quads(
         FoilType::Standard => Foil::Standard,
         FoilType::Special => Foil::Special,
     };
-    let atlas = renderer
-        .glint_atlas
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut normals = FaceNormals::new(m);
     // Quads of one layer mostly share a sprite: look its rect and its
     // translucency up once.
@@ -462,6 +456,12 @@ fn submit_quads(
     let mut last_rect: Option<(&str, Option<Rect>)> = None;
     // A glint in the GUI follows the quad's sprite in the glint atlas: looked up once a sprite too.
     let gui_glint = display == DisplayContext::Gui && foil == Foil::Standard;
+    let atlas = gui_glint.then(|| {
+        renderer
+            .glint_atlas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
     let mut last_glint: Option<(&str, Option<Rect>)> = None;
     for q in &baked.quads {
         let rect = match last_rect {
@@ -469,8 +469,7 @@ fn submit_quads(
             _ => {
                 let rect = sprites
                     .get(sprite_name(&q.material.sprite))
-                    .or_else(|| sprites.get("misc/missingno"))
-                    .or_else(|| sprites.get("horizon/missingno"))
+                    .or_else(|| sprites.get(crate::hud::MISSING_SPRITE))
                     .copied();
                 last_rect = Some((&q.material.sprite, rect));
                 rect
@@ -515,8 +514,9 @@ fn submit_quads(
             pos,
             uv,
             foil_uv: q.uv,
-            gui_glint_uv: gui_glint
-                .then(|| match last_glint {
+            gui_glint_uv: atlas
+                .as_ref()
+                .and_then(|atlas| match last_glint {
                     Some((sprite, rect)) if sprite == q.material.sprite => rect,
                     _ => {
                         let rect = atlas.get(sprite_name(&q.material.sprite)).copied();
@@ -524,7 +524,6 @@ fn submit_quads(
                         rect
                     }
                 })
-                .flatten()
                 .map(|r| {
                     q.uv.map(|[u, v]| [r.u0 + (r.u1 - r.u0) * u, r.v0 + (r.v1 - r.v0) * v])
                 }),
@@ -862,6 +861,64 @@ impl ItemRenderer {
             grass,
             cit,
         })
+    }
+    /// The models a pack's own item definitions (outside the `minecraft` namespace) draw, at any
+    /// depth of their composite, condition, select and range nodes.
+    pub fn pack_model_names(&self) -> Vec<String> {
+        fn leaves(node: &ItemModelNode, out: &mut Vec<String>) {
+            match node {
+                ItemModelNode::Model(leaf) => out.push(leaf.model.clone()),
+                ItemModelNode::Composite { models, .. } => {
+                    models.iter().for_each(|m| leaves(m, out))
+                }
+                ItemModelNode::Condition {
+                    on_true, on_false, ..
+                } => {
+                    leaves(on_true, out);
+                    leaves(on_false, out);
+                }
+                ItemModelNode::Select {
+                    cases, fallback, ..
+                } => {
+                    cases.iter().for_each(|c| leaves(&c.model, out));
+                    fallback.iter().for_each(|f| leaves(f, out));
+                }
+                ItemModelNode::RangeDispatch {
+                    entries, fallback, ..
+                } => {
+                    entries.iter().for_each(|(_, m)| leaves(m, out));
+                    fallback.iter().for_each(|f| leaves(f, out));
+                }
+                ItemModelNode::Registered { models, .. } => {
+                    models.iter().for_each(|(_, m)| leaves(m, out))
+                }
+                _ => {}
+            }
+        }
+        let mut names = Vec::new();
+        for (_, item) in self
+            .models
+            .definitions
+            .iter()
+            .filter(|(id, _)| !id.starts_with("minecraft:"))
+        {
+            leaves(&item.model, &mut names);
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+    /// Bakes `names` ahead, with their corners: vanilla bakes every model when it loads a pack, so
+    /// the first time one shows nothing stops to bake it (a server's large models, its railway's,
+    /// took seconds). Stops once the pack's renderer is dropped (the pack unloaded or reloaded).
+    pub fn bake_ahead(renderer: &Weak<Self>, names: Vec<String>) {
+        for name in names {
+            let Some(renderer) = renderer.upgrade() else {
+                return;
+            };
+            let baked = renderer.bake(&name);
+            renderer.quad_extents(&name, &baked);
+        }
     }
     /// `ModelBakery` item baking, cached per model.
     pub fn bake(&self, model: &str) -> Arc<BakedItemModel> {
@@ -1300,7 +1357,7 @@ pub fn cluster_poses(state: &ItemRenderState, pose: Mat4, amount: u32, seed: i64
 /// already computed for this draw (also used to place the stack's bob).
 pub fn cluster_poses_with_depth(pose: Mat4, amount: u32, seed: i64, depth: f32) -> Vec<Mat4> {
     use horizon_core::random::{LegacyRandom, RandomSource};
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(amount as usize);
     if amount == 0 {
         return out;
     }
@@ -1364,6 +1421,66 @@ mod tests {
         };
         assert_eq!(models("loadtest:item/a"), ["loadtest:item/a"]);
         assert_eq!(models("loadtest:item/b"), ["loadtest:item/b"]);
+    }
+
+    /// A pack's own item models, nested in conditions too, are baked with their corners before
+    /// anything draws them, as vanilla bakes every model when it loads the pack; the `minecraft`
+    /// namespace's aren't.
+    #[test]
+    fn a_packs_own_item_models_are_baked_ahead() {
+        let root = std::env::temp_dir().join(format!("horizon-bake-ahead-{}", std::process::id()));
+        let write = |name: &str, data: &str| {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        };
+        write("items.json", "{}");
+        write(
+            "assets/minecraft/atlases/items.json",
+            r#"{"sources":[{"type":"single","resource":"track:item/rail"}]}"#,
+        );
+        super::glint_tests::png(
+            &root.join("assets/track/textures/item/rail.png"),
+            16,
+            16,
+            [90, 90, 90, 255],
+        );
+        write(
+            "assets/track/items/rail.json",
+            r#"{"model":{"type":"minecraft:model","model":"track:item/rail"}}"#,
+        );
+        write(
+            "assets/track/models/item/rail.json",
+            r##"{"textures":{"all":"track:item/rail"},"elements":[{"from":[0,0,0],"to":[16,2,16],
+                "faces":{"up":{"uv":[0,0,16,16],"texture":"#all"}}}]}"##,
+        );
+        write(
+            "assets/track/items/signal.json",
+            r#"{"model":{"type":"minecraft:condition","property":"minecraft:using_item",
+                "on_true":{"type":"minecraft:model","model":"track:item/signal_on"},
+                "on_false":{"type":"minecraft:model","model":"track:item/rail"}}}"#,
+        );
+        write(
+            "assets/track/models/item/signal_on.json",
+            r##"{"textures":{"all":"track:item/rail"},"elements":[{"from":[7,0,7],"to":[9,16,9],
+                "faces":{"north":{"uv":[0,0,2,16],"texture":"#all"},
+                "south":{"uv":[0,0,2,16],"texture":"#all"}}}]}"##,
+        );
+        write(
+            "assets/minecraft/items/stick.json",
+            r#"{"model":{"type":"minecraft:model","model":"minecraft:item/stick"}}"#,
+        );
+        let data = crate::test_resources::item_data(&root, DataLoadOrigin::ClientPreload).unwrap();
+        let renderer =
+            Arc::new(ItemRenderer::load(&ResourceRoot::directory(root.clone()), &data).unwrap());
+        ItemRenderer::bake_ahead(&Arc::downgrade(&renderer), renderer.pack_model_names());
+        let baked = renderer.baked.lock().unwrap();
+        assert_eq!(baked["track:item/rail"].quads.len(), 1);
+        assert_eq!(baked["track:item/signal_on"].quads.len(), 2);
+        assert!(!baked.contains_key("minecraft:item/stick"));
+        assert_eq!(renderer.extents.lock().unwrap()["track:item/rail"].len(), 4);
+        drop(baked);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

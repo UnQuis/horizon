@@ -99,6 +99,9 @@ pub(super) fn build_renderer(
     renderer
         .hud
         .set_text_shader(&renderer.device, atlas.text_shaders.gui.as_deref());
+    renderer
+        .hud
+        .set_blit_shader(&renderer.device, atlas.blit_shader.as_deref());
     pack.item_renderer
         .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
     renderer.set_lines_shader(atlas.lines_shader.as_deref());
@@ -212,6 +215,7 @@ pub(super) fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         water_plane: None,
         cave_culling: false,
         title: true,
+        gui_only: false,
         sky_blocked: false,
         skybox: false,
         end_sky: false,

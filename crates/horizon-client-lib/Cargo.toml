@@ -22,6 +22,8 @@ horizon-engine-slots = { path = "../horizon-engine-slots" }
 horizon-hooks = { path = "../horizon-hooks" }
 horizon-mod-runtime = { path = "../horizon-mod-runtime" }
 mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab" }
+# Whether a held lock file is still the one at its name (dev and inode, or volume and index).
+same-file = "1"
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
@@ -58,13 +60,19 @@ horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/modding/src/how-to/content-mods.md).
 # Their runtime is the `mods` feature.
-horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index", "junction"] }
+# Keep `horizon-mod-package` features aligned with `horizon-client` so alternating client and
+# client-lib builds/tests unify the same dependency set and reuse compiled artifacts.
+horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index", "junction", "runtime-process"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl", "naga-ir"] }
 winit = "0.30.13"
 pollster = "0.4"
 bytemuck = { version = "1.24", features = ["derive"] }
 glam = "0.30"
 png = "0.18"
+cap-std = "3"
+cap-fs-ext = "3"
+smallvec = "1"
+shlex = "2"
 sha2 = "0.10.9"
 # Server resource packs are checked and cached by their SHA-1, as vanilla does.
 sha1 = "0.10"
@@ -97,9 +105,10 @@ fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 
 [target.'cfg(unix)'.dependencies]
 # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
-rustix = { version = "1", default-features = false, features = ["std", "time", "process", "fs"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "time", "process", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 # Use the registered URI handler without routing links through Explorer/cmd.
 open = { version = "5.4.5", features = ["shellexecute-on-windows"] }
 # Resolve virtualized folders to shell-compatible physical paths (desktop.rs).
@@ -212,6 +221,10 @@ path = "../horizon-client/examples/resource_memory.rs"
 [[example]]
 name = "save_batch_bench"
 path = "../horizon-client/examples/save_batch_bench.rs"
+
+[[example]]
+name = "save_codec_bench"
+path = "../horizon-client/examples/save_codec_bench.rs"
 
 [[example]]
 name = "shared_json_startup_profile"

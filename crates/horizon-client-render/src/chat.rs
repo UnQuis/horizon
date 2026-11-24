@@ -16,6 +16,13 @@ use crate::{
 #[path = "chat_tests.rs"]
 mod tests;
 
+/// A chat message's log line, with `\r` and `\n` written out as vanilla does. One line whatever the
+/// text holds: a later line of a multi-line message would carry no `[CHAT]` mark and stay in the
+/// log a bug report attaches.
+fn chat_log_line(plain: &str) -> String {
+    format!("[CHAT] {}", crate::logging::one_line(plain))
+}
+
 /// `FilterMask.applyWithFormatting` over a player message's signed content, as
 /// the packet's mask `(type, bit set)`: as it is when passed through, none when
 /// fully filtered, and when partly filtered each masked UTF-16 unit becomes a
@@ -474,10 +481,10 @@ impl Chat {
             return;
         }
         // ChatComponent.logChatMessage: every message shown is in the log.
-        let plain = message.content.plain();
-        crate::logging::write_only(log::Level::Info, &format!("[CHAT] {plain}"));
+        let line = chat_log_line(&message.content.plain());
+        crate::logging::write_only(log::Level::Info, &line);
         if self.log {
-            println!("[CHAT] {plain}");
+            println!("{line}");
         }
         message.time = self.now();
         self.received += 1;
@@ -534,22 +541,29 @@ impl Chat {
         };
         let width = self.max_width() - icon;
         let content = self.message_text(message);
+        // Only the last 100 wrapped lines can survive the trim, so keep just those
+        // instead of shifting the whole list once per line.
+        let before = self.lines.len();
+        let mut kept = std::collections::VecDeque::with_capacity(101);
         for line in font.wrap_components(&content, width) {
             count += 1;
             if focused && self.scroll > 0 {
                 self.new_since_scroll = true;
-                self.scroll_by(1, focused);
+                // The list is `before + count - 1` long when this line is added.
+                self.scroll_by_len(1, before + count - 1, focused);
             }
-            self.lines.insert(
-                0,
-                Line {
-                    added: message.added,
-                    content: line,
-                    tag: message.tag.clone(),
-                    message: whole.clone(),
-                },
-            );
+            if kept.len() == 100 {
+                kept.pop_front();
+            }
+            kept.push_back(Line {
+                added: message.added,
+                content: line,
+                tag: message.tag.clone(),
+                message: whole.clone(),
+            });
         }
+        // Newest first, as if each had been inserted at the front.
+        self.lines.splice(0..0, kept.into_iter().rev());
         self.lines.truncate(100);
         count
     }
@@ -770,10 +784,11 @@ impl Chat {
         self.new_since_scroll = false;
     }
     pub fn scroll_by(&mut self, dir: i32, focused: bool) {
-        let max = self
-            .lines
-            .len()
-            .saturating_sub(self.lines_per_page(focused)) as i32;
+        self.scroll_by_len(dir, self.lines.len(), focused);
+    }
+    /// [`Chat::scroll_by`] for a list of `len` lines.
+    fn scroll_by_len(&mut self, dir: i32, len: usize, focused: bool) {
+        let max = len.saturating_sub(self.lines_per_page(focused)) as i32;
         let pos = (self.scroll as i32 + dir).min(max);
         if pos <= 0 {
             self.scroll = 0;

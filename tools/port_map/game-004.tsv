@@ -58,7 +58,7 @@ AreaEffectCloud.get	skip:other		entity data component accessor for predicates an
 AreaEffectCloud.applyImplicitComponents	inline	crates/horizon-client/src/game/items/potions.rs::Game::splash	the lingering branch takes the thrown stack's potion effects and colour; potion_duration_scale is fixed at 0.25
 AreaEffectCloud.applyImplicitComponent	inline	crates/horizon-client/src/game/items/potions.rs::Game::splash	same: potion contents only
 Avatar.defineSynchedData	port	crates/horizon-client/src/lan/hub.rs::Hub::player_state	gap: minor: skin parts (entry 16) are sent, the main hand entry is not
-Avatar.isModelPartShown	port	crates/horizon-client/src/game/network/remote/mod.rs::Game::update_remote_skins	the Skin Customization cape option reaches the drawn player
+Avatar.isModelPartShown	port	crates/horizon-client/src/game/network/remote/skins.rs::Game::update_remote_skins_body	the Skin Customization cape option reaches the drawn player
 Bucketable.loadDefaultDataFromBucketTag	port	crates/horizon-client/src/entity_nbt.rs::apply_item_components	NoAI, Silent, NoGravity, Glowing, Invulnerable, PersistenceRequired and Health, read from the bucket's entity data
 ContainerUser.getLivingEntity	skip:java		interface cast; every container user here is the player
 ConversionTracker.addAdditionalSaveData	inline	crates/horizon-client/src/entity_nbt.rs::mob_to_nbt	Zombie-derived InWaterTime saves -1 unless cached eyes are in water; gap: supplied NBT can still shadow live counter progress
@@ -83,7 +83,7 @@ Display.getBrightnessOverride	inline	crates/horizon-client/src/game/entities/tex
 Display.calculateInterpolationProgress	port	crates/horizon-client/src/game/entities/text_displays.rs::RemoteTextDisplay::progress
 Display.updateCulling	port	crates/horizon-client/src/text_display.rs::culling_box	noCulling when width or height is 0 (`no_culling`); else the width/height AABB
 Display.shouldRenderAtSqrDistance	inline	crates/horizon-client/src/game/entities/text_displays.rs::Game::display_in_view	view_range * 64 * view scale squared; frustum when width and height are set
-Display.getTeamColor	missing		minor: glow_color_override is read but a glowing display gets no coloured outline
+Display.getTeamColor	port	crates/horizon-client/src/game/entities/glowing.rs::Game::display_outline	glow_color_override, falling back to the team's colour or white
 Display.createFreshRenderState	inline	crates/horizon-client/src/game/entities/text_displays.rs::RemoteTextDisplay::tick	the copy of the synced data when no interpolation runs
 Display.createInterpolatedRenderState	inline	crates/horizon-client/src/game/entities/text_displays.rs::RemoteTextDisplay::tick	the new start state is the old one blended to the last drawn progress (TextDisplayData::blend)
 Display.BlockDisplay	home	crates/horizon-client/src/game/entities/text_displays.rs	a block display submits its block model under the display's transformation, lit and tracked like an entity (Game::block_item_display_geometry)

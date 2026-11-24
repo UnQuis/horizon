@@ -34,6 +34,8 @@ pub mod preset_editors;
 mod splash;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod title_request_tests;
 mod world_folder;
 pub mod world_management;
 #[cfg(test)]
@@ -531,6 +533,7 @@ pub(crate) struct Button {
     label: String,
     enabled: bool,
     id: u8,
+    agent_id: Option<&'static str>,
     icon: Option<(&'static str, f32)>,
     /// `SpriteIconButton.TextAndIcon`: the icon at the right end, the text
     /// centred in the room left of it.
@@ -539,6 +542,11 @@ pub(crate) struct Button {
     action: Option<crate::widgets::Action>,
 }
 impl Button {
+    fn identified(mut self, id: &'static str) -> Self {
+        self.agent_id = Some(id);
+        self
+    }
+
     fn does(mut self, action: crate::widgets::Action) -> Self {
         self.action = Some(action);
         self
@@ -969,6 +977,36 @@ impl Title {
             }
         });
     }
+    /// Multiplayer: TitleScreen.init opens SafetyScreen first, unless it was turned off.
+    pub fn open_server_list(&mut self) {
+        self.set_mode(if self.skip_multiplayer_warning {
+            Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
+        } else {
+            Mode::MultiplayerWarning { check: false }
+        });
+    }
+    /// Create New World from the main page (a native mod's `request_title`): the world generation data is read
+    /// first, as the world list's Create button does (`preparing`), and its Cancel comes back to the main page.
+    pub fn open_new_world(&mut self) {
+        self.create_return_to_main = true;
+        self.preparing = true;
+    }
+    /// Direct Connection's Join for `address` (a native mod's `request_title`): None for an address it would not
+    /// join; otherwise the address is kept as the last direct one and the join is the game's to run.
+    pub fn direct_join(&mut self, address: &str) -> Option<Action> {
+        if !horizon_protocol::servers::is_valid_address(address) {
+            return None;
+        }
+        // Direct Connection keeps what was typed for its next opening (`remember_direct_address`).
+        self.last_server = address.to_owned();
+        let address = crate::multiplayer::direct_address(address);
+        crate::multiplayer::remember_direct_join(&self.saves, &address);
+        Some(Action::Connect {
+            address,
+            lan: false,
+            realm: false,
+        })
+    }
     pub(crate) fn new_world(&self) -> Mode {
         Mode::Create {
             name: lang::get_or("selectWorld.newWorld", "New World"),
@@ -1103,6 +1141,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::SingleBiomeSurface;
                 options.single_biome = buffet.biome.clone();
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -1129,6 +1168,7 @@ impl Title {
             if apply {
                 options.world_type = crate::save::WorldPreset::Flat;
                 options.flat_settings = Some(flat.settings);
+                options.apply_builtin_overworld_edit();
             }
             self.set_mode(Mode::Create {
                 name,
@@ -2486,12 +2526,7 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
                 }
             }
             (Mode::Main, Some(4)) => {
-                // TitleScreen.init: SafetyScreen first, unless it was turned off.
-                self.set_mode(if self.skip_multiplayer_warning {
-                    Mode::Multiplayer(crate::multiplayer::Screen::list(&self.saves))
-                } else {
-                    Mode::MultiplayerWarning { check: false }
-                });
+                self.open_server_list();
                 Action::None
             }
             (Mode::MultiplayerWarning { check }, Some(70)) => {

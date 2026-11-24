@@ -141,6 +141,7 @@ impl Game<'_> {
         let mut positions: Option<horizon_client::fast_hash::FxHashMap<u32, usize>> = None;
         let mut index = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
         let mut villager_slots = Vec::new();
+        let mut village = horizon_client::mobs::village_index::VillageIndex::default();
         let mut solid_slots = Vec::new();
         let mut species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
         for (i, s) in snapshot.iter().enumerate() {
@@ -203,6 +204,7 @@ impl Game<'_> {
                         Some(positions) => {
                             let Some(&i) = positions.get(&snapshot[slot].id) else {
                                 keep[slot] = false;
+                                village.mark(slot, &snapshot[slot], &snapshot[slot]);
                                 snapshot[slot].alive = false;
                                 // The row's mob left the list at a boundary: the
                                 // tick view must answer a removed handle with nothing.
@@ -224,6 +226,7 @@ impl Game<'_> {
                     }
                     if m.removed && !resuming {
                         keep[slot] = false;
+                        village.mark(slot, &snapshot[slot], &snapshot[slot]);
                         snapshot[slot].alive = false;
                         // `removed` is the view's authoritative gone: a dead body
                         // that is still in the level keeps resolving (arismoko/horizon#795).
@@ -232,6 +235,73 @@ impl Game<'_> {
                         continue;
                     }
                     let (bx, bz) = (m.position.x.floor() as i32, m.position.z.floor() as i32);
+                    if !resuming
+                        && !retried
+                        && m.species() == horizon_client::mobs::Species::Mannequin
+                        && m.extra.static_env_stamp
+                            == Some((
+                                base.world.revision,
+                                [
+                                    m.position.x.to_bits(),
+                                    m.position.y.to_bits(),
+                                    m.position.z.to_bits(),
+                                ],
+                                [m.width().to_bits(), m.height().to_bits()],
+                            ))
+                        && !mod_api::__private::listened(mod_api::HookId::LivingChangeTarget)
+                    {
+                        if !base.world.loaded(bx, bz) || !ticking(bx, bz) {
+                            keep[slot] = true;
+                            cursor += 1;
+                            continue;
+                        }
+                        if round.canceled(m.id) {
+                            m.despawn = mod_api::Despawn::default();
+                            cursor += 1;
+                            continue;
+                        }
+                        let bounds = m.bounds();
+                        let reach = (16.0 * f64::from(m.model_scale().max(1.0))).powi(2);
+                        let near_player = |pos: Vec3| {
+                            let dx = pos.x - m.position.x;
+                            let dy = pos.y - m.position.y;
+                            let dz = pos.z - m.position.z;
+                            dx * dx + dy * dy + dz * dz < reach
+                        };
+                        let player_near = nearest
+                            .nearest(m.position.x, m.position.y, m.position.z)
+                            .is_some_and(|p| near_player(p.position))
+                            || base.player.as_ref().is_some_and(|p| {
+                                p.alive && !p.spectator && near_player(p.position)
+                            });
+                        let clear_of_mobs = !pushes.has_for(m.id)
+                            && !grid.any_in(bounds, snapshot.len(), |idx| {
+                                let o = &snapshot[idx as usize];
+                                o.id != m.id && o.alive && o.pushable && o.bounds.intersects(bounds)
+                            });
+                        if !player_near
+                            && clear_of_mobs
+                            && m.is_static_mannequin()
+                            && m.position.y >= f64::from(base.world.bottom_y() - 64)
+                        {
+                            m.despawn = mod_api::Despawn::default();
+                            super::super::inventory_tick::equipment_inventory_tick(
+                                &self.world,
+                                self.res.facts(),
+                                level_id,
+                                &mut m.extra.equipment,
+                            );
+                            if horizon_client::mobs::ai::tick_static_mannequin(
+                                m,
+                                base.world.revision,
+                                base.world.bottom_y(),
+                            ) {
+                                ticked.insert(m.id);
+                                cursor += 1;
+                                continue;
+                            }
+                        }
+                    }
                     let seen_guest = if resuming {
                         resume_guest
                     } else if guests.is_empty() {
@@ -300,6 +370,7 @@ impl Game<'_> {
                                     others_grid: Some(&grid),
                                     others_index: Some(&index),
                                     others_villagers: Some(&villager_slots),
+                                    village: Some(&village),
                                     species_slots: Some(&species_slots),
                                     others_solid: Some(&solid_slots),
                                     live_mobs: None,
@@ -443,6 +514,7 @@ impl Game<'_> {
                         others_grid: Some(&grid),
                         others_index: Some(&index),
                         others_villagers: Some(&villager_slots),
+                        village: Some(&village),
                         species_slots: Some(&species_slots),
                         others_solid: Some(&solid_slots),
                         difficulty,
@@ -640,6 +712,7 @@ impl Game<'_> {
                     // ServerLevel ticks entities one after another: the ones
                     // after this mob see it as it is now.
                     let fresh = seen(m, uuid, world_items!(self));
+                    village.mark(slot, &snapshot[slot], &fresh);
                     let reclassified = snapshot[slot].species != fresh.species;
                     snapshot[slot] = fresh;
                     if reclassified {
@@ -753,6 +826,7 @@ impl Game<'_> {
                 }
             }
             villager_slots.clear();
+            village = horizon_client::mobs::village_index::VillageIndex::default();
             species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
             solid_slots.clear();
             for (slot, s) in snapshot.iter().enumerate() {

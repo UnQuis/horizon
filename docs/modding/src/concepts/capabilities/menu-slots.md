@@ -227,7 +227,7 @@ one's place and the mouse stays where it is. Opening from the player's inventory
 `player.open_mod_menu` takes the same `replace` for a content mod's menu type
 ([machine menu data](../../how-to/world/machine-menu-data.md)).
 
-## Slots backed by a held item or an entity's handler
+## Slots backed by a held item, a mod place or an entity's handler
 
 A menu opened with no block (`player.open_mod_menu`, or `open_menu`'s chest menu) can show storage that is not a block
 entity, as NeoForge's `StackCopySlot` and `ResourceHandlerSlot` do. Right after the open, back its first container
@@ -236,6 +236,10 @@ slots with `player.back_mod_menu_slots(host, window, places)`, one `MenuSlotPlac
 - `MenuSlotPlace::HeldItem { hand, slot }`: slot `slot` of the container inside the stack in the player's `hand`, through
   its `ITEM_ITEMS` handler (a backpack's contents). While the menu is open, the hotbar slot holding a main-hand stack takes
   no click, so the backpack can't go into itself.
+- `MenuSlotPlace::ModItem { provider, key, slot }`: slot `slot` of the container inside the stack at the mod place
+  `ItemPlace::Mod { provider, key }` (a `PlaceProvider`'s, such as an accessory slot), through its `ITEM_ITEMS` handler: a
+  backpack worn on the back. A click that would take that stack out of its place (when the provider keeps it in one of
+  the menu's slots, such as an inventory slot) is undone whole, so the backpack can't go into itself.
 - `MenuSlotPlace::EntityItems { entity, slot }`: slot `slot` of `entity`'s `ENTITY_ITEMS` handler, as a mod's provider
   answers it.
 
@@ -247,8 +251,9 @@ a container held there, the menu's slots), and only the slots that changed are w
 notice, deduplicated per menu; there is no next-tick scan. A handler changed independently of an `ItemPlace` write
 is checked and mirrored at the next click, not automatically on the next tick. Before each click and at each
 change notice the menu checks its places: it closes once one stops resolving (the backpack left the hand, the entity is
-gone), or once a `HeldItem` hand no longer holds the stack bound when the slots were backed (another stack put in its
-place, another hotbar slot selected). Stacks are values, so the bound stack is told apart by its item and components
+gone), or once a `HeldItem` hand or a `ModItem` place no longer holds the stack bound when the slots were backed
+(another stack put in its place, another hotbar slot selected). A provider that changes its place by its own means,
+not through an `ItemPlace` write, is seen at the next click; back the slots again to show it at once. Stacks are values, so the bound stack is told apart by its item and components
 other than its contents. Slots past `places` stay the mod's own (`menu_clicked`). A drag, a number-key swap, a
 double-click collect or a throw on a backed menu is still the mod's to answer.
 
@@ -272,7 +277,53 @@ if let Some(window) = window {
 }
 ```
 
+For a blockless content menu, register a `MenuPart` with `Registrar::menu_part` using the menu's id
+and return a `Screen` from `MenuPart::menu_screen`. Provide a finite coordinate pair for every
+container slot declared by the menu type, in slot order. Choose positions that make the slots
+usable on the screen. Use the screen render and input hooks for custom controls, matching
+`ScreenView::menu` to the same menu id. A block's own menu still uses its block screen, including
+any registered recipe-book layout.
+
 A vanilla menu and a menu no mod backed never take this path: their slots keep the backing they had.
+
+## A workstation with no block
+
+An item that carries a crafting table or an anvil ("workbench on a stick") opens the vanilla workstation menu with
+no block, as a Java item does with a `ContainerLevelAccess` at the player:
+`player.open_station(host, menu, inputs, keep)`. `menu` is the key of `minecraft:crafting`, `minecraft:loom`,
+`minecraft:grindstone`, `minecraft:cartography_table`, `minecraft:stonecutter`, `minecraft:smithing` or
+`minecraft:anvil`. The station works where the player stands at each use: its sounds, the grindstone's experience
+and the smithing table's level event happen there. Its input slots start with `inputs` (the crafting grid's nine row
+by row, a station's in its menu's order), so a mod can put back what the item kept. It stays open while the player's
+inventory (main slots, armour, off hand) holds one of the items in `keep`, which stands in for the Java menu's
+`stillValid`, and closes as walking away from a block does once it holds none. A stock client shows it: the client
+opens station screens from the menu type alone.
+
+The menu replaces the one the player had open. The call returns the window id, `Ok(None)` when a mod cancelled the
+open (`container_opened`), or an `OpenStationError`: `NotStation` for any other menu type,
+`PlayerUnavailable`, `TooManyInputs`, or `Stack(StackWriteError)` for an input the game refuses.
+
+Before its inputs go back to the inventory on closing (the player closed it, it was no longer valid, another menu
+replaced it), `station_closing` hands a mod the input slots. Empty a slot to keep its stack, for instance in the
+item's `minecraft:container` component through an `ItemPlace` write in the same hook; only emptied slots count, so a
+listener can't make or grow a stack there. When the player leaves, the inputs go back to the inventory before it is
+saved and the hook doesn't fire. An anvil opened this way wears no block and plays no anvil event: its mod wears its
+own item after `anvil_craft_post` and plays level event 1029 or 1030 with `level.level_event`.
+
+```rust,ignore
+// An ItemPart on the stick; `self.stick` is its ItemKey, from `r.item_key` in `register`.
+fn use_item(&self, host: HostSide<'_>, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
+    let HostSide::Server(host) = host else { return Some(InteractionResult::Consume) };
+    let player = host.player(event.player)?;
+    let table = host
+        .menu_keys()
+        .into_iter()
+        .find(|key| host.menu_key_id(*key) == "minecraft:crafting")?;
+    let grid = stored_grid(event.stack); // what this item kept from its last use
+    player.open_station(host, table, grid, vec![self.stick]).ok()?;
+    Some(InteractionResult::SuccessServer)
+}
+```
 
 ## Recipe transfer into a mod menu
 

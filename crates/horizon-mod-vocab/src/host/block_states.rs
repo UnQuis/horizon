@@ -144,6 +144,13 @@ pub trait BlockStatesBackend {
     #[access(Metadata)]
     fn block_state_has_block_entity(&self, state: BlockState) -> Option<bool>;
     /// Side: both.
+    /// The id of the block entity type a block of this state carries (`minecraft:chest`): the type
+    /// its `newBlockEntity` makes, as the game picks it when the block is placed. None for an
+    /// unknown state and for a state with no block entity, as `has_block_entity` answers `false`.
+    /// A Horizon addition: vanilla has no single call for it.
+    #[access(Metadata)]
+    fn block_state_block_entity_type(&self, state: BlockState) -> Option<String>;
+    /// Side: both.
     /// `BlockState.getMapColor(level, pos)` for a state whose colour does not depend on where it
     /// stands: its `MapColor.id`, 0 (`MapColor.NONE`) for no colour. Map items colour a column
     /// by it (`MapItem.update`). None for an unknown state.
@@ -210,6 +217,11 @@ pub trait BlockStatesBackend {
     /// yes; glass, leaves and single slabs no). None for an unknown state.
     #[access(Metadata)]
     fn block_state_solid_render(&self, state: BlockState) -> Option<bool>;
+    /// Side: both.
+    /// `BlockTags.FIRE`: the state's block is `minecraft:fire` or `minecraft:soul_fire`, the two
+    /// fire blocks of vanilla's tag. Air and other blocks answer false. None for an unknown state.
+    #[access(Metadata)]
+    fn block_state_is_fire(&self, state: BlockState) -> Option<bool>;
     /// Side: both.
     /// `BlockState.requiresCorrectToolForDrops()`: the block drops its loot only when mined
     /// with a correct tool (stone and obsidian yes, dirt no). None for an unknown state.

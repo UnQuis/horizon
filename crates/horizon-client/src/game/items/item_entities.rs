@@ -48,13 +48,36 @@ pub(super) fn bob_offset(position: Vec3, drawn: f32, still: bool) -> f32 {
     drawn * std::f32::consts::PI * 2.0
 }
 
+/// `Player.aiStep` sees sections in traversal order and each section's orbs
+/// in the order they entered it.
+pub(super) fn touching_orbs(
+    orbs: &horizon_client::join_seq::JoinList<ExperienceOrb>,
+    area: Aabb,
+) -> Vec<usize> {
+    let mut touching: Vec<_> = orbs
+        .iter()
+        .enumerate()
+        .filter(|(_, orb)| orb.bounds().intersects(area))
+        .map(|(index, _)| index)
+        .collect();
+    touching.sort_by_key(|&index| {
+        let orb = &orbs[index];
+        (
+            super::entity_sections::section_order(orb.position),
+            orb.section_order,
+        )
+    });
+    touching
+}
+
 impl Game<'_> {
-    pub(super) fn tick_items(&mut self) {
+    pub(super) fn tick_items(&mut self) -> FxHashMap<u32, Vec3> {
         let mut round = self.item_update_round();
-        self.tick_dropped_items(&mut round);
+        let original_moves = self.tick_dropped_items(&mut round);
         horizon_threads::work::clear_work();
         self.drain_entity_inside();
         self.native_tick_post_batch(round);
+        original_moves
     }
     /// The `entity_damage` of an item's own hits, which name no entity (fire,
     /// lava, a cactus). Only the server hurts items.
@@ -68,8 +91,13 @@ impl Game<'_> {
     pub(super) fn joined_during_entity_pass(&self, id: u32) -> bool {
         id > self.ticked_entities_through || self.contact_drops.contains(&id)
     }
-    pub(super) fn tick_dropped_items(&mut self, round: &mut native_ticks::TickRound) {
+    /// Return the original physics displacements for the hopper pass after the item tick.
+    pub(super) fn tick_dropped_items(
+        &mut self,
+        round: &mut native_ticks::TickRound,
+    ) -> FxHashMap<u32, Vec3> {
         let mut items = self.dropped.lift();
+        let mut original_moves = FxHashMap::default();
         // ServerLevel.tick: only entities in entity-ticking chunks tick.
         let ticking = self.entity_ticking_area();
         let mut removed = vec![false; items.len()];
@@ -135,16 +163,16 @@ impl Game<'_> {
                 // `moveTowardsClosestSpace` draws the speed from the item's own random.
                 let escape_speed = no_physics.then(|| item.random.next_float() * 0.2 + 0.1);
                 let mut entered = Vec::new();
-                let (alive, discarded, landed) = self.tick_item_with_block_contacts(
+                let (alive, discarded, landed, original) = self.tick_item_with_block_contacts(
                     item,
                     escape_speed,
                     &nearby,
                     false,
                     &mut |splash| entered.push(splash),
                 );
-                (no_physics, alive, discarded, entered, landed)
+                (no_physics, alive, discarded, entered, landed, original)
             };
-            let (no_physics, alive, discarded, entered, landed) =
+            let (no_physics, alive, discarded, entered, landed, original) =
                 match moves.take(i, item, &mut at_turn) {
                     Some(moved) => moved,
                     None => at_turn(item),
@@ -302,6 +330,9 @@ impl Game<'_> {
                 cells.remove(i, item.position);
                 continue;
             }
+            if merging && let Some(original) = original {
+                original_moves.insert(item.id, original);
+            }
         }
         for pos in bubble_tops {
             self.bubble_column_particles(pos);
@@ -311,12 +342,12 @@ impl Game<'_> {
         let Some(p) = self.player.as_ref() else {
             self.put_back_dropped(items);
             self.spawn_destroyed_contents(destroyed);
-            return;
+            return original_moves;
         };
         if p.health.dead_or_dying() || self.spectator() {
             self.put_back_dropped(items);
             self.spawn_destroyed_contents(destroyed);
-            return;
+            return original_moves;
         }
         let w = f64::from(p.dimensions.width) / 2.0;
         let (min, max) = (
@@ -336,6 +367,7 @@ impl Game<'_> {
         self.native_player_pickups(&mut items, (min, max), feet, own);
         self.put_back_dropped(items);
         self.spawn_destroyed_contents(destroyed);
+        original_moves
     }
     /// `ItemUtils.onContainerDestroyed`: spilled stacks use their own constructor
     /// motion (0.2 up and ±0.1 sideways), leaving the level random untouched.
@@ -563,6 +595,7 @@ impl Game<'_> {
             fall_distance: 0.0,
             rotation: [0.0, 0.0],
             join: Default::default(),
+            section_order: 0,
             no_gravity: false,
             id: self.next_entity,
             position: p,
@@ -606,54 +639,43 @@ impl Game<'_> {
                     p.position.z + w,
                 ),
             );
-            let area = match self.riding_box() {
+            match self.riding_box() {
                 Some(vehicle) => own.union_bounds(vehicle).inflate(Vec3::new(1.0, 0.0, 1.0)),
                 None => own.inflate(Vec3::new(1.0, 0.5, 1.0)),
-            };
-            (
-                [
-                    area.min_position().x,
-                    area.min_position().y,
-                    area.min_position().z,
-                ],
-                [
-                    area.max_position().x,
-                    area.max_position().y,
-                    area.max_position().z,
-                ],
-            )
+            }
         });
         let mut orbs = self.orbs.lift();
         #[cfg(test)]
         crate::game::entity::taken_pass_tests::after_take(self);
-        let mut gained = 0;
-        let mut taken = Vec::new();
-        if let Some((min, max)) = bounds {
-            orbs.retain_mut(|o| {
-                let touching = o.position.x + 0.25 > min[0]
-                    && o.position.x - 0.25 < max[0]
-                    && o.position.y + 0.5 > min[1]
-                    && o.position.y < max[1]
-                    && o.position.z + 0.25 > min[2]
-                    && o.position.z - 0.25 < max[2];
-                if touching && self.xp_delay == 0 {
-                    // ExperienceOrb.playerTouch: one orb every 2 ticks; a
-                    // merged orb gives its value once per count.
-                    self.xp_delay = 2;
-                    gained += o.points();
-                    taken.push(o.clone());
-                    o.count -= 1;
-                    return o.count > 0;
+        let mut taken = None;
+        if let Some(area) = bounds
+            && let Some(player) = self.player.as_mut()
+        {
+            let touching = touching_orbs(&orbs, area);
+            // Player.aiStep draws before ExperienceOrb.playerTouch checks the cooldown.
+            if !touching.is_empty()
+                && let Ok(pick) = player.random.next_int_bound(touching.len() as i32)
+                && self.xp_delay == 0
+            {
+                let index = touching[pick as usize];
+                self.xp_delay = 2;
+                // The particle uses a detached snapshot so a removed orb's attachments retire now.
+                taken = Some(orbs[index].clone());
+                // A merged orb gives its value once per count.
+                if orbs[index].count <= 1 {
+                    drop(orbs.remove(index));
+                } else {
+                    orbs.update(index, |orb| orb.count -= 1);
                 }
-                true
-            });
+            }
         }
         self.orbs
             .restore(orbs, horizon_client::join_seq::RestoreOrder::SurvivorsFirst);
-        if gained > 0 {
-            gained = self.mending(gained);
-        }
-        for o in taken {
+        if let Some(o) = taken {
+            let mut gained = o.points();
+            if gained > 0 {
+                gained = self.mending(gained);
+            }
             // ClientPacketListener.handleTakeItemEntity: every orb taken sounds
             // at the orb, whether mending took its points or not.
             let mut r = random_source::create();
@@ -669,9 +691,9 @@ impl Game<'_> {
                 crate::game::pickups::Taken::Orb(Box::new(o)),
                 crate::game::pickups::Collector::Player,
             );
-        }
-        if gained > 0 {
-            self.give_experience_points(gained as i32);
+            if gained > 0 {
+                self.give_experience_points(gained as i32);
+            }
         }
     }
 
@@ -691,7 +713,8 @@ impl Game<'_> {
             stacks.extend(self.armor.iter_mut().rev().filter_map(Option::take));
             stacks.extend(self.offhand.take());
             stacks.extend(self.equipment.take_all());
-            stacks.retain(|s| s.enchantment_level("minecraft:vanishing_curse") == 0);
+            let enchantments = &world_stations!(self).enchantments;
+            stacks.retain(|s| !enchantments.has_component(s, "minecraft:prevent_equipment_drop"));
             self.apply_equipment();
         }
         let stacks = stacks.into_iter().map(|stack| (stack, at, 0)).collect();
@@ -721,10 +744,18 @@ impl Game<'_> {
     }
 
     /// The item entity `spawn_item` just added, unless a native mod kept it
-    /// out of the level (`native_entity_join_level`).
+    /// out of the level (`native_entity_join_level`). Kept as it was, a path
+    /// a native mod can declare; the spawn paths now return the entity id, and
+    /// `dropped_item_mut` is the way to reach that entity.
+    #[allow(dead_code)]
     pub(super) fn just_spawned_item(&mut self) -> Option<&mut ItemEntity> {
         let id = self.next_entity;
         self.dropped.last_mut().filter(|d| d.id == id)
+    }
+
+    /// The dropped item entity `id`, if it is still in the level.
+    pub(super) fn dropped_item_mut(&mut self, id: u32) -> Option<&mut ItemEntity> {
+        self.dropped.iter_mut().rev().find(|d| d.id == id)
     }
 
     /// `new ItemEntity(level, x, y, z, stack, dx, dy, dz)`.
@@ -734,18 +765,19 @@ impl Game<'_> {
         position: [f64; 3],
         velocity: [f64; 3],
         pickup_delay: u32,
-    ) {
-        self.add_item_entity(stack, position, Some(velocity), pickup_delay);
+    ) -> Option<u32> {
+        self.add_item_entity(stack, position, Some(velocity), pickup_delay)
+            .map(|(id, _)| id)
     }
 
     /// `new ItemEntity(level, x, y, z, stack)`: the item leaves with its own
-    /// random's motion, which this returns.
+    /// random's motion, which this returns along with its entity id.
     pub(super) fn spawn_item_own(
         &mut self,
         stack: ItemStack,
         position: [f64; 3],
         pickup_delay: u32,
-    ) -> [f64; 3] {
+    ) -> Option<(u32, [f64; 3])> {
         self.add_item_entity(stack, position, None, pickup_delay)
     }
 
@@ -755,9 +787,10 @@ impl Game<'_> {
         stack: ItemStack,
         position: [f64; 3],
         velocity: [f64; 3],
-    ) {
+    ) -> Option<u32> {
         let random = spill::prepare_item_random(None);
-        self.add_item_entity_prepared(stack, position, Some(velocity), 0, Some(random));
+        self.add_item_entity_prepared(stack, position, Some(velocity), 0, Some(random))
+            .map(|(id, _)| id)
     }
 
     pub(super) fn add_item_entity(
@@ -766,7 +799,7 @@ impl Game<'_> {
         position: [f64; 3],
         velocity: Option<[f64; 3]>,
         pickup_delay: u32,
-    ) -> [f64; 3] {
+    ) -> Option<(u32, [f64; 3])> {
         self.add_item_entity_prepared(stack, position, velocity, pickup_delay, None)
     }
 
@@ -895,12 +928,11 @@ impl Game<'_> {
         let uuid = thrown_from_hand.then(|| self.acting_player_uuid());
         // Only `drop(.., false)` tosses ask `item_toss`: a death's scatter (`randomly`) does not.
         let id = if randomly {
-            self.spawn_item(thrown, at, v, 40);
-            self.next_entity
+            self.spawn_item(thrown, at, v, 40)?
         } else {
             self.toss_item(thrown, at, v, uuid)?
         };
-        let item = self.dropped.iter_mut().rev().find(|d| d.id == id)?;
+        let item = self.dropped_item_mut(id)?;
         item.thrower = uuid;
         Some(item.id)
     }
@@ -1055,7 +1087,8 @@ mod escape_tests {
         let stack = ItemStack::new("minecraft:stone", 2);
         game.spawn_item(stack, [8.5, 64.4, 8.5], [0.0, 0.0, 0.0], 10);
         let item = game.dropped.last_mut().unwrap();
-        item.random = horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(12345));
+        item.random =
+            horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(12345));
         let mut level = game.world.random.clone();
         game.ticked_entities_through = u32::MAX;
         game.tick_items();
@@ -1098,5 +1131,75 @@ mod bob_tests {
             assert_eq!(bob(id, at, false), vanilla);
         }
         assert_ne!(bob(17, at, false), bob(22, at, false));
+    }
+}
+
+#[cfg(test)]
+mod orb_pickup_tests {
+    use crate::game::game_tests::tests::server_game;
+    use crate::motion::PlayerMotion;
+    use horizon_client::entities::ExperienceOrb;
+    use horizon_core::{geometry::Vec3, random::RandomSource};
+    use horizon_mod_runtime::attachments::{
+        AttachmentType, Attachments, Holder, index::AttachmentIndex,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_player_picks_a_random_orb_not_the_first() {
+        static VALUE: AttachmentType<i32> = AttachmentType {
+            namespace: "test",
+            name: "orb_pickup",
+            default: || 0,
+            codec: None,
+            copy_on_death: false,
+            sync: false,
+        };
+
+        let mut resources = None;
+        let mut game = server_game(&mut resources);
+        let at = Vec3::new(16.5, 64.0, 2.5);
+        let mut player = PlayerMotion::new(game.motion, at).unwrap();
+        player.random.set_seed(0);
+        game.player = Some(player);
+        game.tick_experience(); // Empty lists consume no draw.
+        let mut picked =
+            ExperienceOrb::new(12, Vec3::new(15.75, 64.0, 2.5), Vec3::new(0.5, 0.0, 0.0), 7);
+        picked.no_gravity = true;
+        let index = Arc::new(Mutex::new(AttachmentIndex::default()));
+        let mut attachments = Attachments::default();
+        VALUE.set(&mut attachments, Holder::Level, 1).unwrap();
+        picked
+            .attachment_lifetime
+            .bind(&mut attachments, &index, picked.id);
+        let key = ("test".into(), "orb_pickup".into());
+        assert_eq!(index.lock().unwrap().snapshot(&key).len(), 1);
+        game.orbs.push(picked);
+        let mut waiting = ExperienceOrb::new(11, at, Vec3::ZERO, 1);
+        waiting.no_gravity = true;
+        game.orbs.push(waiting);
+
+        // Orb 12 joined first and now enters the section where orb 11 already waits.
+        game.load_ticking_neighbourhood(1, 0);
+        game.tickets.update(None);
+        game.begin_ordered_ticks();
+        game.run_ordered_ticks(horizon_client::join_seq::JoinSeq::MAX, false)
+            .unwrap();
+        assert!(game.orbs[0].position.x >= 16.0);
+
+        // Seed 0 selects the newly arrived orb at index 1. The cooldown tick
+        // and the last pickup each consume a nextInt(1) draw.
+        for (total, remaining) in [(7, 1), (7, 1), (8, 0)] {
+            game.tick_experience();
+            assert_eq!(game.experience.total, total);
+            assert_eq!(game.orbs.len(), remaining);
+            assert!(index.lock().unwrap().snapshot(&key).is_empty());
+        }
+        assert_eq!(game.pickups.made().get("orb"), Some(&2));
+        assert_eq!(
+            game.player.as_mut().unwrap().random.next_int(),
+            -1_690_734_402
+        );
     }
 }

@@ -56,7 +56,7 @@ digest() { file_digests "$1" | sha256 | cut -c1-16; }
 use_private_copy() {
   local work="$shared/job"
   rm -rf "$work"
-  cp -a --reflink=auto "$prepared" "$work"
+  if [ "$(uname)" = Darwin ]; then cp -ca "$prepared" "$work"; else cp -a --reflink=auto "$prepared" "$work"; fi
   for name in minecraft tools; do ln -sfn "$source/$name" ".local/$name"; done
   while read -r name; do ln -sfn "$work/$name" ".local/$name"; done < "$work/.entries"
   echo "prepared key $key: private copy for this job ($(find "$work" -type f | wc -l) files)"
@@ -128,10 +128,13 @@ if [ ! -f "$prepared/.entries" ]; then
   done
   before=$(ls -1A .local | LC_ALL=C sort)
   started=$SECONDS
+  # In the job's turn at compiling on the self-hosted Mac (tools/compile_lock.py; a no-op elsewhere).
+  # Its own name: `lock` is the preparation lock's folder, which the EXIT trap above removes.
+  in_turn=""; [ ! -f tools/ci/compile-lock.sh ] || in_turn="bash tools/ci/compile-lock.sh ${HORIZON_COMPILE_LOCK_ROLE:-pr} --"
   if [ "$persistent" = true ]; then
-    python3 tools/ci/preparation_step.py preparer-build "$RUNNER_TEMP/prepare-build.log" cargo build --release --locked -p horizon-prepare
+    $in_turn python3 tools/ci/preparation_step.py preparer-build "$RUNNER_TEMP/prepare-build.log" cargo build --release --locked -p horizon-prepare
   else
-    cargo build --release --locked -p horizon-prepare
+    $in_turn cargo build --release --locked -p horizon-prepare
   fi
   if python3 tools/ci/preparation_step.py resource-export "$RUNNER_TEMP/prepare.log" "${CARGO_TARGET_DIR:-target}/release/horizon-prepare" --root "$PWD"; then
     :

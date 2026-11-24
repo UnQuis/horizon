@@ -834,12 +834,12 @@ impl Game<'_> {
         self.cmds
             .profile_fetches
             .iter()
-            .any(|f| matches!(resolver.state(&f.key), Resolve::Pending))
+            .any(|f| matches!(resolver.state_for_game(&f.key), Resolve::Pending))
     }
     fn tick_profile_fetches(&mut self) {
         let fetches = std::mem::take(&mut self.cmds.profile_fetches);
         for fetch in fetches {
-            let state = self.skin_profiles.borrow_mut().state(&fetch.key);
+            let state = self.skin_profiles.borrow_mut().state_for_game(&fetch.key);
             match state {
                 Resolve::Pending => self.cmds.profile_fetches.push(fetch),
                 Resolve::Done(result) => {
@@ -1106,7 +1106,11 @@ impl Game<'_> {
                 .ok()
                 .map(DialogHolder::Direct);
         }
-        // A registry id, written with or without its namespace.
+        self.registry_dialog(text)
+    }
+    /// An entry of the `minecraft:dialog` registry, by its id written with or
+    /// without its namespace.
+    pub(in crate::game) fn registry_dialog(&self, text: &str) -> Option<DialogHolder> {
         let id = if text.contains(':') {
             text.to_owned()
         } else {

@@ -50,6 +50,7 @@ fn install_observer() {
         hand_drawn: |_| {},
         render_needs: observe_needs,
         world_drawn_hooked: || true,
+        hand_drawn_hooked: || false,
     });
 }
 
@@ -440,6 +441,7 @@ fn fixture_frame(hud: &HudBatch) -> Frame<'_> {
         water_plane: None,
         cave_culling: false,
         title: true,
+        gui_only: false,
         sky_blocked: false,
         skybox: false,
         end_sky: false,
