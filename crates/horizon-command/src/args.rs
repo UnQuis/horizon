@@ -18,6 +18,8 @@ pub enum CustomArgumentKind {
     Word,
     /// The rest of the line, spaces included.
     Greedy,
+    /// One token: every character up to the next space or the end of the line, at least one.
+    Token,
 }
 
 /// One completion a registered custom argument offers.
@@ -219,6 +221,8 @@ pub enum ArgType {
     SlotSource,
     /// ResourceOrIdArgument over a registry: an id or an inline SNBT value.
     ResourceOrId(&'static str),
+    /// A received loot table argument: the server owns the registry and codec lookup.
+    ServerLootTable,
     /// ResourceSelectorArgument: a `*`/`?` pattern over a registry's ids.
     ResourceSelector(&'static str),
     /// A registered argument type: the mod's parser and suggestions.
@@ -1887,6 +1891,10 @@ impl ArgType {
                 super::codec::resource_or_id(reader, reg, registry)?;
                 Arg::Resource(reader.string[start..reader.cursor].to_owned())
             }
+            ArgType::ServerLootTable => {
+                super::codec::resource_or_id_syntax(reader)?;
+                Arg::Resource(reader.string[start..reader.cursor].to_owned())
+            }
             ArgType::NbtPath => {
                 parse_nbt_path(reader)?;
                 Arg::Str(reader.string[start..reader.cursor].to_owned())
@@ -1917,6 +1925,17 @@ impl ArgType {
                         let text = reader.remaining().to_owned();
                         reader.cursor = reader.string.len();
                         text
+                    }
+                    CustomArgumentKind::Token => {
+                        let token = reader.read_token().to_owned();
+                        if token.is_empty() {
+                            return Err(CommandError::tr_at(
+                                "parsing.expected",
+                                &[&"a token"],
+                                reader,
+                            ));
+                        }
+                        token
                     }
                 };
                 match (custom.parse)(&text) {
@@ -2105,7 +2124,7 @@ impl ArgType {
             }
             ArgType::Anchor => builder.suggest_matching(["eyes", "feet"]),
             ArgType::Component | ArgType::Style | ArgType::NbtTag => super::snbt::suggest(builder),
-            ArgType::Swizzle | ArgType::Message | ArgType::Nbt => {}
+            ArgType::Swizzle | ArgType::Message | ArgType::Nbt | ArgType::ServerLootTable => {}
             ArgType::Custom(custom) => {
                 let prefix = builder.remaining().to_owned();
                 for suggestion in (custom.suggest)(reg, &prefix) {

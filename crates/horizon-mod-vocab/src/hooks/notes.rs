@@ -305,6 +305,7 @@ For mods that run where the world is simulated: a dedicated server, a LAN host, 
 - **`exp_bottle(pos, experience)`**: an experience bottle broke and its orbs were created.
 - **`firework_explode(entity, pos, bursts)`**: a firework rocket completed its damage and explosion effects.
 - **`potion_splash(item, pos)`**: a thrown splash or lingering potion finished applying its hit effects at `pos`. Experience bottles are excluded.
+- **`entity_enter_love_mode_pre(animal, level, feeder)`**: cancel an eligible animal's entry into love mode. The server hook provides handles to the animal, its level and the optional feeder. Cancellation skips the timer, breeding credit, entry hearts and the post-entry notice. The feeding interaction otherwise proceeds normally.
 - **`entity_enter_love_mode(entity, kind, player)`**: a mob entered love mode after a player interaction; `player` is the feeder UUID when known.
 - **`teleport_command(dimension, entity, from, to, cancel)`**: a server entity is about to be teleported by `/tp` or `/teleport`. `dimension` is the level it arrives in, `entity` its network id, `from` its feet now and `to` where the command sends it; move `to` to redirect it, or set `cancel` to keep it where it is (the command still reports success).
 - **`entity_teleport(dimension, entity, from, to)`**: a server entity completed a same-level teleport command. `entity` is its network id; `from` and `to` are coordinates in `dimension`. This reports the move after it happens.
@@ -1728,7 +1729,7 @@ still go on each event or registrar.
   sets one off as `Level.explode` does, with an optional source entity, `ExplosionInteraction::None`, `Block`, `Mob`, `Tnt`
   or `Trigger` for what it does to blocks, and `ExplosionSettings` for its damage type, calculator, particles and sound.
 
-- Dispenser behaviours are chosen at `DispenserBlock.getDispenseMethod`, before any vanilla behaviour, for mod or vanilla items, on the authoritative server only (droppers are unaffected). The block the dispenser faces is asked first: `dispense_method` gives its part the dimension, dispenser position, facing, the selected stack and `state`, the block at `pos` moved by `facing` (air included), and the part is asked only for that block. Then, unless that part answered, the item's own part is asked by `dispense_item` with the same dimension, position, facing and stack. Either answer is `Some((remainder, event))`: a `None` remainder empties the slot, `Some(stack)` writes that remainder without consuming again, and `event` is the level event played with the smoke (1000 click, 1001 fail, 0 nothing, as `NOOP`). The first answer wins: the other part is not asked and vanilla's behaviour doesn't run. `host.dispense_default(dimension, pos, facing, stack)` drops one item normally, including items with a special vanilla behaviour: answer its remainder with 1000. Leave the answer `None` to let vanilla decide, as before.
+- Dispenser behaviours are chosen at `DispenserBlock.getDispenseMethod`, before any vanilla behaviour, for mod or vanilla items, on the authoritative server only (droppers are unaffected). The global `dispenser_acts(dimension, pos, facing, stack)` is asked first, once per dispenser action, for a mod that cannot name every item or block at registration; its answer (the same `Some((remainder, event))`) wins and no part is asked. Otherwise the block the dispenser faces is asked: `dispense_method` gives its part the dimension, dispenser position, facing, the selected stack and `state`, the block at `pos` moved by `facing` (air included), and the part is asked only for that block. Then, unless that part answered, the item's own part is asked by `dispense_item` with the same dimension, position, facing and stack. Either answer is `Some((remainder, event))`: a `None` remainder empties the slot, `Some(stack)` writes that remainder without consuming again, and `event` is the level event played with the smoke (1000 click, 1001 fail, 0 nothing, as `NOOP`). The first answer wins: the other part is not asked and vanilla's behaviour doesn't run. `host.dispense_default(dimension, pos, facing, stack)` drops one item normally, including items with a special vanilla behaviour: answer its remainder with 1000. Leave the answer `None` to let vanilla decide, as before.
 
 - Image tooltip components: `tooltip_component(stack, size)` answers finite positive width/height in GUI pixels, and `tooltip_component_draw(stack, batch, origin, size)` draws that component with `native_sprite`, `native_fill` and `native_text`. The stack supplies its data. Space and background are reserved after the text and any vanilla bundle component; the component width participates in tooltip positioning. Neither hook changes ordinary tooltips without an answer. Client-side.
 
@@ -1750,9 +1751,13 @@ still go on each event or registrar.
   drops when a neighbour changes), and wherever else vanilla asks. `state` may not be in the world yet, so decide from
   `state`. `may_place_on(dimension, state, ground, ground_pos, may)` answers `VegetationBlock.mayPlaceOn` for a
   mod plant (a block whose template is a vanilla plant, such as a crop): the blocks it can stand on, which its
-  template's `canSurvive` asks, so it is refused elsewhere and pops off when its ground changes. Answer only for your
-  own blocks and leave the answer empty otherwise; the level is read-only. Both run on every shape update of such a
-  block: keep them short.
+  template's `canSurvive` asks, so it is refused elsewhere and pops off when its ground changes.
+  `can_sustain_plant(dimension, state, ground, ground_pos, sustains)` is the soil's half of that question, asked
+  before the plant's `may_place_on`: an answer there is the plant's. Answer only for your own blocks and leave the
+  answer empty otherwise; the level is read-only. All three run on every shape update of such a block: keep them
+  short. `can_survive_v2`, `may_place_on_v2` and `can_sustain_plant_v2` are the same three questions in world
+  generation: a feature placing a block reads the server's tables instead of a level, and asks the soil before the
+  plant as the live game does.
 
 - Drawing mod block entities on the client. `block_entity_submit(pos, block, state, entity, draw)` runs once a frame
   for each mod block entity in view, as vanilla's `BlockEntityRenderer.submit` does (within its view distance, 64 blocks

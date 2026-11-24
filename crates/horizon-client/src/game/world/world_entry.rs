@@ -12,25 +12,53 @@ impl Game<'_> {
     }
 
     pub(super) fn defer_world_entry(&mut self, entry: PendingWorldEntry) -> Result<bool> {
-        self.poll_world_rest()?;
+        Ok(self.try_defer_world_entry(entry)?.is_none())
+    }
+
+    /// As `defer_world_entry`, handing `entry` back when nothing needs waiting for, so an entry
+    /// that carries what it can't rebuild (a replay already read) isn't lost.
+    pub(super) fn try_defer_world_entry(
+        &mut self,
+        entry: PendingWorldEntry,
+    ) -> Result<Option<PendingWorldEntry>> {
+        // An entry dropped by an error still tells a mod waiting on it (`drop_world_entry`).
+        if let Err(error) = self.poll_world_rest() {
+            self.drop_world_entry(entry);
+            return Err(error);
+        }
         if self.rest_loader.is_none() {
-            return Ok(false);
+            return Ok(Some(entry));
         }
         self.perf.world_opening();
         if self.title.is_none() {
+            let saves = match std::env::current_dir() {
+                Ok(dir) => dir.join("saves"),
+                Err(error) => {
+                    self.drop_world_entry(entry);
+                    return Err(error.into());
+                }
+            };
             let title = self
-                .new_title(std::env::current_dir()?.join("saves"))
+                .new_title(saves)
                 .with_user(|| self.options.player_name());
             self.show_title(title);
         }
+        self.displace_pending_replay(mod_api::ReplayError::WorldBusy);
         self.pending_entry = Some(entry);
         log::info!("Horizon: world entry waiting for world resources");
-        Ok(true)
+        Ok(None)
     }
 
     pub(super) fn resume_world_entry(&mut self) -> Result<()> {
-        self.poll_integrated_start()?;
-        self.poll_world_rest()?;
+        // A mod's read replay waiting here is told as failed before the error leaves; other
+        // entries stay as they were.
+        if let Err(error) = self
+            .poll_integrated_start()
+            .and_then(|()| self.poll_world_rest())
+        {
+            self.displace_pending_replay(mod_api::ReplayError::Unavailable);
+            return Err(error);
+        }
         self.poll_world_creation();
         if self.rest_loader.is_some() {
             return Ok(());
@@ -84,6 +112,9 @@ impl Game<'_> {
                     log::warn!("Horizon Studio: could not open {path_str}: {e}");
                 }
             }
+            Some(PendingWorldEntry::PreparedReplay { driver, origin }) => {
+                self.open_prepared_replay(*driver, origin);
+            }
             None => {}
         }
         Ok(())
@@ -117,9 +148,14 @@ impl Game<'_> {
                 })
                 .unwrap_or_default();
             let data_source = self.pack.data_changes.clone();
+            let data_pack_validation_failed =
+                horizon_client::lang::get("dataPack.validation.failed");
             let job = horizon_guest_stack::builder()
                 .name("world-creation".into())
                 .spawn(move || {
+                    overrides
+                        .validate_fill_layers(registry)
+                        .map_err(|e| format!("{data_pack_validation_failed}: {e}"))?;
                     horizon_client::vanillagen::shared_data_from(
                         &dir,
                         &overrides,
@@ -251,7 +287,7 @@ impl Game<'_> {
         self.native_data_pack_files(&mut contributed);
         let files = functions::overlay_files(stack, contributed);
         let inventory = horizon_mod_package::enabled::EnabledMods::read(root)?;
-        let conditions = self.registered_load_conditions(&inventory)?;
+        let conditions = self.registered_load_conditions(&inventory, stack)?;
         let overlay = horizon_world::loot::PackOverlay {
             conditions: &conditions,
             files: &files,
@@ -583,6 +619,7 @@ impl Game<'_> {
         self.forget_book();
         horizon_client::structure_blocks::forget_loot_data();
         self.load_server_loot();
+        self.sync_loot_table_ids();
         // Before the players are sent the reloaded data below.
         self.sync_recipe_content();
         // PlayerList.reloadResources: the tags and recipes go to the players
@@ -798,6 +835,7 @@ impl Game<'_> {
                 prepared.parts.as_ref(),
                 &prepared.block_states,
                 self.pack.assets.registry,
+                Arc::new(prepared.tags.clone()),
             );
         }
         api_values::install_block_states(prepared.block_states);

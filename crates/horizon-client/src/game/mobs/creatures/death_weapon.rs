@@ -49,7 +49,7 @@ impl Game<'_> {
     /// Only listeners need a saved weapon copy; physical family classification never does.
     pub(in crate::game) fn set_projectile_weapon(attack: &mut Attack, weapon: Option<&ItemStack>) {
         if mod_api::__private::listened(mod_api::HookId::LivingIncomingDamage)
-            || mod_api::__private::listened(mod_api::HookId::LivingDeath)
+            || crate::game::native_hooks::death_listened()
             || mod_api::__private::listened(mod_api::HookId::LootDrops)
         {
             attack.projectile_weapon = weapon.cloned();
@@ -386,6 +386,7 @@ impl Game<'_> {
                         Some(m.id),
                         enderman::carried_block_roll(&tool),
                     );
+                    let drops = self.res.items().split_stacks(drops);
                     stacks.extend(
                         drops
                             .into_iter()

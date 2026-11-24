@@ -197,7 +197,7 @@ pub fn build_with_conditions(
     tables(base, &plan, &overlay, &jobs)?;
     // Mod files, and every tag addition gathered per tag file.
     let mut tags: BTreeMap<String, TagMerge> = BTreeMap::new();
-    let mut warnings = Vec::new();
+    let mut warnings = plan.warnings.clone();
     let mut worldgen: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     let mut additions: BTreeMap<&str, Vec<Addition>> = BTreeMap::new();
     // Carvers the root leaves out: the worldgen loader drops a biome's
@@ -491,7 +491,16 @@ pub fn build_with_conditions(
             by_item(|i| i.crafting_remainder.as_deref()),
         ),
         (MOD_ITEM_TEMPLATES, by_item(|i| i.template.as_deref())),
-        (MOD_ITEM_BLOCKS, by_item(|i| i.block.as_deref())),
+        // A wall form can be earlier in the block registry than its primary form.
+        // The shared Block.asItem is not enough to choose the item's primary block.
+        (
+            MOD_ITEM_BLOCKS,
+            by_item(|i| {
+                i.block
+                    .as_deref()
+                    .or_else(|| i.wall_pair.as_ref().map(|_| i.rename.to.as_str()))
+            }),
+        ),
     ] {
         if !map.is_empty() {
             overlay.write(name, &serde_json::to_vec(&map)?)?;
@@ -553,28 +562,34 @@ pub fn resource_root_with_conditions(
             || !m.content.blocks.is_empty()
             || !m.content.items.is_empty()
             || !m.content.block_entity_types.is_empty()
+            || !m.content.vanilla_shapes.is_empty()
     });
     if inventory.is_empty() && !has_content {
         return Ok(base.to_owned());
     }
     let mut stamp = stamp(base, jar_store, mods, inventory)?;
-    if conditions.has_registered() {
+    // Code-only roots never read the conditions, so they keep one root per stamp.
+    if has_content && (conditions.has_registered() || conditions.feature_flags().is_some()) {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         stamp.hash(&mut hash);
         conditions.hash(&mut hash);
-        // Handlers can read config that has no persistent fingerprint. Give each
-        // build a fresh root, leaving every previously usable root untouched.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-            .hash(&mut hash);
+        if conditions.has_registered() {
+            // Handlers can read config that has no persistent fingerprint. Give each
+            // build a fresh root, leaving every previously usable root untouched.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+                .hash(&mut hash);
+        }
         stamp = format!("{:016x}{stamp}", hash.finish());
     }
     let roots = cache.join("mod-content");
     let out = roots.join(&stamp[..ROOT_NAME]);
     // Pin before examining the root. If a prune already admitted the old generation, this
     // waits for it to move that generation aside before looking for its stamp.
+    // The lock file goes beside the root, so the folder must exist before the hold.
+    fs::create_dir_all(&roots)?;
     let _preparing = retain_root(&out);
     if fs::read(out.join(STAMP)).is_ok_and(|s| s == stamp.as_bytes())
         && fs::read(out.join(horizon_mod_package::enabled::MARKER)).is_ok_and(|bytes| {
@@ -607,8 +622,13 @@ pub fn resource_root_with_conditions(
     }
     fs::write(out.join(STAMP), stamp)?;
     // Old roots go on a thread of their own: removing one linked file by file takes seconds, and
-    // the start would wait for each.
+    // the start would wait for each. Tests prune inline: a detached prune holds lock files open
+    // while a test removes its cache, which Windows refuses.
     let current = out.clone();
+    if cfg!(test) {
+        prune_roots(&roots, &current, KEEP_ROOTS);
+        return Ok(out);
+    }
     let spawned = std::thread::Builder::new()
         .name("mod-content-prune".into())
         .spawn(move || prune_roots(&roots, &current, KEEP_ROOTS));

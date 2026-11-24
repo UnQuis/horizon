@@ -283,6 +283,7 @@ fn area_tiers(camel: &str, file: syn::File) -> Result<BTreeMap<Tier, Vec<Entry>>
                         | "Levels"
                         | "Messages"
                         | "Players"
+                        | "Profiles"
                         | "RuntimeLevels"
                         | "RenderAssets"
                         | "InstanceGroups"
@@ -449,7 +450,16 @@ pub(super) fn game_forwarders(root: &Path) -> Result<String, String> {
                 let call = if entry.attrs.iter().any(|a| a.path().is_ident("service")) {
                     "self".into()
                 } else {
-                    format!("Game::{name}({args})")
+                    let target = entry
+                        .attrs
+                        .iter()
+                        .find(|attr| attr.path().is_ident("game_method"))
+                        .map_or_else(
+                            || Ok(entry.sig.ident.clone()),
+                            |attr| attr.parse_args::<syn::Ident>(),
+                        )
+                        .map_err(|error| format!("{name}: {error}"))?;
+                    format!("Game::{target}({args})")
                 };
                 let crosses_output = match &entry.sig.output {
                     syn::ReturnType::Type(_, ty) => boundary_value(ty),

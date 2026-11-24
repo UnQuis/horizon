@@ -18,9 +18,7 @@ use horizon_platform::mod_package::mod_surface;
 
 mod api;
 mod api_route;
-mod inject;
 mod planning;
-mod slots;
 pub use planning::{routes, update_check, UpdateCheck};
 mod crates;
 mod diagnostics;
@@ -339,7 +337,7 @@ pub fn clear_log() -> Result<(), String> {
 
 /// Starts a build attempt's log from the window: [`clear_log`] under the build lease, so a
 /// build or cleanup already holding it keeps its log, result included (#18469). `Ok(false)`
-/// when one does: the attempt will be refused as busy and leaves the log alone.
+/// when one does: the attempt waits for it and starts its log once it has the lease.
 pub fn begin_log() -> Result<bool, String> {
     match crate::native_cache::Cache::acquire(&backend::build_dir()) {
         Err(crate::native_cache::Error::Busy) => Ok(false),
@@ -360,12 +358,40 @@ pub fn append_log(message: &str) -> Result<(), String> {
     writeln!(log, "{message}").map_err(|e| e.to_string())
 }
 
-/// Records the whole attempt, including selection or export after compilation.
+/// Records the whole attempt, including selection or export after compilation, once it has the
+/// build lease ([`lease`]).
 fn logged<T, E: From<String>>(
     said: impl Fn(&E) -> String,
+    progress: &dyn Fn(Step),
     build: impl FnOnce(Result<&crate::native_cache::Cache, &str>) -> Result<T, E>,
 ) -> Result<T, E> {
-    logged_then(said, build, |result| result, clean_up)
+    match lease(progress) {
+        Ok(cache) => logged_then(said, cache, build, |result| result, clean_up),
+        Err(cancelled) => Err(cancelled.into()),
+    }
+}
+
+/// The build lease, waited for while another build, a cache cleanup or Settings → Storage holds
+/// it: the build says what it waits for, and Stop ends the wait with [`CANCELLED`] (#19294). Any
+/// other failure only stops cleanup for explicit builds, and is theirs to tell: automatic
+/// selection requires a held cache for its catalog and can refuse instead of accessing an
+/// unsafe tree.
+fn lease(progress: &dyn Fn(Step)) -> Result<Result<crate::native_cache::Cache, String>, String> {
+    let mut waiting = false;
+    loop {
+        match crate::native_cache::Cache::acquire(&backend::build_dir()) {
+            // Stop pressed as the holder let go still ends the build here, before anything.
+            Ok(cache) => return check_cancelled().map(|()| Ok(cache)),
+            Err(crate::native_cache::Error::Busy) => {}
+            Err(error) => return Ok(Err(cache_error(error))),
+        }
+        if !waiting {
+            waiting = true;
+            progress(Step::Busy);
+        }
+        check_cancelled()?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// The old-build cleanup after an attempt, inside its lease; what it freed and kept is logged.
@@ -373,25 +399,16 @@ fn clean_up(cache: &crate::native_cache::Cache) {
     crate::storage::eviction::after_build_logged(cache, append_log, log_warning)
 }
 
-/// [`logged`], handing the result to `deliver` as soon as it is logged, before `cleanup` runs
-/// under the same build lease: the window shows it without waiting for the cleanup (#18669).
-/// Returns what `deliver` returned, once the cleanup has ended.
+/// [`logged`] with the `cache` [`lease`] gave, handing the result to `deliver` as soon as it is
+/// logged, before `cleanup` runs under the same build lease: the window shows it without waiting
+/// for the cleanup (#18669). Returns what `deliver` returned, once the cleanup has ended.
 fn logged_then<T, E: From<String>, R>(
     said: impl Fn(&E) -> String,
+    cache: Result<crate::native_cache::Cache, String>,
     build: impl FnOnce(Result<&crate::native_cache::Cache, &str>) -> Result<T, E>,
     deliver: impl FnOnce(Result<T, E>) -> R,
     cleanup: impl FnOnce(&crate::native_cache::Cache),
 ) -> R {
-    // Another build or a cleanup holds the lease on the same target/: refuse. Any other
-    // failure only stops cleanup for explicit builds. Automatic selection requires a held
-    // cache for its catalog and can refuse instead of accessing an unsafe tree.
-    let cache = match crate::native_cache::Cache::acquire(&backend::build_dir()) {
-        Ok(cache) => Ok(cache),
-        Err(crate::native_cache::Error::Busy) => {
-            return deliver(Err(cache_error(crate::native_cache::Error::Busy).into()));
-        }
-        Err(error) => Err(cache_error(error)),
-    };
     if let Err(error) = clear_log() {
         return deliver(Err(error.into()));
     }
@@ -473,13 +490,16 @@ pub fn cache_error(error: crate::storage::Error) -> String {
             "This version supplies resources to native build {build}. Remove that build first.",
             &[("build", &build)],
         ),
-        crate::native_cache::Error::UnsupportedFilesystem => {
-            tr("Game cache leases require a supported local filesystem.").into()
-        }
-        crate::native_cache::Error::Unsafe(path) => trf(
-            "Refusing native cache cleanup at an unexpected file or link: {path}",
-            &[("path", &path.display().to_string())],
+        crate::native_cache::Error::InstanceVersion(instance) => trf(
+            "In use by {names}. Pick another version for it first.",
+            &[("names", &instance)],
         ),
+        crate::native_cache::Error::UnsupportedFilesystem(folder) => {
+            crate::refusals::unsupported_filesystem(folder.as_deref(), &backend::data_dir())
+        }
+        crate::native_cache::Error::Unsafe(path) => {
+            crate::refusals::unexpected_entry(&path, &backend::data_dir())
+        }
         crate::native_cache::Error::Io(error) => trf(
             "Could not access the native build cache: {error}",
             &[("error", &error.to_string())],
@@ -533,7 +553,8 @@ fn installed_files(home: &Path) -> Vec<PathBuf> {
 }
 
 /// [`installed_mods`] into `out`, which it empties first. A `.hmod` in the format from before the
-/// SDK is left out, untouched: no build can take it, and it must not stop the others.
+/// SDK is left out, untouched: no build can take it, and it must not stop the others. So is one
+/// turned off that declares the removed `[[inject]]`; one turned on stops the build, by name.
 pub(crate) fn stage_installed(home: &Path, out: PathBuf) -> Result<Option<PathBuf>, String> {
     let _ = fs::remove_dir_all(&out);
     let mut count = 0;
@@ -541,7 +562,16 @@ pub(crate) fn stage_installed(home: &Path, out: PathBuf) -> Result<Option<PathBu
         let bundle = match horizon_platform::mod_package::index::native::Bundle::read(&path) {
             Ok(bundle) => bundle,
             Err(_) if crate::native_status::legacy_format(&path) => continue,
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Err(e) => match crate::native_status::retired_inject(&path) {
+                Some(id) if !crate::browser::java::is_enabled(home, &id) => continue,
+                Some(id) => {
+                    return Err(crate::i18n::trf(
+                        "{id} ({file}) uses [[inject]], which was removed: turn it off, or install a version that listens through a typed hook.",
+                        &[("id", &id), ("file", &path.display().to_string())],
+                    ));
+                }
+                None => return Err(format!("{}: {e}", path.display())),
+            },
         };
         if !crate::browser::java::is_enabled(home, &bundle.manifest.id) {
             continue;
@@ -551,15 +581,6 @@ pub(crate) fn stage_installed(home: &Path, out: PathBuf) -> Result<Option<PathBu
             let to = dir.join(name);
             fs::create_dir_all(to.parent().unwrap_or(&dir)).map_err(|e| e.to_string())?;
             fs::write(&to, bytes).map_err(|e| format!("{}: {e}", to.display()))?;
-        }
-        count += 1;
-    }
-    for bundle in crate::native_status::wasm_points(home) {
-        let dir = out.join(&bundle.manifest.id);
-        for (name, bytes) in &bundle.files {
-            let to = dir.join(name);
-            fs::create_dir_all(to.parent().unwrap_or(&dir)).map_err(|e| e.to_string())?;
-            fs::write(&to, bytes).map_err(|e| e.to_string())?;
         }
         count += 1;
     }
@@ -1066,6 +1087,9 @@ pub enum Step {
     Install,
     /// This launcher's last build still cleans up its old files: this one waits for it.
     Waiting,
+    /// Another build, a cache cleanup or Settings → Storage holds the build cache: this build
+    /// waits for it (#19294).
+    Busy,
     /// This mod was left out of the build.
     LeftOut(LeftOut),
     /// The build ended: seconds it took.
@@ -1120,7 +1144,8 @@ impl Step {
             | Self::LeftOut(_)
             | Self::Checking(_)
             | Self::BackedUp(_)
-            | Self::Waiting => (Stage::Prepare, None),
+            | Self::Waiting
+            | Self::Busy => (Stage::Prepare, None),
             Self::ToolsKept { .. } => (Stage::Prepare, Some(1.)),
             Self::Tools { done, total, .. } => (
                 Stage::Prepare,
@@ -1211,6 +1236,7 @@ impl Step {
             },
             Self::Install => tr("Installing the build").into(),
             Self::Waiting => tr("Cleaning up the last build…").into(),
+            Self::Busy => tr("Waiting for another build or a cache cleanup to finish…").into(),
             Self::LeftOut(left) => left.label(),
             Self::Done { secs, .. } => trf(
                 "Your mods are built (took {secs} s).",
@@ -1381,6 +1407,13 @@ fn check_cancelled() -> Result<(), String> {
 }
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Clears an earlier build's Stop. A build's starter calls it before the build's Stop can be
+/// pressed (the window, before it shows the card and spawns the worker), so a Stop pressed
+/// before the worker runs still ends that build; [`build_then`] doesn't clear it.
+pub fn arm_cancel() {
+    CANCEL.store(false, Ordering::Relaxed);
+}
 
 /// Stops the build under way: its command is killed and the build ends with [`CANCELLED`].
 pub fn cancel() {
@@ -1569,6 +1602,12 @@ fn read_lock(dir: &Path) -> Result<String, String> {
 }
 
 fn source(revision: &str) -> Result<PathBuf, String> {
+    source_until(revision, &|| Ok(()))
+}
+
+/// [`source`] that asks `stop` before the download and for each file unpacked (a build passes
+/// [`check_cancelled`]; internals sync, outside a build, never stops).
+fn source_until(revision: &str, stop: &dyn Fn() -> Result<(), String>) -> Result<PathBuf, String> {
     let dir = root().join("source").join(revision);
     if dir.join(".horizon-revision").is_file() {
         crate::storage::mark_used(&dir).map_err(cache_error)?;
@@ -1579,7 +1618,7 @@ fn source(revision: &str) -> Result<PathBuf, String> {
         horizon_platform::mod_package::index::native::PREBUILT_REPO
     );
     let partial = root().join("source").join(format!(".{revision}.partial"));
-    let top = unpack_archive(&archive, &partial, u64::MAX)?;
+    let top = unpack_archive_until(&archive, &partial, u64::MAX, stop)?;
     fs::write(top.join(".horizon-revision"), revision).map_err(|e| e.to_string())?;
     let _ = fs::remove_dir_all(&dir);
     fs::rename(&top, &dir).map_err(|e| e.to_string())?;
@@ -1590,9 +1629,16 @@ fn source(revision: &str) -> Result<PathBuf, String> {
 
 /// GitHub's archive (`.tar.gz`) at `url`, unpacked into the fresh folder `partial`: the archive's
 /// one top folder, which is returned. Links are left out; at most `limit` bytes are unpacked.
-fn unpack_source(reader: impl std::io::Read, partial: &Path) -> Result<(), String> {
+/// Unpacks the tar `reader` into `partial`, asking `stop` before each entry: its error ends the
+/// unpack word for word.
+fn unpack_source(
+    reader: impl std::io::Read,
+    partial: &Path,
+    stop: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
     let mut archive = tar::Archive::new(reader);
     for entry in archive.entries().map_err(|e| e.to_string())? {
+        stop()?;
         let mut entry =
             entry.map_err(|e| trf("Source interrupted: {error}", &[("error", &e.to_string())]))?;
         let kind = entry.header().entry_type();
@@ -1613,11 +1659,31 @@ fn unpack_source(reader: impl std::io::Read, partial: &Path) -> Result<(), Strin
 }
 
 pub(crate) fn unpack_archive(url: &str, partial: &Path, limit: u64) -> Result<PathBuf, String> {
+    unpack_archive_until(url, partial, limit, &|| Ok(()))
+}
+
+/// [`unpack_archive`] that asks `stop` before the download and for each file unpacked: its
+/// error ends it word for word, and `partial` is removed with what was unpacked so far.
+pub(super) fn unpack_archive_until(
+    url: &str,
+    partial: &Path,
+    limit: u64,
+    stop: &dyn Fn() -> Result<(), String>,
+) -> Result<PathBuf, String> {
     use std::io::Read;
+    stop()?;
     let _ = fs::remove_dir_all(partial);
     fs::create_dir_all(partial).map_err(|e| e.to_string())?;
-    let reader = flate2::read::GzDecoder::new(backend::get(url)?.into_reader()).take(limit);
-    unpack_source(reader, partial)?;
+    let unpacked = backend::get(url).and_then(|response| {
+        let reader = flate2::read::GzDecoder::new(response.into_reader()).take(limit);
+        unpack_source(reader, partial, stop)
+    });
+    if let Err(error) = unpacked {
+        let _ = fs::remove_dir_all(partial);
+        // A request that failed while Stop was pending ends as the stop, not as its error.
+        stop()?;
+        return Err(error);
+    }
     // The archive's one top folder (<repo>-<commit>/) is the source's root.
     fs::read_dir(partial)
         .map_err(|e| e.to_string())?
@@ -1820,35 +1886,26 @@ fn judge_all(
     base: &sdk_cache::Base,
 ) -> Result<Vec<(String, fit::Verdict)>, sdk_cache::Refusal> {
     let mut surface: Option<std::rc::Rc<mod_surface::Surface>> = None;
-    let mut catalog: Option<std::rc::Rc<internals::Catalog>> = None;
     let mut verdicts = Vec::new();
     for project in projects {
-        let verdict = fit::judge(
-            project,
-            sdk.commit(),
-            &mut || {
-                if surface.is_none() {
-                    surface = Some(std::rc::Rc::new(sdk_cache::surface(sdk, base)?));
-                }
-                Ok(surface.clone().expect("read above"))
-            },
-            &mut || {
-                if catalog.is_none() {
-                    let dir = sdk_cache::build_data(sdk, base)?;
-                    let read = internals::Catalog::read(&dir).map_err(|why| {
-                        sdk_cache::Refusal::Refused {
-                            build: sdk.shown(),
-                            why,
-                        }
-                    })?;
-                    catalog = Some(std::rc::Rc::new(read));
-                }
-                Ok(catalog.clone().expect("read above"))
-            },
-        )?;
+        let verdict = fit::judge(project, sdk.commit(), &mut || {
+            if surface.is_none() {
+                surface = Some(std::rc::Rc::new(sdk_cache::surface(sdk, base)?));
+            }
+            Ok(surface.clone().expect("read above"))
+        })?;
         verdicts.push((project.bundle.manifest.id.clone(), verdict));
     }
     Ok(verdicts)
+}
+
+/// [`refused`], unless the player stopped the build while the request ran: then [`CANCELLED`],
+/// so the card shows no error for it.
+fn refused_unless_stopped(refusal: sdk_cache::Refusal) -> String {
+    match check_cancelled() {
+        Err(stopped) => stopped,
+        Ok(()) => refused(refusal),
+    }
 }
 
 /// A build's refusal of the mod tools, as the player reads it. A refused signature is short on
@@ -1870,6 +1927,7 @@ fn refused(refusal: sdk_cache::Refusal) -> String {
 fn guard_worlds(
     home: &Path,
     left: &[LeftOut],
+    verdicts: &[(String, fit::Verdict)],
     build: &str,
     back_up: bool,
     progress: &impl Fn(Step),
@@ -1892,6 +1950,18 @@ fn guard_worlds(
                 (!worlds.is_empty()).then(|| match l.why {
                     isolate::Why::DidNotBuild => {
                         fit::worlds_at_stake_unbuilt(&l.id, build, &worlds)
+                    }
+                    isolate::Why::Newer(_) => {
+                        let pinned = verdicts
+                            .iter()
+                            .find(|(id, _)| id == &l.id)
+                            .and_then(|(_, verdict)| verdict.newer_build());
+                        match pinned {
+                            Some(made_for) => {
+                                fit::worlds_at_stake_newer(&l.id, build, &worlds, made_for)
+                            }
+                            None => fit::worlds_at_stake(&l.id, build, &worlds),
+                        }
                     }
                     _ => fit::worlds_at_stake(&l.id, build, &worlds),
                 })
@@ -2111,7 +2181,8 @@ fn pipeline(
         }
         None
     } else {
-        Some(sdk_cache::index(&sdk_base, &revision, &keys).map_err(refused)?)
+        check_cancelled()?;
+        Some(sdk_cache::index(&sdk_base, &revision, &keys).map_err(refused_unless_stopped)?)
     };
     let mut fitted: Vec<String> = Vec::new();
     if let Some(sdk) = &sdk {
@@ -2156,13 +2227,18 @@ fn pipeline(
                 .iter()
                 .filter_map(|(id, verdict)| {
                     let bundle = mods.iter().find(|b| &b.manifest.id == id)?;
-                    let why = isolate::Why::Unfit(fit::line(id, verdict, &shown));
+                    let line = fit::line(id, verdict, &shown);
+                    let why = if verdict.newer_build().is_some() {
+                        isolate::Why::Newer(line)
+                    } else {
+                        isolate::Why::Unfit(line)
+                    };
                     Some(LeftOut::new(bundle, why))
                 })
                 .collect();
             let left = isolate::with_dependents(&unfit, &pairs);
             if let Some(home) = options.worlds {
-                guard_worlds(home, &left, &shown, options.back_up, progress)?;
+                guard_worlds(home, &left, &unusable, &shown, options.back_up, progress)?;
             }
             return Err(Failed::Mods {
                 left,
@@ -2172,7 +2248,9 @@ fn pipeline(
         }
     }
     if target == Target::Server {
-        let jars = horizon_platform::mod_package::manifest::collect_jar_requirements(
+        // The server export never carries a jar that takes no `data/`: no server opens it.
+        let jars = horizon_platform::mod_package::manifest::jar_requirements_for(
+            horizon_platform::mod_package::manifest::Side::Server,
             mods.iter()
                 .map(|bundle| (bundle.manifest.id.as_str(), bundle.manifest.jar.as_slice())),
         )
@@ -2209,7 +2287,7 @@ fn pipeline(
                 .map(|(b, d)| (b, d.as_slice()))
                 .collect();
             let going = isolate::with_dependents(std::slice::from_ref(&left), &pairs);
-            if let Err(stop) = guard_worlds(home, &going, &shown, back_up, progress) {
+            if let Err(stop) = guard_worlds(home, &going, &[], &shown, back_up, progress) {
                 return stop;
             }
         }
@@ -2272,7 +2350,9 @@ fn pipeline(
                 let sdk = match sdk {
                     Some(sdk) => sdk,
                     None => {
-                        fetched = sdk_cache::index(&sdk_base, &revision, &keys).map_err(refused)?;
+                        check_cancelled()?;
+                        fetched = sdk_cache::index(&sdk_base, &revision, &keys)
+                            .map_err(refused_unless_stopped)?;
                         &fetched
                     }
                 };
@@ -2297,6 +2377,7 @@ fn pipeline(
                             },
                         })
                     },
+                    &check_cancelled,
                 )
                 .map_err(refused)?
             }
@@ -2364,7 +2445,7 @@ fn pipeline(
     if let Some(game) = &prebuilt {
         let checking = std::time::Instant::now();
         linker()?;
-        let rust = rust_toolchain::install(|f| progress(Step::Rust(f)))?;
+        let rust = rust_toolchain::install_until(|f| progress(Step::Rust(f)), &check_cancelled)?;
         timed("Checking the Rust toolchain", checking)?;
         progress(Step::PrebuiltMods);
         let compiling = std::time::Instant::now();
@@ -2519,6 +2600,7 @@ pub fn build(
     progress: impl Fn(Step),
     registry_consent: impl Fn(&RegistryInventory) -> bool,
 ) -> Result<String, Failed> {
+    arm_cancel();
     build_then(
         base,
         || Ok(folder.to_owned()),
@@ -2532,15 +2614,48 @@ pub fn build(
     )
 }
 
+/// [`build`] of the native mods turned on in `instance`, staged once the build has its turn and
+/// lease ([`build_then`]): a build queued behind another never replaces the shared staging folder
+/// that one builds from (#19294).
+pub fn build_installed(
+    base: &str,
+    instance: &Instance,
+    profile: Option<Profile>,
+    asked: Asked,
+    progress: impl Fn(Step),
+    registry_consent: impl Fn(&RegistryInventory) -> bool,
+) -> Result<String, Failed> {
+    arm_cancel();
+    build_then(
+        base,
+        || installed_mods(&instance.home),
+        true,
+        instance,
+        profile,
+        asked,
+        progress,
+        registry_consent,
+        |result| result,
+    )
+}
+
 /// Held by a build from start to the end of its cleanup, within this launcher (#18669).
 static BUILD_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// What [`build_turn`] hands a build: its turn in this launcher, and the build lease (or why
+/// there is none).
+type Turn = (
+    std::sync::MutexGuard<'static, ()>,
+    Result<crate::native_cache::Cache, String>,
+);
+
 /// Waits for this launcher's last build to end its cleanup: it hands its result on before the
 /// cleanup ends, so a build started meanwhile (Try again, or backing up worlds) waits instead
-/// of being refused as busy. Stop ends the wait. Native mods turned off meanwhile are checked
-/// again once the turn is taken, before any build step. Every wait a window build needs
-/// before it starts belongs here.
-fn build_turn(progress: &impl Fn(Step)) -> Result<std::sync::MutexGuard<'static, ()>, Failed> {
+/// of being refused as busy. Then waits for the build lease ([`lease`]) another launcher's
+/// build, a cache cleanup or Settings → Storage may hold (#19294). Stop ends either wait.
+/// Native mods turned off meanwhile are checked again once both are taken, before any build
+/// step. Every wait a window build needs before it starts belongs here.
+fn build_turn(progress: &impl Fn(Step)) -> Result<Turn, Failed> {
     let mut waiting = false;
     let turn = loop {
         match BUILD_TURN.try_lock() {
@@ -2555,8 +2670,11 @@ fn build_turn(progress: &impl Fn(Step)) -> Result<std::sync::MutexGuard<'static,
         check_cancelled()?;
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    // A Stop pressed before this build's worker ran ends it here, not at its first command.
+    check_cancelled()?;
+    let cache = lease(progress)?;
     require_consent()?;
-    Ok(turn)
+    Ok((turn, cache))
 }
 
 /// [`build`], handing its result to `deliver` before the old-build cleanup runs (under the same
@@ -2581,8 +2699,7 @@ pub fn build_then<R>(
     if let Err(error) = require_consent() {
         return deliver(Err(error));
     }
-    CANCEL.store(false, Ordering::Relaxed);
-    let _turn = match build_turn(&progress) {
+    let (_turn, cache) = match build_turn(&progress) {
         Ok(turn) => turn,
         Err(error) => return deliver(Err(error)),
     };
@@ -2599,7 +2716,7 @@ pub fn build_then<R>(
         let folder = stage()?;
         let folder = folder.as_path();
         let profile = select_build_profile(instance.native_profile, profile, || {
-            planning::classify(folder, Some(base), lease)
+            planning::classify(folder, Some(base))
                 .map_err(|error| Failed::Other(error.said(caller)))
         })?;
         let built = isolated(
@@ -2651,7 +2768,7 @@ pub fn build_then<R>(
         }
         Ok(built.version)
     };
-    logged_then(said, attempt, deliver, clean_up)
+    logged_then(said, cache, attempt, deliver, clean_up)
 }
 
 /// The release or Nightly `instance` plays now (the one a native build of it started from).
@@ -2684,7 +2801,9 @@ pub fn build_server(
     require_consent()?;
     CANCEL.store(false, Ordering::Relaxed);
     // Only the command line exports a server: its errors are already the command line's words.
-    logged(String::clone, |cache| {
+    logged(String::clone, &progress, |cache| {
+        // Native mods turned off while this waited for the lease end it before anything.
+        require_consent().map_err(String::from)?;
         if output.symlink_metadata().is_ok() {
             return Err(trf(
                 "{path} already exists. Move it away, or build into another folder.",
@@ -2711,7 +2830,7 @@ pub fn build_server(
         }
         let lease = cache.map_err(str::to_owned)?;
         let profile = select_build_profile(Profile::default(), profile, || {
-            planning::classify(folder, Some(base), lease)
+            planning::classify(folder, Some(base))
         })?;
         let built = pipeline(
             lease,
@@ -2884,6 +3003,113 @@ mod tests {
         assert_eq!(done.shown(), done.label());
     }
 
+    /// A stop during a source's unpack ends it before the next file, as a cancelled build
+    /// (#19300).
+    #[test]
+    fn a_stopped_source_unpack_writes_no_further_file() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        for path in ["top/one", "top/two"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, &b"x"[..]).unwrap();
+        }
+        let bytes = archive.into_inner().unwrap();
+        let asked = std::cell::Cell::new(0);
+        let stop = || {
+            asked.set(asked.get() + 1);
+            match asked.get() > 1 {
+                true => Err(CANCELLED.to_string()),
+                false => Ok(()),
+            }
+        };
+        let result = unpack_source(bytes.as_slice(), folder.path(), &stop);
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert!(folder.path().join("top/one").is_file());
+        assert!(!folder.path().join("top/two").exists());
+    }
+
+    /// A stop during a downloaded archive's unpack removes what was unpacked of it (#19300).
+    #[test]
+    fn a_stopped_archive_download_keeps_no_partial_folder() {
+        use std::io::{Read, Write};
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for path in ["top/one", "top/two"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, &b"x"[..]).unwrap();
+        }
+        let body = archive.into_inner().unwrap().finish().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/source.tar.gz", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut [0; 4096]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(&body);
+            }
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let partial = folder.path().join(".source.partial");
+        let asked = std::cell::Cell::new(0);
+        // Asked once before the download, then before each entry: stops at the second entry
+        // (and is asked once more after the cleanup).
+        let stop = || {
+            asked.set(asked.get() + 1);
+            match asked.get() > 2 {
+                true => Err(CANCELLED.to_string()),
+                false => Ok(()),
+            }
+        };
+        let result = unpack_archive_until(&url, &partial, u64::MAX, &stop);
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert_eq!(asked.get(), 4);
+        assert!(!partial.exists());
+    }
+
+    /// A request that fails while Stop is pending ends as the stop, with no partial folder
+    /// (#19300).
+    #[test]
+    fn a_failed_request_while_stopping_ends_as_the_stop() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/source.tar.gz", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut [0; 4096]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let partial = folder.path().join(".source.partial");
+        let asked = std::cell::Cell::new(0);
+        // Stop is pressed once the request is under way.
+        let stop = || {
+            asked.set(asked.get() + 1);
+            match asked.get() > 1 {
+                true => Err(CANCELLED.to_string()),
+                false => Ok(()),
+            }
+        };
+        let result = unpack_archive_until(&url, &partial, u64::MAX, &stop);
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert!(!partial.exists());
+    }
+
     #[test]
     fn source_archive_escape_is_refused_without_writing_outside() {
         let folder = tempfile::tempdir().unwrap();
@@ -2897,7 +3123,7 @@ mod tests {
         let bytes = archive.into_inner().unwrap();
         let inside = folder.path().join("inside");
         fs::create_dir(&inside).unwrap();
-        assert!(unpack_source(bytes.as_slice(), &inside).is_err());
+        assert!(unpack_source(bytes.as_slice(), &inside, &|| Ok(())).is_err());
         assert!(!folder.path().join("outside").exists());
     }
 
@@ -2912,6 +3138,7 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "native_mods::tests::a_native_build_starts_from_a_release_the_launcher_installed",
                 ])
@@ -3086,6 +3313,7 @@ mod tests {
 
     #[test]
     fn a_mod_saved_into_a_world_is_never_switched_off_without_the_players_choice() {
+        use horizon_platform::mod_package::sdk::{INDEX, SCHEMA};
         use horizon_platform::world::nbt::{self, Limits, Tag};
         let _guard = scratch_state();
         let home = dir("guard-worlds");
@@ -3095,7 +3323,7 @@ mod tests {
             ("ModId", Tag::String("greeter".into())),
             ("ModVersion", Tag::String("1.0.0".into())),
         ]);
-        let root = Tag::compound([
+        let level = Tag::compound([
             (
                 "Data",
                 Tag::compound([("LevelName", Tag::String("Home".into()))]),
@@ -3108,7 +3336,7 @@ mod tests {
         let bytes = nbt::write_named(
             &nbt::NamedTag {
                 name: "".into(),
-                tag: root,
+                tag: level,
             },
             Limits::default(),
         )
@@ -3133,7 +3361,7 @@ mod tests {
                 vec![],
             ),
         ] {
-            let stopped = guard_worlds(&home, &[left(why)], build, false, &|_| {});
+            let stopped = guard_worlds(&home, &[left(why)], &[], build, false, &|_| {});
             let Err(Failed::Worlds(stake)) = stopped else {
                 panic!("a world saved with the mod must stop the build");
             };
@@ -3147,6 +3375,55 @@ mod tests {
                 "nothing is backed up unasked"
             );
         }
+        let pin =
+            format!("{:x}", Sha256::digest(home.to_string_lossy().as_bytes()))[..40].to_owned();
+        let sdk = root().join("sdk").join(&pin);
+        fs::create_dir_all(sdk.parent().unwrap()).unwrap();
+        fs::create_dir(&sdk).unwrap();
+        fs::write(
+            sdk.join(INDEX),
+            serde_json::json!({
+                "schema": SCHEMA,
+                "build": {
+                    "commit": pin, "game": "26.3", "date": "2026-11-22",
+                    "nightly": "nightly-2026-11-22"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let verdict = fit::Verdict::NoList {
+            made_for: pin,
+            age: fit::Age::Newer,
+        };
+        let stopped = guard_worlds(
+            &home,
+            &[left(isolate::Why::Newer(fit::line(
+                "greeter", &verdict, build,
+            )))],
+            &[("greeter".into(), verdict)],
+            build,
+            false,
+            &|_| {},
+        );
+        fs::remove_dir_all(sdk).unwrap();
+        let Err(Failed::Worlds(stake)) = stopped else {
+            panic!("a world saved with the newer mod must stop the build");
+        };
+        assert_eq!(stake.worlds, ["Home"]);
+        assert!(
+            stake.text.contains("Opening it without greeter"),
+            "{}",
+            stake.text
+        );
+        assert!(
+            stake.text.ends_with(
+                "Update this instance to the Nov 22 update to use it: instance settings, Installation, Game version."
+            ),
+            "{}",
+            stake.text
+        );
+
         // A mod that failed to compile but is in no world isn't part of the stop.
         let Err(Failed::Worlds(stake)) = guard_worlds(
             &home,
@@ -3155,6 +3432,7 @@ mod tests {
                 other.id = "elsewhere".into();
                 other
             }],
+            &[],
             build,
             false,
             &|_| {},
@@ -3168,6 +3446,7 @@ mod tests {
         guard_worlds(
             &home,
             &[left(isolate::Why::DidNotBuild)],
+            &[],
             build,
             true,
             &|step| said.borrow_mut().push(step),
@@ -3181,7 +3460,7 @@ mod tests {
             version: "1.0.0".into(),
             why: isolate::Why::DidNotBuild,
         };
-        assert!(guard_worlds(&home, &[other], build, false, &|_| {}).is_ok());
+        assert!(guard_worlds(&home, &[other], &[], build, false, &|_| {}).is_ok());
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -3613,6 +3892,66 @@ mod tests {
         bytes
     }
 
+    /// `id`'s project from `d` as a flat `.hmod` in `home`'s native folder, its manifest followed by
+    /// `extra`.
+    fn install_hmod(d: &Path, home: &Path, id: &str, extra: &str) {
+        let mut zip = zip::ZipWriter::new(
+            fs::File::create(home.join(INSTALLED).join(format!("{id}.hmod"))).unwrap(),
+        );
+        for file in [NATIVE_MANIFEST, "Cargo.toml", "src/lib.rs"] {
+            zip.start_file(file, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&fs::read(d.join(file)).unwrap()).unwrap();
+            if file == NATIVE_MANIFEST {
+                zip.write_all(extra.as_bytes()).unwrap();
+            }
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn a_mod_with_the_removed_inject_stops_the_build_only_when_on() {
+        let _guard = scratch_state();
+        let (veinminer, listener) = (dir("inject-src-a"), dir("inject-src-b"));
+        write_native(&veinminer, "veinminer", A, B);
+        write_native(&listener, "listener", A, B);
+        let home = dir("inject-home");
+        fs::create_dir_all(home.join(INSTALLED)).unwrap();
+        install_hmod(&veinminer, &home, "veinminer", "");
+        install_hmod(
+            &listener,
+            &home,
+            "listener",
+            "[[inject]]\nid='tick'\nat='game::tick'\nkind='head'\nwith='tick'\n",
+        );
+        crate::browser::java::set_enabled(&home, "veinminer", true).unwrap();
+        crate::browser::java::set_enabled(&home, "listener", false).unwrap();
+        let ids: Vec<_> = bundles(&installed_mods(&home).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|b| b.manifest.id)
+            .collect();
+        assert_eq!(ids, ["veinminer"]);
+        let on = |home: &Path| -> Vec<String> {
+            crate::native_status::enabled(home)
+                .into_iter()
+                .map(|m| m.0)
+                .collect()
+        };
+        assert_eq!(on(&home), ["veinminer"]);
+
+        crate::browser::java::set_enabled(&home, "listener", true).unwrap();
+        let error = installed_mods(&home).unwrap_err();
+        assert!(
+            error.starts_with("listener (") && error.contains("[[inject]]"),
+            "{error}"
+        );
+        assert_eq!(on(&home), ["listener", "veinminer"]);
+        for d in [veinminer, listener, home] {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+
     #[test]
     fn an_old_format_native_mod_is_left_out_and_the_others_build() {
         let _guard = scratch_state();
@@ -4012,6 +4351,7 @@ mod tests {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args([
+                    "--include-ignored",
                     "--exact",
                     "native_mods::tests::server_install_is_not_playable_and_export_survives_cache_removal",
                     "--nocapture",
@@ -4321,12 +4661,11 @@ mod tests {
             "[package]\nname='snapshot'\nversion='0.1.0'\n[dependencies]\nhorizon-client='0.1'\n",
         )
         .unwrap();
-        let preview = root().join("installed.routes");
+        let preview = root().join(planning::CHECKED);
         fs::create_dir_all(&preview).unwrap();
         let sentinel = preview.join("snapshot-sentinel");
         fs::write(&sentinel, b"retained").unwrap();
-        let lease = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
-        let plan = planning::classify(&folder, None, &lease).unwrap();
+        let plan = planning::classify(&folder, None).unwrap();
         assert_eq!(plan.mods.len(), 1);
         assert_eq!(plan.mods[0].0, "snapshot");
         assert!(
@@ -4384,7 +4723,7 @@ mod tests {
             pinned_catalog_with_modules(&folder).err().unwrap(),
             expected
         );
-        let preview = root().join("installed.routes");
+        let preview = root().join(planning::CHECKED);
         fs::create_dir_all(&preview).unwrap();
         let marker = preview.join("permission-sentinel");
         fs::write(&marker, b"unchanged").unwrap();
@@ -4448,7 +4787,7 @@ mod tests {
         assert!(!log.contains("Build again"), "{log}");
         assert!(!log.contains("the last build's output"), "{log}");
         // A failure after compiler output keeps those diagnostics and the final reason.
-        let failure: Result<(), String> = logged(String::clone, |_| {
+        let failure: Result<(), String> = logged(String::clone, &|_| {}, |_| {
             append_log("error[E0425]: cannot find value `missing` in this scope")?;
             Err("Could not export the engine".into())
         });
@@ -4457,7 +4796,7 @@ mod tests {
         assert!(log.starts_with("error[E0425]"), "{log}");
         assert_result_then_cleanup(&log, "The build failed: Could not export the engine");
         assert!(!log.contains("Build completed."), "{log}");
-        let success: Result<(), String> = logged(String::clone, |_| Ok(()));
+        let success: Result<(), String> = logged(String::clone, &|_| {}, |_| Ok(()));
         success.unwrap();
         let log = fs::read_to_string(log_path()).unwrap();
         assert_result_then_cleanup(&log, "Build completed.");
@@ -4492,6 +4831,7 @@ mod tests {
             let order = std::cell::RefCell::new(Vec::new());
             let returned = logged_then(
                 String::clone,
+                crate::native_cache::Cache::acquire(&backend::build_dir()).map_err(cache_error),
                 |_| outcome.clone(),
                 |result| {
                     order.borrow_mut().push("result");
@@ -4551,6 +4891,56 @@ mod tests {
             result.map_err(String::from)
         );
         assert_eq!(*steps.borrow(), [Step::Waiting.label()]);
+    }
+
+    /// #19300: a Stop pressed after the window started a build but before its worker ran ends
+    /// that build before any step, rather than being cleared by it.
+    #[test]
+    fn a_stop_pressed_before_the_worker_runs_ends_the_build() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        arm_cancel();
+        cancel();
+        let steps = std::cell::RefCell::new(Vec::new());
+        let result = build_then(
+            "v0.0.0-not-installed",
+            || -> Result<PathBuf, String> { panic!("staged after Stop") },
+            false,
+            &instances::selected(),
+            None,
+            Asked {
+                caller: Caller::Window,
+                back_up: false,
+            },
+            |step| steps.borrow_mut().push(step.label()),
+            |_| false,
+            |result| result,
+        );
+        arm_cancel();
+        original.save().unwrap();
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if error == CANCELLED),
+            "{:?}",
+            result.map_err(String::from)
+        );
+        assert!(steps.borrow().is_empty(), "{:?}", steps.borrow());
+    }
+
+    /// #19300: an SDK index request that failed while Stop was pending ends as the stop.
+    #[test]
+    fn a_failed_index_request_while_stopping_ends_as_the_stop() {
+        let _guard = scratch_state();
+        let offline = || sdk_cache::Refusal::Offline {
+            build: "the Nov 13 update".into(),
+            bytes: None,
+        };
+        arm_cancel();
+        assert_ne!(refused_unless_stopped(offline()), CANCELLED);
+        cancel();
+        let stopped = refused_unless_stopped(offline());
+        arm_cancel();
+        assert_eq!(stopped, CANCELLED);
     }
 
     /// #18669: native mods turned off in Storage while a build waits for the last cleanup stop
@@ -4680,6 +5070,254 @@ mod tests {
         // It went on to build the captured base, which isn't installed here: the build names it.
         let error = String::from(result.unwrap_err());
         assert!(error.contains(base), "{error}");
+    }
+
+    /// #19294: the Mods tab's route check needs no build lease, so one running beside a build
+    /// can't make that build wait or fail.
+    #[test]
+    fn a_route_check_runs_beside_a_build_without_its_lease() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let home = dir("routes-beside-build");
+        let build = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+        let checked = routes(&home, None).map_err(String::from);
+        drop(build);
+        original.save().unwrap();
+        let _ = fs::remove_dir_all(home);
+        // It read the instance's mods, which a check refused for the build's lease never does.
+        let error = checked.unwrap_err();
+        assert_ne!(error, cache_error(crate::native_cache::Error::Busy));
+        assert!(error.contains("No native mod is turned on"), "{error}");
+    }
+
+    /// #19294: a build started while a cache cleanup, Settings → Storage or another launcher's
+    /// build holds the build lease says it waits, and builds once the lease is let go.
+    #[test]
+    fn a_build_waits_for_a_held_lease_then_builds() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            let _lease = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+            held.send(()).unwrap();
+            // Bounded: a build that never waits must fail this test, not hang it.
+            let _ = released.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        holding.recv().unwrap();
+        let steps = std::cell::RefCell::new(Vec::new());
+        let result = build_then(
+            "v0.0.0-not-installed",
+            // Runs only once the build has the lease.
+            || -> Result<PathBuf, String> {
+                steps.borrow_mut().push("staged".to_string());
+                Err("staged".into())
+            },
+            false,
+            &instances::selected(),
+            None,
+            Asked {
+                caller: Caller::Window,
+                back_up: false,
+            },
+            |step| {
+                if matches!(step, Step::Busy) {
+                    release.send(()).unwrap();
+                }
+                steps.borrow_mut().push(step.label());
+            },
+            |_| false,
+            |result| result,
+        );
+        cleanup.join().unwrap();
+        original.save().unwrap();
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if error == "staged"),
+            "{:?}",
+            result.map_err(String::from)
+        );
+        assert_eq!(*steps.borrow(), [Step::Busy.label(), "staged".to_string()]);
+    }
+
+    /// #19294: Stop ends a build's wait for a held build lease, and nothing of the build runs.
+    #[test]
+    fn stop_ends_a_builds_wait_for_a_held_lease() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let held = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+        let steps = std::cell::RefCell::new(Vec::new());
+        let result = build_then(
+            "v0.0.0-not-installed",
+            || -> Result<PathBuf, String> { panic!("staged while the lease was held") },
+            false,
+            &instances::selected(),
+            None,
+            Asked {
+                caller: Caller::Window,
+                back_up: false,
+            },
+            |step| {
+                if matches!(step, Step::Busy) {
+                    cancel();
+                }
+                steps.borrow_mut().push(step.label());
+            },
+            |_| false,
+            |result| result,
+        );
+        drop(held);
+        CANCEL.store(false, Ordering::Relaxed);
+        original.save().unwrap();
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if error == CANCELLED),
+            "{:?}",
+            result.map_err(String::from)
+        );
+        assert_eq!(*steps.borrow(), [Step::Busy.label()]);
+    }
+
+    /// #19294: the command line's build of an instance's installed mods, queued behind a held
+    /// lease, stages them only once it has the lease: the shared staging folder the holder builds
+    /// from stays as it is while this one waits.
+    #[test]
+    fn a_queued_build_of_the_installed_mods_stages_them_only_once_it_has_the_lease() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let incoming = installed_incoming();
+        fs::create_dir_all(&incoming).unwrap();
+        let sentinel = incoming.join("the-running-build-reads-this");
+        fs::write(&sentinel, b"kept").unwrap();
+        let held = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+        let kept_while_waiting = std::cell::Cell::new(false);
+        let result = build_installed(
+            "v0.0.0-not-installed",
+            &instances::selected(),
+            None,
+            Asked {
+                caller: Caller::CommandLine,
+                back_up: false,
+            },
+            |step| {
+                if matches!(step, Step::Busy) {
+                    kept_while_waiting.set(sentinel.is_file());
+                    cancel();
+                }
+            },
+            |_| false,
+        );
+        drop(held);
+        CANCEL.store(false, Ordering::Relaxed);
+        original.save().unwrap();
+        let kept = fs::read(&sentinel);
+        let _ = fs::remove_dir_all(&incoming);
+        assert!(kept_while_waiting.get());
+        assert_eq!(kept.unwrap(), b"kept");
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if error == CANCELLED),
+            "{:?}",
+            result.map_err(String::from)
+        );
+    }
+
+    /// #19294: native mods turned off while a server export waits for a held lease end the
+    /// export once it has the lease, before anything is exported.
+    #[test]
+    fn a_server_export_checks_consent_again_once_it_has_the_lease() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lease = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(std::time::Duration::from_secs(30));
+        });
+        holding.recv().unwrap();
+        let scratch = dir("server-consent");
+        let output = scratch.join("server");
+        let result = build_server(
+            "v0.0.0-not-installed",
+            &scratch,
+            &output,
+            None,
+            false,
+            |step| {
+                if matches!(step, Step::Busy) {
+                    let mut settings = backend::Settings::load();
+                    settings.native_mods_allowed_at = None;
+                    settings.save().unwrap();
+                    release.send(()).unwrap();
+                }
+            },
+            |_| false,
+        );
+        holder.join().unwrap();
+        original.save().unwrap();
+        let exported = output.exists();
+        let _ = fs::remove_dir_all(scratch);
+        assert!(!exported);
+        let expected = String::from(Failed::NoConsent);
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if *error == expected),
+            "{:?}",
+            result.map_err(String::from)
+        );
+    }
+
+    /// #19294: Stop pressed while a build waits, just before the holder lets the lease go, still
+    /// ends the build before it stages anything.
+    #[test]
+    fn stop_as_the_lease_is_let_go_still_ends_the_build() {
+        let _guard = scratch_state();
+        let original = backend::Settings::load();
+        backend::Settings::load().allow_native_mods().unwrap();
+        let (waiting, waits) = std::sync::mpsc::channel::<()>();
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let lease = crate::native_cache::Cache::acquire(&backend::build_dir()).unwrap();
+            held.send(()).unwrap();
+            if waits
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok()
+            {
+                // Inside the build's 100 ms pause between tries: Stop, then the lease goes.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                cancel();
+                drop(lease);
+            }
+        });
+        holding.recv().unwrap();
+        let result = build_then(
+            "v0.0.0-not-installed",
+            || -> Result<PathBuf, String> { panic!("staged after Stop") },
+            false,
+            &instances::selected(),
+            None,
+            Asked {
+                caller: Caller::Window,
+                back_up: false,
+            },
+            |step| {
+                if matches!(step, Step::Busy) {
+                    waiting.send(()).unwrap();
+                }
+            },
+            |_| false,
+            |result| result,
+        );
+        holder.join().unwrap();
+        CANCEL.store(false, Ordering::Relaxed);
+        original.save().unwrap();
+        assert!(
+            matches!(&result, Err(Failed::Other(error)) if error == CANCELLED),
+            "{:?}",
+            result.map_err(String::from)
+        );
     }
 
     /// #18669: the command line's build of the installed mods whose lease can't be taken (not

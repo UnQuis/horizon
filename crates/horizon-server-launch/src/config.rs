@@ -230,6 +230,39 @@ pub struct Config {
     /// `[entities]` (docs/server.md): mob settings passed to the game; written only when it isn't the default.
     #[serde(default, skip_serializing_if = "Entities::is_default")]
     pub entities: Entities,
+    /// `[proxy]` (docs/hosting.md): the supervisor owns the public port and the game listens behind it;
+    /// written only when it isn't the default.
+    #[serde(default, skip_serializing_if = "Proxy::is_default")]
+    pub proxy: Proxy,
+}
+
+/// `[proxy]`: the supervisor listens on `server.port` and signs players in itself (proxy/mod.rs), and the
+/// game listens on 127.0.0.1 behind it, with Velocity forwarding. Off by default. Read when horizon-server
+/// starts: turning it on or off needs a restart of horizon-server, not only of the game.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Proxy {
+    pub enabled: bool,
+    /// The port the game listens on, on 127.0.0.1; 0 takes a free one at every start of horizon-server.
+    pub game_port: u16,
+    /// How long a player is held through a restart before it is sent away if the game isn't back.
+    pub hold_seconds: u32,
+}
+
+impl Default for Proxy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            game_port: 0,
+            hold_seconds: 60,
+        }
+    }
+}
+
+impl Proxy {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// `[entities]`: `villager_lobotomize = true` skips the brain of villagers that cannot move (stuck in a cell,
@@ -759,6 +792,12 @@ impl Config {
         self.chat_filter.check()?;
         self.prune_chunks.check()?;
         self.entities.check()?;
+        if !(1..=3600).contains(&self.proxy.hold_seconds) {
+            return Err("proxy.hold_seconds must be from 1 to 3600".into());
+        }
+        if self.proxy.enabled && self.proxy.game_port == self.server.port {
+            return Err("proxy.game_port is server.port: the game listens behind the proxy, on its own port".into());
+        }
         // The game opens these as given, appending player text or rewriting them, so they stay
         // in the server folder: not absolute, not up a level, no drive (`C:x`) on Windows.
         for (what, path) in [
@@ -793,6 +832,22 @@ impl Config {
                 range.end()
             ));
         }
+        // The game reads these properties as Java ints; a larger number fails to parse and is silently
+        // replaced by the default (20, 10). Smaller or larger values it clamps itself, so only these are refused.
+        let server = &self.server;
+        for (name, value) in [
+            ("max_players", server.max_players),
+            ("view_distance", server.view_distance),
+            ("simulation_distance", server.simulation_distance),
+            ("max_view_distance", server.max_view_distance),
+        ] {
+            if i32::try_from(value).is_err() {
+                return Err(format!(
+                    "server.{name} is {value}: use at most {}",
+                    i32::MAX
+                ));
+            }
+        }
         if let Some((section, field, key)) =
             TYPED.iter().find(|t| self.properties.contains_key(t.2))
         {
@@ -817,6 +872,19 @@ impl Config {
                 .iter()
                 .map(|(k, v)| (k.clone(), property_text(v))),
         );
+        // Behind the proxy the game listens where only it goes (`game_port` is set once the proxy runs).
+        if self.proxy.enabled && self.proxy.game_port != 0 {
+            for (key, value) in [
+                ("server-ip".to_owned(), "127.0.0.1".to_owned()),
+                ("server-port".to_owned(), self.proxy.game_port.to_string()),
+                ("online-mode".to_owned(), "false".to_owned()),
+            ] {
+                match out.iter_mut().find(|(k, _)| *k == key) {
+                    Some(slot) => slot.1 = value,
+                    None => out.push((key, value)),
+                }
+            }
+        }
         out
     }
 
@@ -877,6 +945,16 @@ impl Config {
         }
         ServerProperties::new(properties, &mut SystemEntropy::default())
             .map_or(4, |p| p.op_permission_level)
+    }
+
+    /// A key as the game reads it at its next start: `server.properties` with this configuration's keys
+    /// written over it (as [`Config::write_properties`] does), so a key only the file sets counts too.
+    pub fn effective_property(&self, dir: &Path, key: &str) -> Option<String> {
+        let mut properties = read_properties(&dir.join(PROPERTIES)).unwrap_or_default();
+        for (k, value) in self.vanilla() {
+            properties.put(&k, value);
+        }
+        properties.get(key).map(str::to_owned)
     }
 
     /// A configuration from a vanilla `server.properties`: typed settings from their keys, and every other
@@ -959,6 +1037,7 @@ pub fn render(config: &Config) -> String {
         "combat",
         "biome_regions",
         "entities",
+        "proxy",
     ] {
         if let Some(settings) = table.get(section) {
             let mut only = toml::Table::new();
@@ -1018,29 +1097,117 @@ static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// default, and the next start would write those into `server.properties`. Another process (the
 /// CLI's `config set`) has its own temporary file.
 pub(crate) fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    replace_with(path, text, || {})
+}
+
+/// [`replace`], with `before_publish` run once per attempt between staging and publishing (a test
+/// uses it to create the destination at that moment).
+fn replace_with(path: &Path, text: &str, mut before_publish: impl FnMut()) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map_or_else(Default::default, |n| n.to_string_lossy());
-    let tmp = path.with_file_name(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut file, text.as_bytes())?;
-        file.sync_all()?;
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
+    loop {
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A target that is missing is a new file; any other failure to look at it is the caller's to
+        // see, not a reason to treat the file as new.
+        let old = match std::fs::metadata(path) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // These files hold secrets (the RCON password, the management secret, the API token): with an
+        // old file to keep the mode of, the temporary one is owner-only until it has that mode, so it
+        // is never more readable than what it replaces. A new file gets the default mode, as vanilla's.
+        #[cfg(unix)]
+        if old.is_some() {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         }
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        // A temporary name taken by another writer fails here, and that writer's file is left alone:
+        // only a file this call created is removed below.
+        let mut file = options.open(&tmp)?;
+        let written = (|| {
+            std::io::Write::write_all(&mut file, text.as_bytes())?;
+            file.sync_all()?;
+            // The old file's mode, read as late as possible and applied to the staged file's own
+            // handle before it is renamed into place.
+            if old.is_some() {
+                match std::fs::metadata(path) {
+                    Ok(meta) => file.set_permissions(meta.permissions())?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        // Closed before the rename and the cleanup, as Windows may refuse either on an open file.
+        drop(file);
+        before_publish();
+        let published = written.and_then(|()| {
+            if old.is_some() {
+                std::fs::rename(&tmp, path).map(|()| true)
+            } else {
+                publish_new(&tmp, path)
+            }
+        });
+        if !matches!(published, Ok(true)) {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        match published {
+            Ok(true) => return Ok(()),
+            // A file appeared at the path while this one was staged (another initializer, an admin):
+            // it is not clobbered with the default mode; the next attempt replaces it keeping its mode.
+            Ok(false) => continue,
+            Err(e) => return Err(e),
+        }
     }
-    written
+}
+
+/// Puts the staged file `tmp` at `path` only if nothing is there yet: `Ok(false)` when something
+/// is, and `tmp` is left for the caller to remove. A hard link fails when its name exists, where a
+/// rename would replace it. A file system without hard links gets the file created at `path` only
+/// if it is absent (`create_new`) and `tmp`'s text copied into it, so nothing there is replaced.
+fn publish_new(tmp: &Path, path: &Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(_) => {
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            let copied = std::fs::File::open(tmp)
+                .and_then(|mut src| std::io::copy(&mut src, &mut file))
+                .and_then(|_| file.sync_all());
+            drop(file);
+            match copied {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(tmp);
+                    Ok(true)
+                }
+                // Only the file this call created is removed.
+                Err(e) => {
+                    let _ = std::fs::remove_file(path);
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 /// Sets one typed setting in `server.toml` (`whitelist on`), keeping the owner's comments.
@@ -1141,6 +1308,66 @@ mod tests {
         p
     }
 
+    /// The replacement itself runs everywhere; the mode it keeps is a Unix check.
+    #[test]
+    fn replace_keeps_the_mode_of_the_file_it_replaces() {
+        let dir = std::env::temp_dir().join(format!("horizon-replace-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.properties");
+        std::fs::write(&path, "old").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .unwrap();
+        replace(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions()
+            ) & 0o777,
+            0o640
+        );
+        // A new file is made too, and no temporary file stays.
+        replace(&dir.join("fresh.properties"), "x").unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file that appears while a new one is staged (another initializer's owner-only file) is not
+    /// replaced by a default-mode file: the write retries as a replacement and keeps its mode.
+    #[test]
+    fn a_file_that_appears_during_a_new_write_keeps_its_mode() {
+        let dir = std::env::temp_dir().join(format!("horizon-replace-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server.toml");
+        let mut first = true;
+        replace_with(&path, "new", || {
+            if std::mem::take(&mut first) {
+                std::fs::write(&path, "theirs").unwrap();
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(&path).unwrap().permissions()
+            ) & 0o777,
+            0o600
+        );
+        // No temporary file of either attempt stays.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// `server.toml` is checked as `config set` checks `backups.keep`: 0 would make the supervisor delete
     /// every automatic backup (the one it just made too), so it is refused with the same range.
     #[test]
@@ -1160,6 +1387,27 @@ keep = {keep}
         assert!(with(1001).is_err());
         assert!(with(1).is_ok() && with(1000).is_ok());
         assert_eq!(Config::default().backups.keep, 12);
+    }
+
+    /// The game parses these as Java ints and replaces what does not fit with its default, unannounced.
+    #[test]
+    fn server_numbers_the_game_cannot_read_are_refused() {
+        let with = |key: &str, n: u32| Config::parse(&format!("[server]\n{key} = {n}\n"));
+        for key in [
+            "max_players",
+            "view_distance",
+            "simulation_distance",
+            "max_view_distance",
+        ] {
+            let err = with(key, 3_000_000_000).unwrap_err();
+            assert!(
+                err.contains(&format!("server.{key} is 3000000000")),
+                "{err}"
+            );
+            assert!(with(key, i32::MAX as u32).is_ok());
+        }
+        // The game clamps these itself, so a file that worked keeps working.
+        assert!(with("view_distance", 64).is_ok() && with("max_players", 5000).is_ok());
     }
 
     #[test]
@@ -1561,6 +1809,33 @@ keep = {keep}
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn the_proxy_is_off_by_default_and_moves_the_game_behind_it_when_on() {
+        let config = Config::default();
+        assert!(!config.proxy.enabled);
+        let key = |c: &Config, k: &str| c.vanilla().into_iter().find(|(key, _)| key == k);
+        // Off, the game keeps the owner's port and online mode.
+        assert_eq!(key(&config, "server-port").unwrap().1, "25565");
+        assert_eq!(key(&config, "online-mode").unwrap().1, "true");
+
+        let on = Config::parse("[proxy]\nenabled = true\ngame_port = 25999\n").unwrap();
+        assert!(on.proxy.enabled);
+        assert_eq!(key(&on, "server-port").unwrap().1, "25999");
+        assert_eq!(key(&on, "server-ip").unwrap().1, "127.0.0.1");
+        // The proxy signs players in: the game trusts what it forwards.
+        assert_eq!(key(&on, "online-mode").unwrap().1, "false");
+        // The owner's own port is where the proxy listens, and the file keeps it.
+        assert_eq!(on.server.port, 25565);
+        assert!(render(&on).contains("[proxy]"));
+        assert!(!render(&config).contains("[proxy]"));
+    }
+
+    #[test]
+    fn the_games_port_behind_the_proxy_is_not_the_public_one() {
+        let err = Config::parse("[proxy]\nenabled = true\ngame_port = 25565\n").unwrap_err();
+        assert!(err.contains("proxy.game_port"), "{err}");
+        assert!(Config::parse("[proxy]\nunknown = 1\n").is_err());
+    }
     /// One bad escape in an owner's server.properties: the start refuses with the file and line instead of
     /// writing server.toml's keys over a file that lost every other key (the game refuses the file too).
     #[test]
@@ -1637,6 +1912,32 @@ keep = {keep}
         let e = Config::default().write_properties(&dir).unwrap_err();
         assert!(e.to_string().contains(PROPERTIES), "{e}");
         assert_eq!(std::fs::read_link(&path).unwrap(), target);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key only `server.properties` sets reaches whoever asks as the game would read it, and server.toml
+    /// wins where both set it.
+    #[test]
+    fn an_effective_property_includes_keys_only_the_file_sets() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-effective-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(PROPERTIES),
+            "enable-status=false\nnetwork-compression-threshold=64\n",
+        )
+        .unwrap();
+        let config = Config::parse("[properties]\nnetwork-compression-threshold = 512\n").unwrap();
+        assert_eq!(
+            config.effective_property(&dir, "enable-status").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            config
+                .effective_property(&dir, "network-compression-threshold")
+                .as_deref(),
+            Some("512")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

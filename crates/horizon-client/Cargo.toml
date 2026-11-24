@@ -59,7 +59,9 @@ horizon-friends = { path = "../horizon-friends", optional = true }
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/modding/src/how-to/content-mods.md).
 # Their runtime is the `mods` feature.
-horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index", "runtime-process"] }
+# Keep `horizon-mod-package` features aligned with `horizon-client-lib` so alternating client and
+# client-lib builds/tests unify the same dependency set and reuse compiled artifacts.
+horizon-mod-package = { path = "../horizon-mod-package", default-features = false, features = ["index", "junction", "runtime-process"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "metal", "wgsl", "naga-ir"] }
 winit = "0.30.13"
 pollster = "0.4"
@@ -80,7 +82,6 @@ ab_glyph = "0.2.32"
 log = "0.4"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
-horizon-theme = { path = "../horizon-theme" }
 # Machine and process probes for benchmark and dedicated-server performance reports.
 horizon-system = { path = "../horizon-system" }
 # Opt-in data collection: the game keeps, the launcher sends (docs/telemetry.md). The
@@ -104,7 +105,7 @@ cap-fs-ext = "3"
 
 [target.'cfg(unix)'.dependencies]
 # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
-rustix = { version = "1", default-features = false, features = ["std", "time", "process", "fs"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "time", "process", "fs"] }
 
 [target.'cfg(windows)'.dependencies]
 # DirectX 12, where Vulkan has no adapter or device, or by choice (`graphicsApi`, graphics.rs).
@@ -186,7 +187,7 @@ horizon-mod-wasm = { path = "../horizon-mod-wasm", features = ["runtime-fixture"
 wat = "1.261"
 tempfile = "3"
 horizon-mod-runtime = { path = "../horizon-mod-runtime", features = ["test-work-count"] }
-horizon-threads = { path = "../horizon-threads", features = ["test-allocation-count"] }
+horizon-threads = { path = "../horizon-threads", features = ["test-allocation-count", "test-game-dir"] }
 mod_platform = { package = "horizon-mod-api", path = "../horizon-mod-api", features = ["testing"] }
 mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab", features = ["testing"] }
 horizon-client-render = { path = "../horizon-client-render", features = ["test-support"] }

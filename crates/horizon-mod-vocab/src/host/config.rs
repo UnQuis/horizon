@@ -88,6 +88,12 @@ pub trait ConfigServerHost {
     #[access(Metadata)]
     fn game_tests_enabled(&self) -> bool;
     /// Side: server.
+    /// The entity broadcast range the server hosts with, in percent of vanilla's range
+    /// (`entity-broadcast-range-percentage` of server.properties, `/serversettings`). 100 when
+    /// no server is hosting a world, as vanilla's default is.
+    #[access(WorldOnly)]
+    fn entity_range_percent(&self) -> i32;
+    /// Side: server.
     /// The server's tick rate (20 unless `/tick rate` changed it) and the
     /// milliseconds its ticks took on average lately, as `/tick query`
     /// reports them. The ticks a second it keeps up is the rate, or
@@ -183,6 +189,12 @@ pub trait ConfigServerHost {
     /// Returns `UnknownRule` for an unknown id; level reads use the same store.
     #[access(WorldOnly)]
     fn game_rule(&self, id: &str) -> Result<GameRuleValue, GameRuleReadError>;
+    /// Side: server.
+    /// The default value of rule `id` in the server-wide store (`GameRule.getDefault`), the value
+    /// the rule has before `/gamerule` or a mod changes it. None for an unknown id, so a rule
+    /// that was never registered reads as absent, not as a default.
+    #[access(WorldOnly)]
+    fn game_rule_default(&self, id: &str) -> Option<GameRuleValue>;
     /// Side: server.
     /// The retained server reload listeners of the last successful reload.
     #[access(WorldOnly)]

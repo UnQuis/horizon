@@ -2,6 +2,7 @@
 //! server threads and the play-state hub, feeds it the world's entities each
 //! tick and turns what the guests do into gameplay. A world that is not open
 //! costs one `Option` check per tick.
+mod control;
 mod event_timings;
 #[cfg(test)]
 mod level_event_targets;
@@ -128,7 +129,6 @@ impl Game<'_> {
                 .add(ty.strip_prefix("minecraft:").unwrap_or(&ty), &key, n);
         }
     }
-
     /// `PlayerList.removeAll`: every player who joined leaves with the world.
     pub(super) fn award_leave_game_to_all(&mut self) {
         let Some(host) = self.lan.as_ref() else {
@@ -530,18 +530,22 @@ pub(super) fn mob_meta_sync(
             defaults.push((19, serializer::BYTE, Value::Byte(0)));
         }
         "minecraft:parrot" => {
+            tame_owner_meta(e.owner, meta, defaults);
             // TamableAnimal.DATA_FLAGS_ID: in the sitting pose 1, tame 4.
             let flags = i8::from(e.sitting_pose) | if e.tame { 4 } else { 0 };
             if flags != 0 {
                 meta.push((18, serializer::BYTE, Value::Byte(flags)));
             }
+            defaults.push((18, serializer::BYTE, Value::Byte(0)));
         }
         "minecraft:cat" | "minecraft:wolf" => {
+            tame_owner_meta(e.owner, meta, defaults);
             // TamableAnimal.DATA_FLAGS_ID: in the sitting pose 1, tame 4.
             let flags = i8::from(e.sitting_pose) | if e.tame { 4 } else { 0 };
             if flags != 0 {
                 meta.push((18, serializer::BYTE, Value::Byte(flags)));
             }
+            defaults.push((18, serializer::BYTE, Value::Byte(0)));
             let (index, registry, name) = if kind == "minecraft:cat" {
                 let v = horizon_client::mobs::tame::CAT_VARIANTS[(e.variant as usize).min(10)];
                 (20, "minecraft:cat_variant", v)
@@ -989,6 +993,27 @@ pub(super) fn mob_meta_sync(
     }
 }
 
+/// `TamableAnimal.DATA_OWNERUUID_ID`: the owner reference follows the flags
+/// for parrots, cats and wolves and defaults to an empty optional value.
+fn tame_owner_meta(
+    owner: Option<[i32; 4]>,
+    meta: &mut Vec<(u8, i32, Value)>,
+    defaults: &mut Vec<(u8, i32, Value)>,
+) {
+    if let Some(owner) = owner {
+        meta.push((
+            19,
+            serializer::OPTIONAL_LIVING_ENTITY_REFERENCE,
+            Value::OptUuid(Some(playerdata::ints_uuid(owner))),
+        ));
+    }
+    defaults.push((
+        19,
+        serializer::OPTIONAL_LIVING_ENTITY_REFERENCE,
+        Value::OptUuid(None),
+    ));
+}
+
 /// AbstractVillager.DATA_UNHAPPY_COUNTER (after AgeableMob's two): the head
 /// shake of a villager saying no counts it down from 40.
 use super::villager_client::unhappy_counter;
@@ -1101,7 +1126,6 @@ impl Game<'_> {
                 [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5]
             })
     }
-
     /// MinecraftServer.setRespawnData: every placed player hears a changed world spawn.
     pub(super) fn lan_broadcast_world_spawn(&self) {
         if let Some(host) = &self.lan {
@@ -1114,7 +1138,6 @@ impl Game<'_> {
             }
         }
     }
-
     /// `horizon-ctl lan ...`.
     pub(super) fn lan_control(&mut self, words: &[&str]) -> Result<Option<serde_json::Value>> {
         use serde_json::json;
@@ -1135,16 +1158,11 @@ impl Game<'_> {
                 if self.title.is_some() {
                     return Err("open a world first".into());
                 }
-                let port = words.get(2).map_or(Ok(0), |p| p.parse::<u16>())?;
-                self.lan_open(LanSettings {
-                    port: if port == 0 {
-                        lan::available_port()
-                    } else {
-                        port
-                    },
-                    guest_commands: words.contains(&"commands"),
-                    force_game_mode: words.contains(&"force"),
-                })?;
+                let mut settings = control::open_settings(&words[2..])?;
+                if settings.port == 0 {
+                    settings.port = lan::available_port();
+                }
+                self.lan_open(settings)?;
                 Ok(Some(json!({ "ok": true, "port": self.lan_port() })))
             }
             Some("close") => {
@@ -1165,6 +1183,8 @@ impl Game<'_> {
                 // The owner's profile name.
                 "host": self.options.player_name(),
                 "port": h.settings.port,
+                "guest_commands": h.hub.config.guest_commands,
+                "force_game_mode": h.hub.config.force_game_mode,
                 // The server's own world: its finished chunks and how many it
                 // has generated or loaded so far.
                 "world": {
@@ -1426,6 +1446,7 @@ impl Game<'_> {
             if !host.hub.guests[i].participates_in_player_simulation() {
                 continue;
             }
+            let _logout = host.hub.hold_player_logout(host.hub.guests[i].uuid);
             let mut g = host.hub.guests.take_for_save(i);
             self.take_parent_vehicle(&mut g);
             self.save_guest(&mut g);
@@ -1446,15 +1467,18 @@ impl Game<'_> {
         // A proxy released this record to another server, which now owns saving it.
         if guest.placed && !guest.released {
             let _ = self.finish_player_autosaves(true);
-            if self
+            let saved = if self
                 .lan
                 .as_ref()
                 .and_then(|host| host.owner.as_ref())
                 .is_some_and(|o| o.uuid == guest.uuid)
             {
-                playerdata::save_owner(guest, &mut self.level, &self.world_root);
+                playerdata::save_owner(guest, &mut self.level, &self.world_root)
             } else {
-                self.player_autosaves.save_after(guest, &self.world_root);
+                self.player_autosaves.save_after(guest, &self.world_root).1
+            };
+            if let Some(host) = self.lan.as_mut() {
+                host.hub.record_player_logout_save(guest.uuid, saved);
             }
             let directory = playerdata::directory(&self.world_root);
             self.native_player_save_to_file(guest.uuid, &guest.name, &directory);
@@ -2313,6 +2337,7 @@ impl Game<'_> {
                         self.native_guest_left(&guest);
                         continue;
                     }
+                    let logout = guest.take_logout_guard();
                     // The menu they had open closes, in the level they were in
                     // (`ServerPlayer.disconnect` -> `doCloseContainer`).
                     if guest.placed {
@@ -2320,9 +2345,13 @@ impl Game<'_> {
                         let theirs = super::Dim::from_id(&guest.dimension);
                         if self.enter_level(theirs).is_ok() {
                             let conn = guest.conn;
+                            let (uuid, name) = (guest.uuid, guest.name.clone());
+                            let reason = guest.left_reason.clone();
                             let host = self.lan.as_mut()?;
                             let at = host.hub.guests.len();
                             host.hub.guests.push(*guest);
+                            // Still placed, with their state in: a mod can act on them first.
+                            self.announce_player_leaving(conn, uuid, &name, &reason);
                             self.guest_disconnected(conn);
                             let Some(host) = self.lan.as_mut() else {
                                 unreachable!("LanHost dropped inside a tick; closes are deferred")
@@ -2341,6 +2370,7 @@ impl Game<'_> {
                     // PlayerList.remove: the vehicle it alone rides goes too.
                     self.take_parent_vehicle(&mut guest);
                     self.save_guest(&mut guest);
+                    drop(logout);
                     let host = self.lan.as_mut()?;
                     host.play.remove(&guest.conn);
                     host.forget_menus(guest.conn);
@@ -2385,6 +2415,20 @@ impl Game<'_> {
                     }
                 }
                 HostEvent::PlayerMove(conn) => self.lan_player_move(conn),
+                HostEvent::PlayerMovePacket {
+                    conn,
+                    to,
+                    to_rotation,
+                    on_ground,
+                    has_position,
+                    has_rotation,
+                } => self.announce_player_move_packet(
+                    conn,
+                    to,
+                    to_rotation,
+                    (on_ground, has_position, has_rotation),
+                ),
+                HostEvent::Pong { conn, id } => self.announce_player_pong(conn, id),
                 HostEvent::Input { conn, flags } => {
                     if !mod_api::__private::listened(mod_api::HookId::PlayerInput) {
                         continue;
@@ -2432,6 +2476,13 @@ impl Game<'_> {
                         self.run_guest_commands();
                     }
                 }
+                // handleClientTickEnd's movement reset, in packet order behind the
+                // MoveVehicle the hub queued for this drain (a rider's move of the tick).
+                HostEvent::TickEnd(conn) => {
+                    if let Some(host) = self.lan.as_mut() {
+                        host.hub.client_tick_end(conn);
+                    }
+                }
                 HostEvent::Jump { conn, from, yaw } => {
                     self.guest_jump(conn, from, yaw);
                 }
@@ -2452,9 +2503,12 @@ impl Game<'_> {
     /// sees the support (arismoko/horizon#4510). `tick_lan` then syncs the level; a paused
     /// tick that never calls this still drains inside `tick_lan`.
     pub(in crate::game) fn tick_lan_packets(&mut self) {
+        self.answer_status_pings();
         if self.level_pass.packets_drained {
             return;
         }
+        // The mods hear the handshakes the connection threads wait on before the tick's joins.
+        self.answer_handshakes();
         let Some(mut host) = self.lan.take() else {
             return;
         };
@@ -2600,7 +2654,6 @@ impl Game<'_> {
         self.lan = Some(host);
         self.flush_attachment_sync();
     }
-
     /// Deliver start/stop callbacks before sounds and attachment snapshots.
     /// A callback can spawn another entity, whose pairing is part of the same
     /// operation, as a nested ChunkMap.addEntity would be in vanilla.
@@ -2619,7 +2672,6 @@ impl Game<'_> {
                 .expect("the hub is back after the tracking events");
         }
     }
-
     /// Pair late arrivals before a sound flush as well as at the end of the
     /// tick. The counter prevents taking or draining an entity's state twice.
     pub(super) fn lan_pair_joined(&mut self, host: &mut LanHost) {
@@ -2781,19 +2833,21 @@ impl Game<'_> {
             // piston's `triggerEvent` on the blocks as they were before the
             // move, a base the last tick restored included.
             for (pos, b0, b1, state) in std::mem::take(&mut self.lan_block_events) {
-                host.hub.block_event(pos, b0, b1, state);
+                host.hub.block_event(&self.world, pos, b0, b1, state);
             }
             let entities = states.as_slice();
             self.lan_prepare_captured_sounds(entities);
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
-            // An entity that left the level since the last tick (a snowball
-            // that hit) is dropped by the tracker below: its event goes out
-            // first, as `Level.broadcastEntityEvent` precedes the discard.
+            // Break events precede equipment updates; events of removed entities
+            // precede their discard, as in Level.broadcastEntityEvent.
             let (gone, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.lan_entity_events)
                 .into_iter()
-                .partition(|(id, ..)| !entities.iter().any(|e| e.id == *id));
+                .partition(|(id, event)| {
+                    horizon_client::mobs::item_break::equipment_break_slot(*event).is_some()
+                        || !entities.iter().any(|e| e.id == *id)
+                });
             self.lan_entity_events = later;
             for (id, event) in gone {
                 host.hub.entity_event(id, event);
@@ -2952,6 +3006,8 @@ impl Game<'_> {
         entities: &[EntityState],
         spawn: [f64; 3],
     ) {
+        // The player's stacks are built against this world's item prototypes.
+        let prototypes = self.items().component_defaults.clone();
         let Some(host) = self.lan.as_mut() else {
             return;
         };
@@ -2965,8 +3021,8 @@ impl Game<'_> {
             // PlayerList.loadPlayerData: the owner gets the world's player file,
             // everyone else their own.
             let known = match owner.filter(|o| o.uuid == g.uuid) {
-                Some(o) => playerdata::load_owner(g, &root, o.saved.take().as_deref()),
-                None => playerdata::load(g, &root),
+                Some(o) => playerdata::load_owner(g, &root, o.saved.take().as_deref(), &prototypes),
+                None => playerdata::load(g, &root, &prototypes),
             };
             // `PlayerList.placeNewPlayer`: a saved level the world no longer has is the Overworld.
             if !levels.has(&g.dimension) {
@@ -3227,6 +3283,23 @@ impl Game<'_> {
         self.break_sound_at(stack, at);
         self.eat_particles(stack, 5);
     }
+    /// `LivingEntity.onEquippedItemBroken` for a mob: the slot's break event to the
+    /// guests, and, in a window that is its own client, `breakItem` of the stack that
+    /// broke here — its own copy of the mob has already lost it (the clients the event
+    /// precedes still have it, `remote_equipment_break`).
+    pub(super) fn mob_equipment_broke(
+        &mut self,
+        id: u32,
+        slot: horizon_core::equipment_slot::EquipmentSlot,
+        stack: &horizon_client::items::ItemStack,
+        at: [f64; 3],
+    ) {
+        let event = horizon_client::mobs::item_break::equipment_break_event(slot);
+        self.lan_entity_event(id as i32, event, at);
+        if self.options.execution_role.is_client() {
+            self.mob_break_item(id as i32, stack, at);
+        }
+    }
     /// `ServerPlayer.crit` (or `magicCrit` when `magic`): this window's
     /// emitter, and an animation for the attacker's client and observers once
     /// the hub is back in place.
@@ -3329,7 +3402,7 @@ impl Game<'_> {
             }
         }
         for (pos, b0, b1, state) in std::mem::take(&mut self.lan_block_events) {
-            host.hub.block_event(pos, b0, b1, state);
+            host.hub.block_event(&self.world, pos, b0, b1, state);
         }
         for (id, event) in std::mem::take(&mut self.lan_entity_events) {
             host.hub.entity_event(id, event);
@@ -3386,8 +3459,16 @@ impl Game<'_> {
                 && !dead
                 && old.and_then(|o| o.2).is_none_or(|before| time < before)
             {
-                host.hub
-                    .swing(m.id as i32, i32::from(m.swing_is_off_hand()), at, None);
+                // The packet names the hand and the animation the swing started
+                // with; the swing records the arm, so the main hand is the
+                // right one unless the mob is left-handed.
+                host.hub.swing(
+                    m.id as i32,
+                    m.swing_is_off_hand(),
+                    m.anim.swing_animation,
+                    at,
+                    None,
+                );
             }
             seen.insert(m.id, (m.hurt_time, dead, swing));
         }
@@ -3454,6 +3535,8 @@ impl Game<'_> {
             )
             .chain(self.portal_ticket_areas())
             .chain(self.viewed_extra())
+            // The chunk the world spawn search is waiting for after a reset, which no player has loaded.
+            .chain(self.world_spawn_search_area())
             .collect();
     }
 
@@ -4363,6 +4446,49 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "daily"]
+    fn tamable_owner_is_sent_and_can_be_cleared() {
+        let hub = meta_hub("TamableOwnerMetaTest");
+        let owner = [1, 2, 3, 4];
+        let expected = Value::OptUuid(Some(0x00000001000000020000000300000004));
+        for kind in ["minecraft:parrot", "minecraft:cat", "minecraft:wolf"] {
+            let mut mob = mob_of(kind)
+                .unwrap_or_else(|| panic!("prepared mob data missing for {kind}"));
+            mob.extra.tame = true;
+            mob.extra.owner = Some(owner);
+            let metadata = |mob: &Mob| {
+                let (mut meta, mut defaults) = (Vec::new(), Vec::new());
+                super::mob_meta(mob, &hub, None, 0, &mut meta, &mut defaults);
+                (meta, defaults)
+            };
+
+            let (meta, defaults) = metadata(&mob);
+            assert!(
+                meta.contains(&(
+                    19,
+                    serializer::OPTIONAL_LIVING_ENTITY_REFERENCE,
+                    expected.clone(),
+                )),
+                "{kind}: {meta:?}"
+            );
+            assert!(defaults.contains(&(
+                19,
+                serializer::OPTIONAL_LIVING_ENTITY_REFERENCE,
+                Value::OptUuid(None)
+            )));
+
+            mob.extra.owner = None;
+            let (meta, defaults) = metadata(&mob);
+            assert!(meta.iter().all(|entry| entry.0 != 19), "{kind}: {meta:?}");
+            assert!(defaults.contains(&(
+                19,
+                serializer::OPTIONAL_LIVING_ENTITY_REFERENCE,
+                Value::OptUuid(None)
+            )));
+        }
+    }
+
     /// A mod's custom name and its visibility reach the tracking players
     /// (`Entity.DATA_CUSTOM_NAME`, `DATA_CUSTOM_NAME_VISIBLE`), and taking
     /// them away is sent as none / false.
@@ -4671,7 +4797,6 @@ mod tests {
             Admission,
             engine::{Owner, Target},
         };
-        use horizon_client::lan::hub::HostEvent;
         use horizon_client::menu::{Kind, Menu};
         super::super::native_guest_turn_tests::with_guests(|game| {
             let host = game.lan.as_mut().unwrap();
@@ -4683,7 +4808,7 @@ mod tests {
             // The hub takes a guest out of its list before it reports the leave.
             let guest = host.hub.guests.remove(0);
             assert_eq!(guest.conn, 12);
-            let event = HostEvent::Left(Box::new(guest));
+            let event = host.hub.leave_event(guest);
             let host = game.lan.take().unwrap();
             game.lan = game.lan_process_events(host, [event], &[], [0.5, 64.0, 0.5]);
             let host = game.lan.as_ref().unwrap();
@@ -4695,6 +4820,176 @@ mod tests {
                 Err(Admission::MissingHolder)
             ));
             assert!(Target::admit(game, 13, Owner::Inventory).is_ok());
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_pending_logout_blocks_inventory_edits_during_autosave_completion() {
+        use horizon_client::items::ItemStack;
+        use mod_api::{
+            Hooks, PlayerInventoryError, PlayerInventoryKind, PlayerInventoryMove,
+            PlayerSaveToFileEvent, ServerHost,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        fn assert_unavailable(host: &mut dyn ServerHost, request: &PlayerInventoryMove) {
+            assert!(matches!(
+                host.server_player_inventory(12, PlayerInventoryKind::Player),
+                Err(PlayerInventoryError::LoggingIn)
+            ));
+            assert_eq!(
+                host.server_move_inventory_stack(request),
+                Err(PlayerInventoryError::LoggingIn)
+            );
+        }
+
+        struct Probe {
+            calls: Arc<AtomicUsize>,
+            request: PlayerInventoryMove,
+        }
+
+        #[mod_api::__subscriptions]
+        impl Hooks for Probe {
+            fn player_save_to_file(
+                &self,
+                host: &mut dyn ServerHost,
+                event: &mut PlayerSaveToFileEvent<'_>,
+            ) {
+                if event.player == 12 {
+                    assert_unavailable(host, &self.request);
+                    self.calls.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        super::super::native_guest_turn_tests::with_guests(|game| {
+            let dir = tempfile::tempdir().unwrap();
+            game.world_root = dir.path().to_owned();
+            let apple = ItemStack::new("minecraft:apple", 1);
+            let bread = ItemStack::new("minecraft:bread", 2);
+            let (request, final_stack) = {
+                let hub = &mut game.lan.as_mut().unwrap().hub;
+                hub.update_guest(12, |g| g.inventory[0] = Some(apple));
+                hub.update_guest(13, |g| g.inventory[0] = Some(bread.clone()));
+                let g = hub.guest(12).unwrap();
+                game.player_autosaves.enqueue(g, &game.world_root);
+                let source = game
+                    .server_player_inventory(13, PlayerInventoryKind::Player)
+                    .unwrap();
+                (
+                    PlayerInventoryMove::new(
+                        (13, PlayerInventoryKind::Player, 0),
+                        source.slots[0].clone().unwrap(),
+                        (12, PlayerInventoryKind::Player),
+                    ),
+                    source.slots[0].clone().unwrap(),
+                )
+            };
+
+            let hub = &mut game.lan.as_mut().unwrap().hub;
+            hub.update_guest(12, |g| g.inventory[0] = Some(bread));
+            let guest = hub.guests.remove(0);
+            let event = hub.leave_event(guest);
+            assert_unavailable(game, &request);
+
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mods: mod_api::Mods = vec![mod_api::ModEntry::new(
+                "inventory_logout",
+                Box::new(Probe {
+                    calls: calls.clone(),
+                    request,
+                }),
+            )]
+            .into();
+            mod_platform::testing::with_mods(mods, || {
+                let host = game.lan.take().unwrap();
+                game.lan = game.lan_process_events(host, [event], &[], [0.5, 64.0, 0.5]);
+            });
+
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            let snapshot = game
+                .server_player_inventory(12, PlayerInventoryKind::Player)
+                .unwrap();
+            assert!(!snapshot.online);
+            assert_eq!(snapshot.slots[0], Some(final_stack.clone()));
+            let source = game
+                .server_player_inventory(13, PlayerInventoryKind::Player)
+                .unwrap();
+            assert_eq!(source.slots[0], Some(final_stack));
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn a_failed_logout_save_blocks_offline_inventory_until_a_successful_save() {
+        use super::super::{
+            native_guest_turn_tests::with_guests, native_player_death::tests::new_guest,
+        };
+        use horizon_client::{items::ItemStack, lan::playerdata};
+        use mod_api::{PlayerInventoryError, PlayerInventoryKind, PlayerInventoryMove};
+
+        fn leave(game: &mut super::Game<'_>, conn: u32) {
+            let mut host = game.lan.take().unwrap();
+            let index = host.hub.guests.connection_index(conn).unwrap();
+            let guest = host.hub.guests.remove(index);
+            let event = host.hub.leave_event(guest);
+            game.lan = game.lan_process_events(host, [event], &[], [0.5, 64.0, 0.5]);
+        }
+
+        with_guests(|game| {
+            let dir = tempfile::tempdir().unwrap();
+            game.world_root = dir.path().to_owned();
+            let kind = PlayerInventoryKind::Player;
+            let file = playerdata::path(dir.path(), 12);
+            let hub = &mut game.lan.as_mut().unwrap().hub;
+            hub.update_guest(12, |g| {
+                g.inventory[0] = Some(ItemStack::new("minecraft:apple", 1));
+            });
+            assert!(playerdata::save(hub.guest(12).unwrap(), dir.path()));
+            let stale = std::fs::read(&file).unwrap();
+            let stack = game.server_player_inventory(12, kind).unwrap().slots[0]
+                .clone()
+                .unwrap();
+            let request = PlayerInventoryMove::new((12, kind, 0), stack, (13, kind));
+            let live_before = game.server_player_inventory(13, kind).unwrap().slots;
+            game.lan
+                .as_mut()
+                .unwrap()
+                .hub
+                .update_guest(12, |g| g.inventory[0] = None);
+
+            let temporary = file.with_extension("dat_new");
+            std::fs::create_dir(&temporary).unwrap();
+            leave(game, 12);
+            std::fs::remove_dir(&temporary).unwrap();
+
+            assert_eq!(std::fs::read(&file).unwrap(), stale);
+            assert!(matches!(
+                game.server_player_inventory(12, kind),
+                Err(PlayerInventoryError::File(_))
+            ));
+            assert!(matches!(
+                game.server_move_inventory_stack(&request),
+                Err(PlayerInventoryError::File(_))
+            ));
+            assert_eq!(
+                game.server_player_inventory(13, kind).unwrap().slots,
+                live_before
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), stale);
+
+            let mut returning = new_guest(14, 12);
+            returning.dimension = game.dim.id().to_owned();
+            game.lan.as_mut().unwrap().hub.guests.push(returning);
+            assert!(game.server_player_inventory(12, kind).unwrap().online);
+            leave(game, 14);
+            let offline = game.server_player_inventory(12, kind).unwrap();
+            assert!(!offline.online);
+            assert!(offline.slots[0].is_none());
         });
     }
 
@@ -5221,10 +5516,16 @@ pub(crate) mod world_spawn_sync_tests {
             // RespawnData.of(level.dimension(), ..): the same block set from the
             // End is a changed RespawnData, sent with the End as its dimension.
             game.as_console(|game| {
-                assert!(game.run_command("execute in minecraft:the_end run setworldspawn 100 140 -20"))
+                assert!(
+                    game.run_command("execute in minecraft:the_end run setworldspawn 100 140 -20")
+                )
             });
             let sent = spawns(&rx);
-            assert_eq!(sent.len(), 1, "a spawn that only changes dimension is broadcast");
+            assert_eq!(
+                sent.len(),
+                1,
+                "a spawn that only changes dimension is broadcast"
+            );
             assert_eq!(sent[0].pos.dimension, "minecraft:the_end");
             assert_eq!(sent[0].pos.pos, [100, 140, -20]);
             game.as_console(|game| {
@@ -5462,7 +5763,7 @@ mod mob_pickup_sync_tests {
 }
 
 #[cfg(test)]
-mod mob_swing_sync_tests {
+pub(super) mod mob_swing_sync_tests {
     use super::*;
     use horizon_client::{
         first_person::SwingAnimation,
@@ -5471,14 +5772,17 @@ mod mob_swing_sync_tests {
     use std::sync::{Arc, atomic::AtomicI32, mpsc};
 
     /// A server with one placed guest beside the mobs.
-    fn guest_at(game: &mut Game<'_>, at: [f64; 3]) -> mpsc::Receiver<Out> {
+    pub(in crate::game) fn guest_at(game: &mut Game<'_>, at: [f64; 3]) -> mpsc::Receiver<Out> {
         game.lan_host(
             LanSettings {
                 port: 0,
                 guest_commands: true,
                 force_game_mode: false,
             },
-            NetConfig::loopback(0, String::new(), 2),
+            NetConfig {
+                listen: false,
+                ..NetConfig::loopback(0, String::new(), 2)
+            },
             HubConfig {
                 default_game_mode: 0,
                 guest_commands: true,
@@ -5519,7 +5823,7 @@ mod mob_swing_sync_tests {
         rx
     }
 
-    fn swings(rx: &mpsc::Receiver<Out>) -> Vec<play::SwingAnimation> {
+    pub(super) fn swings(rx: &mpsc::Receiver<Out>) -> Vec<play::SwingAnimation> {
         rx.try_iter()
             .flat_map(|out| match out {
                 Out::Packet(body) => vec![body],
@@ -5827,7 +6131,9 @@ mod merchant_restock_tests {
         game.set_allow_commands(true);
         let rx = super::world_spawn_sync_tests::host_for(&mut game);
         let mut host = game.lan.take().unwrap();
-        host.hub.guests.update(0, |guest| guest.dimension = "minecraft:overworld".into());
+        host.hub
+            .guests
+            .update(0, |guest| guest.dimension = "minecraft:overworld".into());
         game.lan = Some(host);
         assert!(game.run_command(concat!(
             "summon villager 0.5 80 2.5 {NoAI:1b,Silent:1b,Xp:20,",
@@ -5881,9 +6187,13 @@ mod merchant_restock_tests {
         live.offers[0].uses = 0;
         live.offers[0].demand = 12;
         game.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
-            guest.effects.add(horizon_client::effects::EffectInstance::new(
-                "hero_of_the_village", 1000, 0,
-            ));
+            guest
+                .effects
+                .add(horizon_client::effects::EffectInstance::new(
+                    "hero_of_the_village",
+                    1000,
+                    0,
+                ));
         });
         game.merchant_restocked(id);
         let restocked = offers();

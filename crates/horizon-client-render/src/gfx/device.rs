@@ -187,15 +187,25 @@ pub(crate) fn describe_adapter(adapter: &wgpu::Adapter) {
     );
 }
 /// Whether an adapter's texture arrays hold the block textures Horizon puts
-/// in one array.
-pub(crate) fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<u32> {
+/// in one array: the arrays terrain.wgsl binds for them, and the layers per array.
+pub(crate) fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<(u32, u32)> {
     let info = adapter.get_info();
-    Ok(layer_split(
-        adapter.limits().max_texture_array_layers,
-        info.backend == wgpu::Backend::Gl,
-        adapter_requested_split(&info, requested_split(), layers),
-        layers,
-    )?)
+    let limits = adapter.limits();
+    let max = limits.max_texture_array_layers;
+    let gl = info.backend == wgpu::Backend::Gl;
+    let requested = adapter_requested_split(&info, requested_split(), layers);
+    // A pack past the arrays terrain.wgsl binds takes more, where the GPU samples enough.
+    match super::layer_split(max, gl, requested, layers) {
+        Ok(split) => Ok((super::SPRITE_ARRAYS, split)),
+        Err(_) if super::sprite_arrays_for(&limits) == super::MORE_SPRITE_ARRAYS => {
+            let more = super::MORE_SPRITE_ARRAYS;
+            Ok((
+                more,
+                super::layer_split_in(max, gl, requested, layers, more)?,
+            ))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 /// Whether the swapchain can take a window of `width` x `height`: each side from 1 to the
 /// device's `max_texture_dimension_2d` (`max`), else `Surface::configure` panics. 0 is a
@@ -277,11 +287,17 @@ pub(super) async fn open_device(
     // on it), and a watchdog ends the start instead of leaving the boot screen forever.
     let timeout = device_open_timeout();
     let searched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let effective_api = api.with_env();
+    let active_api = Arc::new(std::sync::Mutex::new(effective_api));
+    let active_for_timeout = active_api.clone();
+    let searched_for_timeout = searched.clone();
     let (disarm, _watchdog) = arm_search_watchdog(
         timeout,
         DEVICE_OPEN_GRACE,
         searched.clone(),
         move || {
+            let hung = active_for_timeout.lock().map_or(effective_api, |g| *g);
+            super::safe_start::mark_watchdog_hang(&searched_for_timeout, hung);
             log::error!("{}", device_search_timed_out(timeout));
             log::logger().flush();
         },
@@ -293,8 +309,19 @@ pub(super) async fn open_device(
             panic!("{message}");
         },
     );
-    let opened = open_device_search(window.clone(), offscreen, wgpu_backend, api, needs).await;
+    let opened = open_device_search(
+        window.clone(),
+        offscreen,
+        wgpu_backend,
+        api,
+        needs,
+        &active_api,
+    )
+    .await;
     searched.store(true, std::sync::atomic::Ordering::Release);
+    if opened.is_ok() {
+        super::safe_start::clear_watchdog_hang();
+    }
     drop(disarm);
     opened
 }
@@ -306,6 +333,7 @@ async fn open_device_search(
     wgpu_backend: bool,
     api: GraphicsApi,
     needs: surface_setup::DeviceNeeds,
+    active_api: &std::sync::Mutex<GraphicsApi>,
 ) -> Result<Opened> {
     let tries = device_search(
         api.with_env(),
@@ -316,7 +344,7 @@ async fn open_device_search(
     );
     let mut first = None;
     for (order, allow_cpu) in tries {
-        match open_device_with(&window, offscreen, &order, needs, allow_cpu).await {
+        match open_device_with(&window, offscreen, &order, needs, allow_cpu, active_api).await {
             Ok(opened) => {
                 if let Some(first) = &first {
                     log::warn!(
@@ -411,6 +439,18 @@ pub(crate) fn device_search(
     tries.push((chosen, true));
     tries
 }
+fn api_for_backends(backends: wgpu::Backends, fallback: GraphicsApi) -> GraphicsApi {
+    if backends == wgpu::Backends::VULKAN {
+        GraphicsApi::Vulkan
+    } else if backends == wgpu::Backends::DX12 {
+        GraphicsApi::Dx12
+    } else if backends == wgpu::Backends::GL {
+        GraphicsApi::OpenGl
+    } else {
+        fallback
+    }
+}
+
 /// `open_device` on `order`'s backends in turn, taking an adapter of the CPU type
 /// (software rendering) only when `allow_cpu`.
 async fn open_device_with(
@@ -419,9 +459,13 @@ async fn open_device_with(
     order: &[wgpu::Backends],
     needs: surface_setup::DeviceNeeds,
     allow_cpu: bool,
+    active_api: &std::sync::Mutex<GraphicsApi>,
 ) -> Result<Opened> {
     let mut failures = Vec::new();
     for (attempt, backends) in order.iter().copied().enumerate() {
+        if let Ok(mut guard) = active_api.lock() {
+            *guard = api_for_backends(backends, *guard);
+        }
         let name = backends_name(backends);
         if attempt > 0 {
             log::warn!("Horizon renderer: trying {name} ({})", failures.join("; "));
@@ -540,16 +584,24 @@ async fn open_backend(
             adapter.get_info().name
         )));
     }
-    // An integrated GPU on DirectX 12 compiles with DXC: the same request
-    // again, on an instance that loads the DLL beside the game. Anything that
-    // goes wrong keeps the FXC instance.
+    // An integrated GPU on DirectX 12 compiles with DXC, and so does a discrete
+    // one asked for ray queries or mesh shaders, which FXC can't compile: the
+    // same request again, on an instance that loads the DLL beside the game.
+    // Anything that goes wrong keeps the FXC instance.
     let forced = dx12_compiler::forced();
-    let dxc = if dx12_compiler::wants_dxc(&adapter.get_info(), forced) {
+    let sm_6_5 = needs.shader_model_6_5();
+    let dxc = if dx12_compiler::wants_dxc(&adapter.get_info(), forced, sm_6_5) {
         open_dxc(&adapter.get_info(), window, offscreen, open).await
     } else {
         None
     };
     let dxc_found = dxc.is_some();
+    dx12_compiler::note_fxc_until_asked(dx12_compiler::dxc_on_request(
+        &adapter.get_info(),
+        forced,
+        sm_6_5,
+        dx12_compiler::bundled_dll().is_some(),
+    ));
     let (instance, surface, adapter) = dxc.unwrap_or((instance, surface, adapter));
     if adapter.get_info().backend == wgpu::Backend::Dx12 {
         crate::crash::set_detail(
@@ -684,8 +736,9 @@ async fn open_dxc(
     let why = match surface_and_adapter(&instance, window, offscreen).await {
         Ok((surface, adapter)) if dx12_compiler::same_adapter(fxc, &adapter.get_info()) => {
             log::info!(
-                "Horizon renderer: DirectX 12 compiles shaders with DXC ({}) on this integrated GPU",
-                dll.display()
+                "Horizon renderer: DirectX 12 compiles shaders with DXC ({}) on this {:?}",
+                dll.display(),
+                fxc.device_type
             );
             return Some((instance, surface, adapter));
         }
