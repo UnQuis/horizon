@@ -75,12 +75,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Keep the forward vector even when its target leaves the viewport: the compose pass
         // walks motion from a destination sample towards its source, so a trailing-edge pixel
         // needs the vector stored at that pixel to find a source still inside the reference.
-        // Only a non-finite projection or an invalid depth makes the sample unusable.
-        let valid = target_uv.x > -1.0e6 && target_uv.x < 1.0e6
-            && target_uv.y > -1.0e6 && target_uv.y < 1.0e6
+        // Only a vector the rgba16float target cannot hold (finite binary16 tops out at 65504;
+        // a larger one would be stored as infinity), a non-finite projection or an invalid depth
+        // makes the sample unusable. NaN fails the comparison and is rejected too.
+        let motion = target_uv - uv;
+        let valid = all(abs(motion) < vec2<f32>(65504.0))
             && in_bounds(target_depth, b_eps);
         if (valid) {
-            out = vec4<f32>(target_uv - uv, 1.0, out.w);
+            out = vec4<f32>(motion, 1.0, out.w);
         }
     }
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), out);
